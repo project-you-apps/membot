@@ -30,6 +30,12 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
 # Virtual environments
 venv/
 .venv/
