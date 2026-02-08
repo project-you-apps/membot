@@ -156,6 +156,18 @@ Supports `.txt`, `.md`, `.pdf`, and `.docx`. Long documents are automatically ch
 
 Place cartridges in `cartridges/` or `data/` directories relative to the server.
 
+### Sample Cartridge
+
+The repo includes a pre-built cartridge of [*Attention Is All You Need*](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017) — the paper that introduced the Transformer architecture. 24 chunks, fully trained with lattice physics.
+
+```bash
+# Mount it and start searching
+> mount_cartridge("attention-is-all-you-need")
+> memory_search("how does multi-head attention work")
+```
+
+Build your own from any PDF, markdown, or text file in seconds with `cartridge_builder.py`.
+
 ## Security
 
 - **NPZ-first**: New cartridges are always saved as `.npz` (NumPy archive — no code execution)

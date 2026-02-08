@@ -16,6 +16,10 @@ data/*.npz
 data/*.npy
 data/*.json
 
+# Exception: sample cartridge (small enough to include)
+!cartridges/attention-is-all-you-need.cart.npz
+!cartridges/attention-is-all-you-need.cart_manifest.json
+
 # Model cache
 model_cache/
 
