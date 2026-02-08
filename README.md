@@ -135,7 +135,24 @@ A brain cartridge is a self-contained memory unit:
 | `name_brain.npy` | Hebbian weight matrix (128 MB) | For physics search |
 | `name_manifest.json` | SHA256 integrity fingerprint | Recommended |
 
-Cartridges are compatible with [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) v8.2+. Build them in Studio, serve them with Membot.
+Cartridges are compatible with [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) v8.2+. Build them in Studio or with the CLI builder, serve them with Membot.
+
+### Building Cartridges
+
+Use the included `cartridge_builder.py` to create cartridges from local documents:
+
+```bash
+# Embed a folder of documents (fast, no GPU needed)
+python cartridge_builder.py ./my-docs/ --name my-knowledge
+
+# Full build with lattice training (GPU required, enables physics search)
+python cartridge_builder.py ./my-docs/ --name my-knowledge --train
+
+# Single file, custom chunk size
+python cartridge_builder.py research-paper.pdf --name paper --chunk-size 500
+```
+
+Supports `.txt`, `.md`, `.pdf`, and `.docx`. Long documents are automatically chunked with overlap.
 
 Place cartridges in `cartridges/` or `data/` directories relative to the server.
 
@@ -170,6 +187,7 @@ The model downloads automatically on first run (~270 MB). Subsequent starts load
 ```
 membot/
 ├── membot_server.py              # MCP server entry point
+├── cartridge_builder.py          # CLI tool to build cartridges from documents
 ├── multi_lattice_wrapper_v7.py   # Python wrapper for CUDA engine
 ├── requirements.txt
 ├── bin/
