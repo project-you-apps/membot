@@ -12,13 +12,13 @@ Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector
 
 Standard vector search returns the closest embeddings by cosine distance. Membot does that too — but it also settles your query through a neural lattice with Mexican hat inhibition, Hebbian weights, and energy dynamics. The physics layer surfaces **contextual connections** across domains:
 
-| Query: "Garfield" | Embedding-Only       | Physics Blend (70/30)         |
-|-------------------+----------------------+-------------------------------|
-|            #1     | Garfield (cat)       | Garfield (cat)                |
-|            #2     | James A. Garfield    | James A. Garfield             |
-|            #3     | Charles J. Guiteau   | Charles J. Guiteau            |
-|            #4     | Gerald Ford          | Gerald Ford                   |
-|            **#5** | **Barack Obama**     | **Assassination of Garfield** |
+| Query: "Garfield" | Embedding-Only | Physics Blend (70/30) |
+|---|---|---|
+| #1 | Garfield (cat) | Garfield (cat) |
+| #2 | James A. Garfield | James A. Garfield |
+| #3 | Charles J. Guiteau | Charles J. Guiteau |
+| #4 | Gerald Ford | Gerald Ford |
+| **#5** | **Barack Obama** | **Assassination of Garfield** |
 
 The top 4 stay the same (accuracy preserved), but rank #5 changes from a generic "president" match to a contextually meaningful connection. The physics found the assassination — a relationship that lives in the attractor dynamics, not in the embedding geometry.
 
