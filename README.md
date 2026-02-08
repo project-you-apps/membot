@@ -158,12 +158,18 @@ Place cartridges in `cartridges/` or `data/` directories relative to the server.
 
 ### Sample Cartridge
 
-The repo includes a pre-built cartridge of [*Attention Is All You Need*](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017) — the paper that introduced the Transformer architecture. 24 chunks, fully trained with lattice physics.
+The repo includes a pre-built cartridge of [*Attention Is All You Need*](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017) — the paper that introduced the Transformer architecture. 24 chunks with pre-computed embeddings, ready for immediate embedding-only search.
 
 ```bash
-# Mount it and start searching
+# Mount it and start searching right away
 > mount_cartridge("attention-is-all-you-need")
 > memory_search("how does multi-head attention work")
+```
+
+To enable physics-enhanced search, rebuild the cartridge with `--train` (requires GPU). This generates the brain weights and L2 signatures that the physics blend needs:
+
+```bash
+python cartridge_builder.py attention-paper.pdf --name attention-is-all-you-need --train
 ```
 
 Build your own from any PDF, markdown, or text file in seconds with `cartridge_builder.py`.
