@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Cartridge data (large binary files — don't commit)
+cartridges/*.pkl
+cartridges/*.npz
+cartridges/*.npy
+cartridges/*.json
+data/*.pkl
+data/*.npz
+data/*.npy
+data/*.json
+
+# Model cache
+model_cache/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Virtual environments
+venv/
+.venv/

@@ -1,0 +1,33 @@
+VECTOR+ LATTICE ENGINE - PROPRIETARY LICENSE
+=============================================
+
+Copyright (c) 2026 Waving Cat Learning Systems / Project You / Andy Grossberg
+All Rights Reserved.
+
+The compiled binary files in this directory (lattice_cuda_v7.dll and any
+future builds) are proprietary software licensed under the following terms:
+
+PERMITTED USES:
+- Personal, non-commercial use
+- Academic and educational research
+- Evaluation and testing
+- Non-commercial open source projects
+
+PROHIBITED WITHOUT WRITTEN LICENSE:
+- Commercial use of any kind
+- Integration into commercial products or services
+- Resale, sublicensing, or redistribution for profit
+- Use in any revenue-generating application
+- Reverse engineering, decompilation, or disassembly
+
+COMMERCIAL LICENSING:
+For commercial use, please contact:
+  Email: andy@project-you.app
+  Web: https://project-you.app/licensing
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. IN NO EVENT
+SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING
+FROM THE USE OF THIS SOFTWARE.
+
+This license applies ONLY to the compiled binary files (.dll, .so, .dylib).
+The Python server code is licensed separately under MIT License.

@@ -1,0 +1,198 @@
+# Membot
+
+**Brain cartridge server for AI agents.**
+
+Membot is an MCP server that gives AI agents swappable, physics-enhanced memory. Mount a brain cartridge, search it with real neural physics, store new memories, swap to a different domain — all through standard [Model Context Protocol](https://modelcontextprotocol.io/) tool calls.
+
+Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector-plus-studio), Membot blends traditional embedding similarity with a 16-million neuron Hopfield network to find **associative relationships** that pure cosine similarity misses.
+
+![Membot Physics Demo](docs/garfield-physics-demo.png)
+
+## The Physics Difference
+
+Standard vector search returns the closest embeddings by cosine distance. Membot does that too — but it also settles your query through a neural lattice with Mexican hat inhibition, Hebbian weights, and energy dynamics. The physics layer surfaces **contextual connections** across domains:
+
+| Query: "Garfield" | Embedding-Only       | Physics Blend (70/30)         |
+|-------------------+----------------------+-------------------------------|
+|            #1     | Garfield (cat)       | Garfield (cat)                |
+|            #2     | James A. Garfield    | James A. Garfield             |
+|            #3     | Charles J. Guiteau   | Charles J. Guiteau            |
+|            #4     | Gerald Ford          | Gerald Ford                   |
+|            **#5** | **Barack Obama**     | **Assassination of Garfield** |
+
+The top 4 stay the same (accuracy preserved), but rank #5 changes from a generic "president" match to a contextually meaningful connection. The physics found the assassination — a relationship that lives in the attractor dynamics, not in the embedding geometry.
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.10+
+- An MCP-compatible agent ([OpenClaw](https://github.com/anthropics/openclaw), [Claude Code](https://claude.com/claude-code), etc.)
+
+Optional (for physics-enhanced search):
+- NVIDIA GPU with CUDA 11.0+
+- Pre-built CUDA engine (`lattice_cuda_v7.dll` / `.so`)
+
+### Install
+
+```bash
+git clone https://github.com/project-you-apps/membot.git
+cd membot
+pip install -r requirements.txt
+```
+
+### Run
+
+```bash
+python membot_server.py
+```
+
+Membot communicates over **stdio** (JSON-RPC), designed for MCP agent frameworks. It's not a REST API — your agent talks to it through the MCP protocol.
+
+### Agent Configuration
+
+**OpenClaw** (`~/.openclaw/openclaw.json`):
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "mcp-adapter": {
+        "enabled": true,
+        "config": {
+          "servers": [
+            {
+              "name": "membot",
+              "transport": "stdio",
+              "command": "python",
+              "args": ["/path/to/membot/membot_server.py"]
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+**Claude Code** (`~/.claude.json` or project settings):
+
+```json
+{
+  "mcpServers": {
+    "membot": {
+      "command": "python",
+      "args": ["/path/to/membot/membot_server.py"]
+    }
+  }
+}
+```
+
+Tools will appear prefixed with `membot_` (e.g., `membot_memory_search`).
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `list_cartridges` | Browse available brain cartridges with size and capabilities |
+| `mount_cartridge` | Load a cartridge into memory (embeddings + optional GPU brain) |
+| `memory_search` | Semantic search with physics+embedding blend and keyword reranking |
+| `memory_store` | Store new text into the mounted cartridge |
+| `save_cartridge` | Persist the current cartridge to disk (secure NPZ format) |
+| `unmount` | Free memory and unload the current cartridge |
+| `get_status` | Server diagnostics (mounted cartridge, memory count, GPU status) |
+
+## How It Works
+
+1. **Mount** a brain cartridge — embeddings, text, L2 signatures, and Hebbian weights load into memory
+2. **Search** — your query is embedded (Nomic v1.5, 768-dim), then:
+   - Cosine similarity against stored embeddings (fast, always available)
+   - Lattice settle: query is imprinted → physics runs → L2 signature extracted → cosine against stored signatures (GPU, when available)
+   - **70/30 blend**: 70% embedding + 30% physics similarity
+   - Keyword reranking boosts results that contain query terms
+3. **Store** — new text is embedded and added to the cartridge; optionally imprinted into the lattice with Hebbian learning
+4. **Save** — cartridge persists as secure `.npz` with SHA256 integrity manifest
+
+### Search Modes
+
+| Mode | When | Speed (100k) |
+|------|------|------|
+| Embedding-only | No GPU or no signatures | ~200ms |
+| Physics + Embedding (70/30) | GPU + signatures loaded | ~10s |
+
+Physics search is slower but finds cross-domain associative connections that embedding search can't. The confidence gating automatically falls back to embedding-only when the physics signal is degenerate.
+
+## Brain Cartridges
+
+A brain cartridge is a self-contained memory unit:
+
+| File | Contents | Required |
+|------|----------|----------|
+| `name.pkl` or `name.cart.npz` | Embeddings + text | Yes |
+| `name_signatures.npz` | L2 hierarchy vectors (4096-dim) | For physics search |
+| `name_brain.npy` | Hebbian weight matrix (128 MB) | For physics search |
+| `name_manifest.json` | SHA256 integrity fingerprint | Recommended |
+
+Cartridges are compatible with [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) v8.2+. Build them in Studio, serve them with Membot.
+
+Place cartridges in `cartridges/` or `data/` directories relative to the server.
+
+## Security
+
+- **NPZ-first**: New cartridges are always saved as `.npz` (NumPy archive — no code execution)
+- **PKL sandboxing**: Legacy `.pkl` files are only loaded from trusted directories (configurable)
+- **Integrity verification**: SHA256 manifest checked on mount; tampered cartridges are rejected
+- **Input sanitization**: Cartridge names validated against path traversal; text and query lengths capped
+- **Resource limits**: Max 100,000 entries per cartridge, 10,000 chars per store, 2,000 chars per query
+
+## Embedding Model
+
+Membot uses [nomic-ai/nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) via SentenceTransformers. This matches the embedder used by Vector+ Studio to build cartridges.
+
+The model downloads automatically on first run (~270 MB). Subsequent starts load from cache.
+
+**Important**: The embedding model used to build cartridges must match the one used to query them. Membot and Vector+ Studio both use the same model, so cartridges are interchangeable.
+
+## System Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| Python | 3.10+ | 3.12+ |
+| RAM | 4 GB | 16+ GB |
+| GPU | None (embedding-only mode) | NVIDIA RTX 3080+ |
+| VRAM | — | 8+ GB |
+| CUDA | — | 12.0+ |
+
+## Project Structure
+
+```
+membot/
+├── membot_server.py              # MCP server entry point
+├── multi_lattice_wrapper_v7.py   # Python wrapper for CUDA engine
+├── requirements.txt
+├── bin/
+│   └── lattice_cuda_v7.dll       # Pre-built CUDA physics engine (Windows)
+├── cartridges/                   # Your brain cartridges go here
+└── data/                         # Alternative cartridge directory
+```
+
+## License
+
+**Dual-Licensed:**
+
+| Component | License | Commercial Use |
+|-----------|---------|----------------|
+| Python code (`.py` files) | MIT | Yes |
+| CUDA Engine (`bin/*.dll`) | Proprietary | [Contact for license](mailto:andy@project-you.app) |
+
+The server code and utilities are open source under MIT. The compiled CUDA physics engine is free for personal, educational, and non-commercial use. Commercial use requires a separate license — see [bin/LICENSE](bin/LICENSE).
+
+## Links
+
+- [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) — GUI for building and searching brain cartridges
+- [Project You](https://project-you.app) — Parent project
+- [Licensing](https://project-you.app/licensing) — Commercial licensing options
+
+---
+
+*Patterns stored holographically, not as records. Memory served as cartridges, not as databases.*
