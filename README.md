@@ -10,9 +10,11 @@ Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector
 
 ## The Physics Difference
 
-Standard vector search returns the closest embeddings by cosine distance. Membot does that too — but it also settles your query through a neural lattice with Mexican hat inhibition, Hebbian weights, and energy dynamics. The physics layer surfaces **contextual connections** across domains:
+Standard vector search returns the closest embeddings by cosine distance. Membot does that too — but it also settles your query through a neural lattice with Mexican hat inhibition, Hebbian weights, and energy dynamics. The physics layer surfaces **contextual connections** across domains.
 
-| Query: "Garfield" | Embedding-Only | Physics Blend (70/30) |
+Here we searched 100,000 Wikipedia articles with the query *"Is Garfield an American President or a Cat?"*:
+
+| Query: "Is Garfield an American President or a Cat?" | Embedding-Only | Physics Blend (70/30) |
 |---|---|---|
 | #1 | Garfield (cat) | Garfield (cat) |
 | #2 | James A. Garfield | James A. Garfield |
