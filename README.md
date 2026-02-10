@@ -2,7 +2,7 @@
 
 **Brain cartridge server for AI agents.**
 
-Membot is an MCP server that gives AI agents swappable, physics-enhanced memory. Mount a brain cartridge, search it with real neural physics, store new memories, swap to a different domain — all through standard [Model Context Protocol](https://modelcontextprotocol.io/) tool calls.
+Membot is an MCP server that gives AI agents swappable, physics-enhanced memory. Mount a brain cartridge, search it with real neural physics, store new memories, swap to a different domain --all through standard [Model Context Protocol](https://modelcontextprotocol.io/) tool calls.
 
 Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector-plus-studio), Membot blends traditional embedding similarity with a 16-million neuron Hopfield network to find **associative relationships** that pure cosine similarity misses.
 
@@ -10,7 +10,7 @@ Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector
 
 ## The Physics Difference
 
-Standard vector search returns the closest embeddings by cosine distance. Membot does that too — but it also settles your query through a neural lattice with Mexican hat inhibition, Hebbian weights, and energy dynamics. The physics layer surfaces **contextual connections** across domains.
+Standard vector search returns the closest embeddings by cosine distance. Membot does that too--but it also settles your query through a neural lattice with Mexican hat inhibition, Hebbian weights, and energy dynamics. The physics layer surfaces **contextual connections** across domains.
 
 Here we searched 100,000 Wikipedia articles with the query *"Is Garfield an American President or a Cat?"*:
 
@@ -22,7 +22,7 @@ Here we searched 100,000 Wikipedia articles with the query *"Is Garfield an Amer
 | #4 | Gerald Ford | Gerald Ford |
 | **#5** | **Barack Obama** | **Assassination of Garfield** |
 
-The top 4 stay the same (accuracy preserved), but rank #5 changes from a generic "president" match to a contextually meaningful connection. The physics found the assassination — a relationship that lives in the attractor dynamics, not in the embedding geometry.
+The top 4 stay the same (accuracy preserved), but rank #5 changes from a generic "president" match to a contextually meaningful connection. The physics found the assassination--a relationship that lives in the attractor dynamics, not in the embedding geometry.
 
 ## Quick Start
 
@@ -46,10 +46,26 @@ pip install -r requirements.txt
 ### Run
 
 ```bash
+# Local (stdio)--for OpenClaw, Claude Desktop, local agents
 python membot_server.py
+
+# Remote (HTTP)--for any MCP client over the network
+python membot_server.py --transport http --port 8000
+
+# Read-only (disables store and save)--for public-facing servers
+python membot_server.py --transport http --port 8000 --read-only
 ```
 
-Membot communicates over **stdio** (JSON-RPC), designed for MCP agent frameworks. It's not a REST API — your agent talks to it through the MCP protocol.
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `--transport` | `stdio` | Transport mode: `stdio`, `http`, or `sse` |
+| `--host` | `0.0.0.0` | Bind address (HTTP/SSE mode) |
+| `--port` | `8000` | Listen port (HTTP/SSE mode) |
+| `--read-only` | off | Disable `memory_store` and `save_cartridge` |
+
+**stdio mode**: JSON-RPC over stdin/stdout, designed for MCP agent frameworks that launch Membot as a subprocess.
+
+**HTTP mode**: Streamable HTTP on `http://{host}:{port}/mcp`. Any MCP client can connect remotely. Includes rate limiting (60 req/min per IP) and optional API key auth via `MEMBOT_API_KEY` environment variable.
 
 ### Agent Configuration
 
@@ -77,7 +93,7 @@ Membot communicates over **stdio** (JSON-RPC), designed for MCP agent frameworks
 }
 ```
 
-**Claude Code** (`~/.claude.json` or project settings):
+**Claude Code** (local, stdio):
 
 ```json
 {
@@ -90,7 +106,30 @@ Membot communicates over **stdio** (JSON-RPC), designed for MCP agent frameworks
 }
 ```
 
+**Claude Code** (remote, HTTP):
+
+```json
+{
+  "mcpServers": {
+    "membot": {
+      "type": "http",
+      "url": "http://your-server:8000/mcp"
+    }
+  }
+}
+```
+
 Tools will appear prefixed with `membot_` (e.g., `membot_memory_search`).
+
+**OpenClaw agent dispatch** (headless):
+
+OpenClaw agent dispatch doesn't load MCP adapter tools. Use [mcporter](https://github.com/steipete/mcporter) + a SOUL.md that instructs the agent to call Membot via Bash:
+
+```bash
+mcporter call membot.memory_search query="your query" top_k=5
+```
+
+See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working example.
 
 ## Tools
 
@@ -106,14 +145,14 @@ Tools will appear prefixed with `membot_` (e.g., `membot_memory_search`).
 
 ## How It Works
 
-1. **Mount** a brain cartridge — embeddings, text, L2 signatures, and Hebbian weights load into memory
-2. **Search** — your query is embedded (Nomic v1.5, 768-dim), then:
+1. **Mount** a brain cartridge--embeddings, text, L2 signatures, and Hebbian weights load into memory
+2. **Search**--your query is embedded (Nomic v1.5, 768-dim), then:
    - Cosine similarity against stored embeddings (fast, always available)
    - Lattice settle: query is imprinted → physics runs → L2 signature extracted → cosine against stored signatures (GPU, when available)
    - **70/30 blend**: 70% embedding + 30% physics similarity
    - Keyword reranking boosts results that contain query terms
-3. **Store** — new text is embedded and added to the cartridge; optionally imprinted into the lattice with Hebbian learning
-4. **Save** — cartridge persists as secure `.npz` with SHA256 integrity manifest
+3. **Store**--new text is embedded and added to the cartridge; optionally imprinted into the lattice with Hebbian learning
+4. **Save**--cartridge persists as secure `.npz` with SHA256 integrity manifest
 
 ### Search Modes
 
@@ -158,7 +197,7 @@ Place cartridges in `cartridges/` or `data/` directories relative to the server.
 
 ### Sample Cartridge
 
-The repo includes a pre-built cartridge of [*Attention Is All You Need*](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017) — the paper that introduced the Transformer architecture. 24 chunks with pre-computed embeddings, ready for immediate embedding-only search.
+The repo includes a pre-built cartridge of [*Attention Is All You Need*](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017)--the paper that introduced the Transformer architecture. 24 chunks with pre-computed embeddings, ready for immediate embedding-only search.
 
 ```bash
 # Mount it and start searching right away
@@ -174,9 +213,34 @@ python cartridge_builder.py attention-paper.pdf --name attention-is-all-you-need
 
 Build your own from any PDF, markdown, or text file in seconds with `cartridge_builder.py`.
 
+## Deployment
+
+For remote hosting, run Membot in HTTP mode behind a reverse proxy or directly:
+
+```bash
+# Set API key (clients must send Authorization: Bearer <key>)
+export MEMBOT_API_KEY="your-secret-key"
+
+# Start read-only public server
+python membot_server.py --transport http --port 8000 --read-only
+```
+
+**Architecture**: Public server runs read-only (search only). Build and curate cartridges locally, then upload finished ones to the server. Users and agents connect to browse and search, not write.
+
+**systemd** (Linux):
+
+```ini
+[Service]
+Environment="MEMBOT_API_KEY=your-secret-key"
+ExecStart=/opt/membot/venv/bin/python /opt/membot/membot_server.py --transport http --port 8000 --read-only
+Restart=always
+```
+
+**Requirements**: Python 3.10+ and ~2 GB RAM (SentenceTransformer model). No GPU needed for embedding-only search.
+
 ## Security
 
-- **NPZ-first**: New cartridges are always saved as `.npz` (NumPy archive — no code execution)
+- **NPZ-first**: New cartridges are always saved as `.npz` (NumPy archive --no code execution)
 - **PKL sandboxing**: Legacy `.pkl` files are only loaded from trusted directories (configurable)
 - **Integrity verification**: SHA256 manifest checked on mount; tampered cartridges are rejected
 - **Input sanitization**: Cartridge names validated against path traversal; text and query lengths capped
@@ -197,8 +261,8 @@ The model downloads automatically on first run (~270 MB). Subsequent starts load
 | Python | 3.10+ | 3.12+ |
 | RAM | 4 GB | 16+ GB |
 | GPU | None (embedding-only mode) | NVIDIA RTX 3080+ |
-| VRAM | — | 8+ GB |
-| CUDA | — | 12.0+ |
+| VRAM | -- | 8+ GB |
+| CUDA | -- | 12.0+ |
 
 ## Project Structure
 
@@ -223,13 +287,13 @@ membot/
 | Python code (`.py` files) | MIT | Yes |
 | CUDA Engine (`bin/*.dll`) | Proprietary | [Contact for license](mailto:andy@project-you.app) |
 
-The server code and utilities are open source under MIT. The compiled CUDA physics engine is free for personal, educational, and non-commercial use. Commercial use requires a separate license — see [bin/LICENSE](bin/LICENSE).
+The server code and utilities are open source under MIT. The compiled CUDA physics engine is free for personal, educational, and non-commercial use. Commercial use requires a separate license--see [bin/LICENSE](bin/LICENSE).
 
 ## Links
 
-- [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) — GUI for building and searching brain cartridges
-- [Project You](https://project-you.app) — Parent project
-- [Licensing](https://project-you.app/licensing) — Commercial licensing options
+- [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) -- GUI for building and searching brain cartridges
+- [Project You](https://project-you.app) -- Parent project
+- [Licensing](https://project-you.app/licensing) -- Commercial licensing options
 
 ---
 

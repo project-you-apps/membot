@@ -27,17 +27,21 @@ Tools:
   unmount          — Free memory and unload cartridge
   get_status       — Server diagnostics
 
-Transport: stdio (MCP JSON-RPC)
+Transport:
+  stdio  — Local pipe (OpenClaw, Claude Desktop)
+  http   — Streamable HTTP (remote agents, Claude Code)
 
 Usage:
-  python membot_server.py
+  python membot_server.py                              # stdio (default)
+  python membot_server.py --transport http --port 8000  # HTTP server
+  MEMBOT_API_KEY=secret python membot_server.py --transport http  # HTTP + auth
 
 See README.md for agent configuration.
 
 https://github.com/project-you-apps/membot
 """
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 import os
 import sys
 import re
@@ -47,6 +51,8 @@ import zlib
 import time
 import json
 import logging
+import argparse
+import collections
 import numpy as np
 
 # --- Logging (stderr only — stdout is reserved for MCP JSON-RPC) ---
@@ -168,6 +174,7 @@ state = {
     "lattice": None,          # CUDA wrapper or None
     "gpu_available": False,
     "modified": False,        # True if memory_store was called since last save
+    "read_only": False,       # True if --read-only flag is set
 }
 
 
@@ -668,6 +675,9 @@ def memory_store(content: str, tags: str = "") -> str:
         content: Text content to memorize (max 10,000 chars)
         tags: Optional metadata tags (prepended to stored text)
     """
+    if state.get("read_only"):
+        return "Server is in read-only mode. memory_store is disabled."
+
     if len(content) > MAX_TEXT_LENGTH:
         return f"Text too long ({len(content)} chars). Max is {MAX_TEXT_LENGTH}."
 
@@ -729,6 +739,9 @@ def save_cartridge(name: str = "") -> str:
         name: Optional name for the saved cartridge (default: use mounted name)
     """
     log.info(f"save_cartridge('{name}')")
+
+    if state.get("read_only"):
+        return "Server is in read-only mode. save_cartridge is disabled."
 
     if state["cartridge_name"] is None and not name:
         return "No cartridge to save. Mount one first or provide a name."
@@ -817,11 +830,97 @@ def get_status() -> str:
 
 
 # ============================================================
+# HTTP MIDDLEWARE (auth + rate limiting)
+# ============================================================
+
+# --- Rate Limiter (sliding window, per-IP) ---
+_rate_window: dict[str, collections.deque] = {}
+RATE_LIMIT = 60          # requests per window
+RATE_WINDOW_SEC = 60     # window size in seconds
+
+
+def _check_rate_limit(client_id: str) -> bool:
+    """Returns True if request is allowed, False if rate-limited."""
+    now = time.time()
+    if client_id not in _rate_window:
+        _rate_window[client_id] = collections.deque()
+    window = _rate_window[client_id]
+    # Evict expired entries
+    while window and window[0] < now - RATE_WINDOW_SEC:
+        window.popleft()
+    if len(window) >= RATE_LIMIT:
+        return False
+    window.append(now)
+    return True
+
+
+def _setup_http_middleware(api_key: str | None):
+    """Add auth + rate limiting middleware when running in HTTP mode."""
+    try:
+        from fastmcp.server.middleware import Middleware, MiddlewareContext
+        from fastmcp.server.dependencies import get_http_request
+    except ImportError:
+        log.warning("FastMCP middleware not available — running HTTP without auth/rate-limiting")
+        return
+
+    class AuthAndRateLimitMiddleware(Middleware):
+        async def on_call_tool(self, context: MiddlewareContext, call_next):
+            try:
+                request = get_http_request()
+            except Exception:
+                # Not an HTTP request (shouldn't happen in HTTP mode)
+                return await call_next(context)
+
+            # Rate limiting by client IP
+            client_ip = request.client.host if request.client else "unknown"
+            if not _check_rate_limit(client_ip):
+                from fastmcp.exceptions import ToolError
+                log.warning(f"Rate limited: {client_ip}")
+                raise ToolError(f"Rate limited. Max {RATE_LIMIT} requests per {RATE_WINDOW_SEC}s.")
+
+            # API key auth (if configured)
+            if api_key:
+                auth_header = request.headers.get("authorization", "")
+                if not auth_header.startswith("Bearer "):
+                    from fastmcp.exceptions import ToolError
+                    raise ToolError("Access denied: missing Bearer token")
+                token = auth_header.removeprefix("Bearer ").strip()
+                if token != api_key:
+                    from fastmcp.exceptions import ToolError
+                    log.warning(f"Auth failed from {client_ip}")
+                    raise ToolError("Access denied: invalid API key")
+
+            return await call_next(context)
+
+    mcp.add_middleware(AuthAndRateLimitMiddleware())
+    if api_key:
+        log.info("HTTP middleware: auth (Bearer token) + rate limiting enabled")
+    else:
+        log.info("HTTP middleware: rate limiting enabled (no auth — set MEMBOT_API_KEY to require)")
+
+
+# ============================================================
 # ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Membot — Brain Cartridge Server")
+    parser.add_argument("--transport", default="stdio", choices=["stdio", "http", "sse"],
+                        help="Transport mode (default: stdio)")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="HTTP bind address (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="HTTP port (default: 8000)")
+    parser.add_argument("--read-only", action="store_true",
+                        help="Disable memory_store and save_cartridge (public server mode)")
+    args = parser.parse_args()
+
+    state["read_only"] = args.read_only
+
     log.info("Starting Membot — Brain Cartridge Server...")
+    log.info(f"Transport: {args.transport}")
+    if args.read_only:
+        log.info("READ-ONLY mode: memory_store and save_cartridge disabled")
     log.info(f"Cartridge dirs: {CARTRIDGE_DIRS}")
     log.info(f"Security: max_entries={MAX_ENTRIES}, max_text={MAX_TEXT_LENGTH}, pkl=trusted-dirs-only")
 
@@ -832,4 +931,12 @@ if __name__ == "__main__":
     carts = find_cartridges()
     log.info(f"Found {len(carts)} cartridges")
 
-    mcp.run(transport="stdio")
+    # Setup HTTP middleware if not in stdio mode
+    if args.transport != "stdio":
+        api_key = os.environ.get("MEMBOT_API_KEY")
+        _setup_http_middleware(api_key)
+        log.info(f"HTTP server starting on {args.host}:{args.port}")
+        if args.read_only:
+            log.info("Public server mode: write operations blocked")
+
+    mcp.run(transport=args.transport, host=args.host, port=args.port)
