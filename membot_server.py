@@ -162,20 +162,62 @@ def is_trusted_directory(path: str) -> bool:
 
 
 # ============================================================
-# STATE
+# STATE (per-session)
 # ============================================================
 
-state = {
-    "cartridge_name": None,
-    "cartridge_path": None,
-    "embeddings": None,       # (N, 768) float32
-    "texts": [],              # list[str]
-    "signatures": None,       # (N, 4096) float32 or None
-    "lattice": None,          # CUDA wrapper or None
-    "gpu_available": False,
-    "modified": False,        # True if memory_store was called since last save
-    "read_only": False,       # True if --read-only flag is set
+SESSION_TIMEOUT_SEC = 1800   # 30 minutes idle → session expires
+MAX_SESSIONS = 50            # Max concurrent sessions
+
+def _new_session() -> dict:
+    """Create a fresh session state dict."""
+    return {
+        "cartridge_name": None,
+        "cartridge_path": None,
+        "embeddings": None,       # (N, 768) float32
+        "texts": [],              # list[str]
+        "signatures": None,       # (N, 4096) float32 or None
+        "lattice": None,          # CUDA wrapper or None
+        "gpu_available": False,
+        "modified": False,        # True if memory_store was called since last save
+        "last_access": time.time(),
+    }
+
+# session_id → session state dict
+_sessions: dict[str, dict] = {}
+
+# Global config (not per-session)
+_server_config = {
+    "read_only": False,
 }
+
+
+def _get_session(session_id: str) -> dict:
+    """Get or create a session by ID. Evicts expired sessions."""
+    now = time.time()
+
+    # Evict expired sessions
+    expired = [sid for sid, s in _sessions.items()
+               if now - s["last_access"] > SESSION_TIMEOUT_SEC]
+    for sid in expired:
+        log.info(f"Session expired: {sid} (idle {now - _sessions[sid]['last_access']:.0f}s)")
+        del _sessions[sid]
+
+    if session_id not in _sessions:
+        if len(_sessions) >= MAX_SESSIONS:
+            # Evict oldest session
+            oldest = min(_sessions, key=lambda sid: _sessions[sid]["last_access"])
+            log.info(f"Session evicted (max reached): {oldest}")
+            del _sessions[oldest]
+        _sessions[session_id] = _new_session()
+        log.info(f"New session created: {session_id}")
+
+    _sessions[session_id]["last_access"] = now
+    return _sessions[session_id]
+
+
+def _resolve_session_id(session_id: str) -> str:
+    """Resolve empty session_id to 'default', return as-is otherwise."""
+    return session_id.strip() if session_id.strip() else "default"
 
 
 # ============================================================
@@ -207,20 +249,25 @@ def embed_text(text: str, prefix: str = "search_query") -> np.ndarray:
 # GPU INIT (OPTIONAL — NON-FATAL IF UNAVAILABLE)
 # ============================================================
 
+_gpu_state = {
+    "lattice": None,
+    "available": False,
+}
+
 def init_gpu():
     """Try to load CUDA LatticeRunner. Returns True if successful."""
-    if state["lattice"] is not None:
-        return state["gpu_available"]
+    if _gpu_state["lattice"] is not None:
+        return _gpu_state["available"]
     try:
         sys.path.insert(0, BASE_DIR)
         from multi_lattice_wrapper_v7 import MultiLatticeCUDAv7
-        state["lattice"] = MultiLatticeCUDAv7(lattice_size=4096, verbose=0)
-        state["gpu_available"] = True
+        _gpu_state["lattice"] = MultiLatticeCUDAv7(lattice_size=4096, verbose=0)
+        _gpu_state["available"] = True
         log.info("CUDA LatticeRunner V7 ready (4096x4096)")
         return True
     except Exception as e:
         log.warning(f"CUDA not available (CPU-only mode): {e}")
-        state["gpu_available"] = False
+        _gpu_state["available"] = False
         return False
 
 
@@ -440,15 +487,18 @@ def list_cartridges() -> str:
 
 
 @mcp.tool()
-def mount_cartridge(name: str) -> str:
+def mount_cartridge(name: str, session_id: str = "") -> str:
     """Mount a brain cartridge by name (or partial name).
     Loads embeddings and text into memory for searching.
     Verifies integrity against manifest if available.
 
     Args:
         name: Cartridge name (exact or partial match)
+        session_id: Session identifier (auto-assigned if empty). Each session has its own mounted cartridge.
     """
-    log.info(f"mount_cartridge({name})")
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"mount_cartridge({name}, session={session_id})")
 
     try:
         clean_name = sanitize_name(name)
@@ -512,14 +562,14 @@ def mount_cartridge(name: str) -> str:
         gpu_msg = ""
         if os.path.exists(brain_path) and init_gpu():
             try:
-                state["lattice"].load_brain(brain_path)
+                _gpu_state["lattice"].load_brain(brain_path)
                 gpu_msg = ", brain loaded to GPU"
                 log.info("Brain weights loaded to GPU")
             except Exception as e:
                 gpu_msg = f", brain load failed: {e}"
                 log.warning(f"Brain load failed: {e}")
 
-        return f"Mounted '{cart['name']}': {n} memories, {dim}-dim, {data['format'].upper()}, integrity={verify_msg}{gpu_msg}. Ready."
+        return f"Mounted '{cart['name']}': {n} memories, {dim}-dim, {data['format'].upper()}, integrity={verify_msg}{gpu_msg}. Session: {session_id}"
 
     except PermissionError as e:
         log.error(f"Security block: {e}")
@@ -530,7 +580,7 @@ def mount_cartridge(name: str) -> str:
 
 
 @mcp.tool()
-def memory_search(query: str, top_k: int = 5) -> str:
+def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
     """Search the mounted cartridge using lattice physics + embedding similarity.
     Runs the query through the neural lattice (settle → L2 signature) and blends
     physics-based similarity with embedding cosine for ranked results.
@@ -540,11 +590,14 @@ def memory_search(query: str, top_k: int = 5) -> str:
     Args:
         query: Natural language search query
         top_k: Number of results to return (default 5)
+        session_id: Session identifier (uses default session if empty)
     """
     if len(query) > MAX_QUERY_LENGTH:
         return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
 
-    log.info(f"memory_search('{query[:60]}', top_k={top_k})")
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"memory_search('{query[:60]}', top_k={top_k}, session={session_id})")
 
     if state["cartridge_name"] is None:
         return "No cartridge mounted. Use mount_cartridge first."
@@ -568,9 +621,9 @@ def memory_search(query: str, top_k: int = 5) -> str:
         search_mode = "embedding"
         physics_blend = 0.0
 
-        if PHYSICS_ENABLED and state["gpu_available"] and state["lattice"] is not None and state["signatures"] is not None:
+        if PHYSICS_ENABLED and _gpu_state["available"] and _gpu_state["lattice"] is not None and state["signatures"] is not None:
             try:
-                ml = state["lattice"]
+                ml = _gpu_state["lattice"]
                 ml.reset()
                 ml.imprint_vector(query_emb)
                 ml.settle(frames=2, learn=False)
@@ -615,7 +668,7 @@ def memory_search(query: str, top_k: int = 5) -> str:
             scores = emb_scores
             if state["signatures"] is None:
                 log.info("No signatures loaded — embedding-only search")
-            elif not state["gpu_available"]:
+            elif not _gpu_state["available"]:
                 log.info("No GPU — embedding-only search")
 
         # 4. Keyword reranking — pull wider candidate pool, boost by keyword hits
@@ -666,7 +719,7 @@ def memory_search(query: str, top_k: int = 5) -> str:
 
 
 @mcp.tool()
-def memory_store(content: str, tags: str = "") -> str:
+def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     """Store new text in the currently mounted cartridge.
     The text is embedded via Nomic and added to the searchable memory.
     If GPU is available, the pattern is also imprinted into the lattice.
@@ -674,12 +727,16 @@ def memory_store(content: str, tags: str = "") -> str:
     Args:
         content: Text content to memorize (max 10,000 chars)
         tags: Optional metadata tags (prepended to stored text)
+        session_id: Session identifier (uses default session if empty)
     """
-    if state.get("read_only"):
+    if _server_config.get("read_only"):
         return "Server is in read-only mode. memory_store is disabled."
 
     if len(content) > MAX_TEXT_LENGTH:
         return f"Text too long ({len(content)} chars). Max is {MAX_TEXT_LENGTH}."
+
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
 
     if state["cartridge_name"] is None:
         return "No cartridge mounted. Use mount_cartridge first."
@@ -709,9 +766,9 @@ def memory_store(content: str, tags: str = "") -> str:
 
         # 4. GPU lattice imprint (if available)
         gpu_msg = ""
-        if state["gpu_available"] and state["lattice"] is not None:
+        if _gpu_state["available"] and _gpu_state["lattice"] is not None:
             try:
-                ml = state["lattice"]
+                ml = _gpu_state["lattice"]
                 ml.reset()
                 ml.imprint_vector(emb)
                 ml.settle(frames=10, learn=True)
@@ -731,16 +788,19 @@ def memory_store(content: str, tags: str = "") -> str:
 
 
 @mcp.tool()
-def save_cartridge(name: str = "") -> str:
+def save_cartridge(name: str = "", session_id: str = "") -> str:
     """Save the current cartridge to disk as a secure .npz file.
     Generates a SHA256 manifest for integrity verification.
 
     Args:
         name: Optional name for the saved cartridge (default: use mounted name)
+        session_id: Session identifier (uses default session if empty)
     """
-    log.info(f"save_cartridge('{name}')")
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"save_cartridge('{name}', session={session_id})")
 
-    if state.get("read_only"):
+    if _server_config.get("read_only"):
         return "Server is in read-only mode. save_cartridge is disabled."
 
     if state["cartridge_name"] is None and not name:
@@ -766,10 +826,10 @@ def save_cartridge(name: str = "") -> str:
 
         # Also save brain weights if GPU is active
         brain_msg = ""
-        if state["gpu_available"] and state["lattice"] is not None:
+        if _gpu_state["available"] and _gpu_state["lattice"] is not None:
             brain_path = os.path.join(save_dir, f"{save_name}_brain.npy")
             try:
-                state["lattice"].save_brain(brain_path)
+                _gpu_state["lattice"].save_brain(brain_path)
                 brain_msg = " + brain weights"
             except Exception as e:
                 brain_msg = f" (brain save failed: {e})"
@@ -785,9 +845,15 @@ def save_cartridge(name: str = "") -> str:
 
 
 @mcp.tool()
-def unmount() -> str:
-    """Unmount the current cartridge and free memory."""
-    log.info("unmount")
+def unmount(session_id: str = "") -> str:
+    """Unmount the current cartridge and free memory.
+
+    Args:
+        session_id: Session identifier (uses default session if empty)
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"unmount(session={session_id})")
 
     if state["cartridge_name"] is None:
         return "No cartridge mounted."
@@ -797,6 +863,7 @@ def unmount() -> str:
     if state["modified"]:
         warning = " WARNING: Unsaved changes were discarded."
 
+    # Reset session state but keep it alive
     state["cartridge_name"] = None
     state["cartridge_path"] = None
     state["embeddings"] = None
@@ -808,16 +875,23 @@ def unmount() -> str:
 
 
 @mcp.tool()
-def get_status() -> str:
-    """Get server status: mounted cartridge, memory count, GPU availability."""
-    log.info("get_status")
+def get_status(session_id: str = "") -> str:
+    """Get server status: mounted cartridge, memory count, GPU availability.
+
+    Args:
+        session_id: Session identifier (uses default session if empty)
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"get_status(session={session_id})")
 
     cart = state["cartridge_name"] or "None"
     n = len(state["texts"]) if state["texts"] else 0
     dim = state["embeddings"].shape[1] if state["embeddings"] is not None and len(state["embeddings"]) > 0 else 0
     has_sigs = state["signatures"] is not None
-    gpu = "Ready" if state["gpu_available"] else "Not available"
+    gpu = "Ready" if _gpu_state["available"] else "Not available"
     modified = " (unsaved changes)" if state["modified"] else ""
+    active_sessions = len(_sessions)
 
     return (
         f"Cartridge: {cart}{modified} | "
@@ -825,6 +899,8 @@ def get_status() -> str:
         f"Embedding dim: {dim} | "
         f"Signatures: {'Yes' if has_sigs else 'No'} | "
         f"GPU: {gpu} | "
+        f"Sessions: {active_sessions} | "
+        f"Session: {session_id} | "
         f"Embed: nomic-embed-text-v1.5 via SentenceTransformer"
     )
 
@@ -915,7 +991,7 @@ if __name__ == "__main__":
                         help="Disable memory_store and save_cartridge (public server mode)")
     args = parser.parse_args()
 
-    state["read_only"] = args.read_only
+    _server_config["read_only"] = args.read_only
 
     log.info("Starting Membot — Brain Cartridge Server...")
     log.info(f"Transport: {args.transport}")

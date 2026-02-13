@@ -67,6 +67,31 @@ python membot_server.py --transport http --port 8000 --read-only
 
 **HTTP mode**: Streamable HTTP on `http://{host}:{port}/mcp`. Any MCP client can connect remotely. Includes rate limiting (60 req/min per IP) and optional API key auth via `MEMBOT_API_KEY` environment variable.
 
+### Multi-Session Support
+
+Membot supports multiple concurrent sessions. Each session has its own mounted cartridge and independent state, so multiple agents can use the same server without stomping on each other.
+
+Every tool accepts an optional `session_id` parameter:
+
+```python
+# Agent A mounts its own cartridge
+mount_cartridge("medical-knowledge", session_id="agent-a")
+
+# Agent B mounts a different one — no collision
+mount_cartridge("legal-docs", session_id="agent-b")
+
+# Each searches their own mounted cartridge
+memory_search("symptoms of flu", session_id="agent-a")
+memory_search("statute of limitations", session_id="agent-b")
+```
+
+If `session_id` is omitted, all calls go to the `"default"` session (backward-compatible with single-user usage).
+
+**Session limits:**
+- Sessions expire after **30 minutes** of inactivity (configurable via `SESSION_TIMEOUT_SEC`)
+- Maximum **50 concurrent sessions** (oldest evicted when limit hit)
+- The embedding model and GPU are shared across all sessions — only the mounted cartridge state is per-session
+
 ### Agent Configuration
 
 **OpenClaw** (`~/.openclaw/openclaw.json`):
@@ -215,25 +240,83 @@ Build your own from any PDF, markdown, or text file in seconds with `cartridge_b
 
 ## Deployment
 
-For remote hosting, run Membot in HTTP mode behind a reverse proxy or directly:
+### Self-Hosted Setup
+
+Anyone can run their own Membot instance. Pick your own API key (any string), set it as an environment variable, and start the server:
 
 ```bash
-# Set API key (clients must send Authorization: Bearer <key>)
-export MEMBOT_API_KEY="your-secret-key"
+# 1. Choose your API key (any string you want)
+export MEMBOT_API_KEY="my-secret-key-here"
 
-# Start read-only public server
+# 2. Start the server
+python membot_server.py --transport http --port 8000
+
+# Or read-only (public-facing, disables store and save)
 python membot_server.py --transport http --port 8000 --read-only
 ```
 
-**Architecture**: Public server runs read-only (search only). Build and curate cartridges locally, then upload finished ones to the server. Users and agents connect to browse and search, not write.
+Clients connect by passing `Authorization: Bearer my-secret-key-here` in their HTTP headers. That's it — no account system, no registration. One key per server instance.
 
-**systemd** (Linux):
+### Connecting Agents to Your Server
+
+**Claude Code** (remote, with auth):
+
+```bash
+claude mcp add --transport http --scope user membot http://your-server:8000/mcp \
+  --header "Authorization: Bearer my-secret-key-here"
+```
+
+**OpenClaw / mcporter** (`~/.mcporter/mcporter.json`):
+
+```json
+{
+  "servers": {
+    "membot": {
+      "url": "http://your-server:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer my-secret-key-here"
+      }
+    }
+  }
+}
+```
+
+### Deployment Architectures
+
+**Public dispensary** (read-only): Multiple agents search shared cartridges. Nobody can write. Build cartridges locally, upload to server.
+
+```bash
+MEMBOT_API_KEY="shared-read-key" python membot_server.py --transport http --read-only
+```
+
+**Team server** (read-write): Multiple agents mount, search, and store independently. Each agent uses a `session_id` to get its own isolated state.
+
+```bash
+MEMBOT_API_KEY="team-key" python membot_server.py --transport http
+```
+
+**Personal server** (full access): One user, one key, full CRUD. Add to your system startup for always-on memory.
+
+### systemd (Linux)
 
 ```ini
+[Unit]
+Description=Membot Brain Cartridge Server
+After=network.target
+
 [Service]
 Environment="MEMBOT_API_KEY=your-secret-key"
-ExecStart=/opt/membot/venv/bin/python /opt/membot/membot_server.py --transport http --port 8000 --read-only
+ExecStart=/opt/membot/venv/bin/python /opt/membot/membot_server.py --transport http --port 8000
 Restart=always
+WorkingDirectory=/opt/membot
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable membot
+sudo systemctl start membot
 ```
 
 **Requirements**: Python 3.10+ and ~2 GB RAM (SentenceTransformer model). No GPU needed for embedding-only search.
@@ -245,6 +328,7 @@ Restart=always
 - **Integrity verification**: SHA256 manifest checked on mount; tampered cartridges are rejected
 - **Input sanitization**: Cartridge names validated against path traversal; text and query lengths capped
 - **Resource limits**: Max 100,000 entries per cartridge, 10,000 chars per store, 2,000 chars per query
+- **Concurrent writes**: Multiple sessions can mount and search simultaneously, but concurrent saves to the same cartridge file are last-writer-wins. Use `--read-only` for public servers. If you need file locking, per-user API keys, or a managed team deployment, [get in touch](mailto:andy@project-you.app).
 
 ## Embedding Model
 
