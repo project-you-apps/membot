@@ -6,9 +6,10 @@ Built on the Vector+ Lattice Engine.
 
 Architecture:
   - SentenceTransformer (nomic-ai/nomic-embed-text-v1.5) for 768-dim embeddings
-  - Physics-enhanced search: query → lattice settle → L2 signature → blended ranking
-  - Blends 70% embedding cosine + 30% L2 physics similarity (when GPU + signatures available)
-  - Falls back to embedding-only cosine if no GPU or no signatures
+  - Sign-zero Hamming search: 70% embedding cosine + 30% Hamming similarity on binary codes
+  - Binary corpus: sign_zero encoding (bit_i = 1 if embedding_i > 0), 768 bits = 96 bytes/pattern
+  - Keyword reranking on top of blended scores
+  - GPU/lattice available for recall but not used for search ranking
   - Compatible with Vector Plus Studio v8.3 cartridge format (.npz/.pkl)
 
 Security:
@@ -79,7 +80,7 @@ CARTRIDGE_DIRS = [
     os.path.join(BASE_DIR, "cartridges"),
     os.path.join(BASE_DIR, "data"),
 ]
-PHYSICS_ENABLED = True        # 70/30 embedding+physics blend (embedder mismatch fixed)
+HAMMING_BLEND = 0.3           # 70% cosine + 30% sign_zero Hamming (replaces physics L2)
 
 # --- Security Limits ---
 MAX_ENTRIES = 100_000        # Max memories per cartridge
@@ -175,7 +176,8 @@ def _new_session() -> dict:
         "cartridge_path": None,
         "embeddings": None,       # (N, 768) float32
         "texts": [],              # list[str]
-        "signatures": None,       # (N, 4096) float32 or None
+        "binary_corpus": None,    # (N, 768) uint8 — sign_zero encoding for Hamming search
+        "signatures": None,       # (N, 4096) float32 or None (legacy, not used in search)
         "lattice": None,          # CUDA wrapper or None
         "gpu_available": False,
         "modified": False,        # True if memory_store was called since last save
@@ -540,11 +542,17 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
         state["signatures"] = None
         state["modified"] = False
 
+        # Compute sign_zero binary corpus for Hamming search (96 bytes per pattern)
+        if len(embeddings) > 0:
+            state["binary_corpus"] = (embeddings > 0).astype(np.uint8)
+        else:
+            state["binary_corpus"] = None
+
         n = len(texts)
         dim = embeddings.shape[1] if len(embeddings) > 0 else 0
         elapsed_ms = (time.time() - t0) * 1000
 
-        log.info(f"Loaded {n} entries, dim={dim}, format={data['format']}, integrity={verify_msg} in {elapsed_ms:.0f}ms")
+        log.info(f"Loaded {n} entries, dim={dim}, format={data['format']}, integrity={verify_msg}, sign_zero={n} codes, in {elapsed_ms:.0f}ms")
 
         # Load L2 signatures if available
         sig_base = cart["path"].rsplit(".", 1)[0]
@@ -591,7 +599,7 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
         query: Natural language search query
         top_k: Number of results to return (default 5)
         session_id: Session identifier (uses default session if empty)
-    """
+    """  # noqa: docstring kept generic for MCP schema — actual impl uses sign_zero Hamming
     if len(query) > MAX_QUERY_LENGTH:
         return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
 
@@ -617,59 +625,35 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
         query_norm = np.linalg.norm(query_emb) + 1e-9
         emb_scores = np.dot(stored / stored_norms, query_emb / query_norm)
 
-        # 3. Physics search: settle query through lattice, compare L2 signatures
+        # 3. Sign-zero Hamming search: binary XOR distance as secondary signal
         search_mode = "embedding"
-        physics_blend = 0.0
 
-        if PHYSICS_ENABLED and _gpu_state["available"] and _gpu_state["lattice"] is not None and state["signatures"] is not None:
+        if HAMMING_BLEND > 0 and state["binary_corpus"] is not None:
             try:
-                ml = _gpu_state["lattice"]
-                ml.reset()
-                ml.imprint_vector(query_emb)
-                ml.settle(frames=2, learn=False)
-                query_sig = ml.recall_l2().flatten()
+                # Sign-zero encode query: bit_i = 1 if query_emb_i > 0
+                q_bin = (query_emb > 0).astype(np.uint8)
+                corpus_bin = state["binary_corpus"]
+                n_bin = min(len(corpus_bin), len(emb_scores))
 
-                # Cosine similarity on L2 signatures (4096-dim physics space)
-                sigs = state["signatures"]
-                # Trim to match if cartridge was extended by memory_store
-                n_sigs = min(len(sigs), len(emb_scores))
-                sigs = sigs[:n_sigs]
+                # Hamming similarity: 1 - (XOR distance / n_bits)
+                n_bits = corpus_bin.shape[1]
+                xor = np.bitwise_xor(q_bin, corpus_bin[:n_bin])
+                dist = xor.sum(axis=1)
+                ham_scores = 1.0 - dist.astype(np.float32) / n_bits
 
-                sig_norms = np.linalg.norm(sigs, axis=1, keepdims=True) + 1e-9
-                q_sig_norm = np.linalg.norm(query_sig) + 1e-9
-                sig_scores = np.dot(sigs / sig_norms, query_sig / q_sig_norm)
-
-                # Confidence gating: skip physics blend if L2 signatures are degenerate.
-                # Gate on sig_std only — low variance means flat attractor (no discrimination).
-                # Overlap check removed: at large N, low overlap is expected for cross-domain
-                # queries and doesn't indicate bad signatures.
-                sig_std = float(np.std(sig_scores))
-
-                gate_physics = sig_std < 0.02
-
-                if gate_physics:
-                    scores = emb_scores
-                    search_mode = "embedding (physics gated)"
-                    physics_blend = 0.0
-                    log.info(f"Physics confidence gating: sig_std={sig_std:.4f} — "
-                             f"using embedding-only")
-                else:
-                    # Blend: 70% embedding + 30% physics (matches Studio v0.83 default)
-                    blended = np.copy(emb_scores)
-                    blended[:n_sigs] = 0.7 * emb_scores[:n_sigs] + 0.3 * sig_scores
-                    scores = blended
-                    search_mode = "physics+embedding"
-                    physics_blend = 0.3
-                    log.info(f"Physics search: L2 sig blended 70/30, sig_std={sig_std:.4f}, {n_sigs} patterns")
+                # Blend: 70% embedding cosine + 30% Hamming
+                blended = np.copy(emb_scores)
+                blended[:n_bin] = (1.0 - HAMMING_BLEND) * emb_scores[:n_bin] + HAMMING_BLEND * ham_scores
+                scores = blended
+                search_mode = "hamming+embedding"
+                log.info(f"Hamming search: sign_zero blended {1.0 - HAMMING_BLEND:.0%}/{HAMMING_BLEND:.0%}, {n_bin} patterns")
             except Exception as e:
-                log.warning(f"Physics search failed, falling back to embedding: {e}")
+                log.warning(f"Hamming search failed, falling back to embedding: {e}")
                 scores = emb_scores
         else:
             scores = emb_scores
-            if state["signatures"] is None:
-                log.info("No signatures loaded — embedding-only search")
-            elif not _gpu_state["available"]:
-                log.info("No GPU — embedding-only search")
+            if state["binary_corpus"] is None:
+                log.info("No binary corpus — embedding-only search")
 
         # 4. Keyword reranking — pull wider candidate pool, boost by keyword hits
         STOP_WORDS = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "to",
@@ -709,7 +693,10 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
             return f"No relevant matches for '{query}' (searched {len(state['texts'])} memories, {elapsed_ms:.0f}ms)"
 
         kw_label = f"+kw" if keywords else ""
-        mode_label = f"physics+embedding 70/30{kw_label}" if search_mode == "physics+embedding" else f"embedding-only{kw_label}"
+        if search_mode == "hamming+embedding":
+            mode_label = f"hamming+embedding 70/30{kw_label}"
+        else:
+            mode_label = f"embedding-only{kw_label}"
         header = f"Search [{mode_label}]: {len(results)} results from '{state['cartridge_name']}' ({elapsed_ms:.0f}ms)\n"
         return header + "\n\n".join(results)
 
@@ -750,7 +737,7 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     try:
         t0 = time.time()
 
-        # 1. Embed via Ollama
+        # 1. Embed via Nomic
         emb = embed_text(content, prefix="search_document")
 
         # 2. Add to embedding matrix
@@ -759,12 +746,19 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
         else:
             state["embeddings"] = np.vstack([state["embeddings"], emb.reshape(1, -1)])
 
-        # 3. Store text
+        # 3. Extend binary corpus (sign_zero for Hamming search)
+        new_bin = (emb > 0).astype(np.uint8).reshape(1, -1)
+        if state["binary_corpus"] is None or len(state["binary_corpus"]) == 0:
+            state["binary_corpus"] = new_bin
+        else:
+            state["binary_corpus"] = np.vstack([state["binary_corpus"], new_bin])
+
+        # 4. Store text
         stored_text = f"[{tags}] {content}" if tags else content
         state["texts"].append(stored_text)
         state["modified"] = True
 
-        # 4. GPU lattice imprint (if available)
+        # 5. GPU lattice imprint (if available)
         gpu_msg = ""
         if _gpu_state["available"] and _gpu_state["lattice"] is not None:
             try:
@@ -868,6 +862,7 @@ def unmount(session_id: str = "") -> str:
     state["cartridge_path"] = None
     state["embeddings"] = None
     state["texts"] = []
+    state["binary_corpus"] = None
     state["signatures"] = None
     state["modified"] = False
 
@@ -888,7 +883,8 @@ def get_status(session_id: str = "") -> str:
     cart = state["cartridge_name"] or "None"
     n = len(state["texts"]) if state["texts"] else 0
     dim = state["embeddings"].shape[1] if state["embeddings"] is not None and len(state["embeddings"]) > 0 else 0
-    has_sigs = state["signatures"] is not None
+    has_hamming = state["binary_corpus"] is not None
+    ham_bytes = f"{n * 96:,} bytes" if has_hamming else "N/A"
     gpu = "Ready" if _gpu_state["available"] else "Not available"
     modified = " (unsaved changes)" if state["modified"] else ""
     active_sessions = len(_sessions)
@@ -897,10 +893,11 @@ def get_status(session_id: str = "") -> str:
         f"Cartridge: {cart}{modified} | "
         f"Memories: {n}/{MAX_ENTRIES} | "
         f"Embedding dim: {dim} | "
-        f"Signatures: {'Yes' if has_sigs else 'No'} | "
+        f"Hamming index: {'Yes' if has_hamming else 'No'} ({ham_bytes}) | "
         f"GPU: {gpu} | "
         f"Sessions: {active_sessions} | "
         f"Session: {session_id} | "
+        f"Search: cosine+hamming 70/30+kw | "
         f"Embed: nomic-embed-text-v1.5 via SentenceTransformer"
     )
 

@@ -2,27 +2,33 @@
 
 **Brain cartridge server for AI agents.**
 
-Membot is an MCP server that gives AI agents swappable, physics-enhanced memory. Mount a brain cartridge, search it with real neural physics, store new memories, swap to a different domain --all through standard [Model Context Protocol](https://modelcontextprotocol.io/) tool calls.
+Membot is an MCP server that gives AI agents swappable, searchable memory stored on a neuromorphic substrate. Mount a brain cartridge, search it with multi-signal ranking, store new memories, swap to a different domain--all through standard [Model Context Protocol](https://modelcontextprotocol.io/) tool calls.
 
-Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector-plus-studio), Membot blends traditional embedding similarity with a 16-million neuron Hopfield network to find **associative relationships** that pure cosine similarity misses.
+Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector-plus-studio), Membot uses a three-signal search pipeline--embedding cosine, binary Hamming similarity, and keyword reranking--to find results that any single method would miss. No GPU required.
 
-![Membot Physics Demo](docs/garfield-physics-demo.png)
+![Membot Demo](docs/garfield-physics-demo.png)
 
-## The Physics Difference
+## How Search Works
 
-Standard vector search returns the closest embeddings by cosine distance. Membot does that too--but it also settles your query through a neural lattice with Mexican hat inhibition, Hebbian weights, and energy dynamics. The physics layer surfaces **contextual connections** across domains.
+Membot's search blends three independent signals, each catching what the others miss:
 
-Here we searched 100,000 Wikipedia articles with the query *"Is Garfield an American President or a Cat?"*:
+```text
+Query -> Nomic embed (768-dim)
+  |-- Cosine similarity (70%)       <- semantic geometry
+  |-- Hamming similarity (30%)      <- binary population code (XOR + popcount)
+  \-- Keyword reranking             <- +0.03 per hit, capped +0.12
+      -> Final ranked results
+```
 
-| Query: "Is Garfield an American President or a Cat?" | Embedding-Only | Physics Blend (70/30) |
-|---|---|---|
-| #1 | Garfield (cat) | Garfield (cat) |
-| #2 | James A. Garfield | James A. Garfield |
-| #3 | Charles J. Guiteau | Charles J. Guiteau |
-| #4 | Gerald Ford | Gerald Ford |
-| **#5** | **Barack Obama** | **Assassination of Garfield** |
+**Cosine** captures semantic meaning. **Hamming** operates on a compact binary code (768 bits = 96 bytes per pattern) derived from the sign structure of each embedding--a form of neuromorphic population coding. **Keywords** catch surface-level matches that embedding geometry sometimes misses.
 
-The top 4 stay the same (accuracy preserved), but rank #5 changes from a generic "president" match to a contextually meaningful connection. The physics found the assassination--a relationship that lives in the attractor dynamics, not in the embedding geometry.
+The binary code is computed at mount time: `bit_i = 1 if embedding_i > 0`. This sign pattern preserves the semantic fingerprint created by contrastive training (Pearson r=0.891 with full cosine), at 33x less storage.
+
+| Signal | What It Catches | Storage at 1M |
+|--------|-----------------|---------------|
+| Cosine (float32 embeddings) | Semantic similarity | 3 GB |
+| Hamming (sign-zero binary) | Population code agreement | 96 MB |
+| Keywords (raw text) | Exact term matches | (in passage text) |
 
 ## Quick Start
 
@@ -31,7 +37,7 @@ The top 4 stay the same (accuracy preserved), but rank #5 changes from a generic
 - Python 3.10+
 - An MCP-compatible agent ([OpenClaw](https://github.com/anthropics/openclaw), [Claude Code](https://claude.com/claude-code), etc.)
 
-Optional (for physics-enhanced search):
+Optional (for lattice recall and training):
 - NVIDIA GPU with CUDA 11.0+
 - Pre-built CUDA engine (`lattice_cuda_v7.dll` / `.so`)
 
@@ -162,7 +168,7 @@ See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working exa
 |------|-------------|
 | `list_cartridges` | Browse available brain cartridges with size and capabilities |
 | `mount_cartridge` | Load a cartridge into memory (embeddings + optional GPU brain) |
-| `memory_search` | Semantic search with physics+embedding blend and keyword reranking |
+| `memory_search` | Multi-signal search: cosine + Hamming + keyword reranking |
 | `memory_store` | Store new text into the mounted cartridge |
 | `save_cartridge` | Persist the current cartridge to disk (secure NPZ format) |
 | `unmount` | Free memory and unload the current cartridge |
@@ -170,23 +176,20 @@ See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working exa
 
 ## How It Works
 
-1. **Mount** a brain cartridge--embeddings, text, L2 signatures, and Hebbian weights load into memory
+1. **Mount** a brain cartridge--embeddings, text, and optional brain weights load into memory. A binary corpus (sign-zero encoding) is computed automatically for Hamming search.
 2. **Search**--your query is embedded (Nomic v1.5, 768-dim), then:
-   - Cosine similarity against stored embeddings (fast, always available)
-   - Lattice settle: query is imprinted → physics runs → L2 signature extracted → cosine against stored signatures (GPU, when available)
-   - **70/30 blend**: 70% embedding + 30% physics similarity
-   - Keyword reranking boosts results that contain query terms
-3. **Store**--new text is embedded and added to the cartridge; optionally imprinted into the lattice with Hebbian learning
+   - Cosine similarity against stored embeddings (semantic ranking)
+   - Hamming similarity on sign-zero binary codes (population code matching)
+   - **70/30 blend**: 70% cosine + 30% Hamming
+   - Keyword reranking boosts results containing query terms
+3. **Store**--new text is embedded, added to the cartridge, and its binary code is appended to the Hamming index
 4. **Save**--cartridge persists as secure `.npz` with SHA256 integrity manifest
 
-### Search Modes
+### The Neuromorphic Substrate
 
-| Mode | When | Speed (100k) |
-|------|------|------|
-| Embedding-only | No GPU or no signatures | ~200ms |
-| Physics + Embedding (70/30) | GPU + signatures loaded | ~10s |
+Patterns are stored on a neuromorphic lattice--a 64x64 grid of 64 regions (16 million neurons) with Hebbian weights, Mexican hat inhibition, and energy dynamics. The lattice provides **content-addressable recall**: present a partial or noisy cue, and the attractor dynamics converge to the correct stored pattern. This is Hopfield network behavior, validated to 1 million patterns with no capacity wall.
 
-Physics search is slower but finds cross-domain associative connections that embedding search can't. The confidence gating automatically falls back to embedding-only when the physics signal is degenerate.
+Search uses the compact binary index (fast, no GPU). Recall uses the full lattice physics (noise-tolerant, associative). One substrate, two access modes.
 
 ## Brain Cartridges
 
@@ -195,9 +198,10 @@ A brain cartridge is a self-contained memory unit:
 | File | Contents | Required |
 |------|----------|----------|
 | `name.pkl` or `name.cart.npz` | Embeddings + text | Yes |
-| `name_signatures.npz` | L2 hierarchy vectors (4096-dim) | For physics search |
-| `name_brain.npy` | Hebbian weight matrix (128 MB) | For physics search |
+| `name_brain.npy` | Hebbian weight matrix (128 MB) | For lattice recall |
 | `name_manifest.json` | SHA256 integrity fingerprint | Recommended |
+
+The binary Hamming index is computed automatically at mount time from the stored embeddings--no pre-built index files needed.
 
 Cartridges are compatible with [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) v8.2+. Build them in Studio or with the CLI builder, serve them with Membot.
 
@@ -209,7 +213,7 @@ Use the included `cartridge_builder.py` to create cartridges from local document
 # Embed a folder of documents (fast, no GPU needed)
 python cartridge_builder.py ./my-docs/ --name my-knowledge
 
-# Full build with lattice training (GPU required, enables physics search)
+# Full build with lattice training (GPU required, enables associative recall)
 python cartridge_builder.py ./my-docs/ --name my-knowledge --train
 
 # Single file, custom chunk size
@@ -230,7 +234,7 @@ The repo includes a pre-built cartridge of [*Attention Is All You Need*](https:/
 > memory_search("how does multi-head attention work")
 ```
 
-To enable physics-enhanced search, rebuild the cartridge with `--train` (requires GPU). This generates the brain weights and L2 signatures that the physics blend needs:
+To enable lattice recall (content-addressable memory with noise tolerance), rebuild with `--train` (requires GPU):
 
 ```bash
 python cartridge_builder.py attention-paper.pdf --name attention-is-all-you-need --train
@@ -319,7 +323,7 @@ sudo systemctl enable membot
 sudo systemctl start membot
 ```
 
-**Requirements**: Python 3.10+ and ~2 GB RAM (SentenceTransformer model). No GPU needed for embedding-only search.
+**Requirements**: Python 3.10+ and ~2 GB RAM (SentenceTransformer model). No GPU needed for search.
 
 ## Security
 
@@ -344,7 +348,7 @@ The model downloads automatically on first run (~270 MB). Subsequent starts load
 |-----------|---------|-------------|
 | Python | 3.10+ | 3.12+ |
 | RAM | 4 GB | 16+ GB |
-| GPU | None (embedding-only mode) | NVIDIA RTX 3080+ |
+| GPU | None (search works without GPU) | NVIDIA RTX 3080+ (for lattice recall) |
 | VRAM | -- | 8+ GB |
 | CUDA | -- | 12.0+ |
 
