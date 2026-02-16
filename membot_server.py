@@ -588,7 +588,7 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
 
 
 @mcp.tool()
-def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
+def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: bool = False) -> str:
     """Search the mounted cartridge using lattice physics + embedding similarity.
     Runs the query through the neural lattice (settle → L2 signature) and blends
     physics-based similarity with embedding cosine for ranked results.
@@ -599,6 +599,7 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
         query: Natural language search query
         top_k: Number of results to return (default 5)
         session_id: Session identifier (uses default session if empty)
+        verbose: Show per-result signal breakdown (cosine, hamming, keyword boost)
     """  # noqa: docstring kept generic for MCP schema — actual impl uses sign_zero Hamming
     if len(query) > MAX_QUERY_LENGTH:
         return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
@@ -627,6 +628,7 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
 
         # 3. Sign-zero Hamming search: binary XOR distance as secondary signal
         search_mode = "embedding"
+        ham_scores = None
 
         if HAMMING_BLEND > 0 and state["binary_corpus"] is not None:
             try:
@@ -673,7 +675,7 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
             text_lower = state["texts"][i].lower()
             hits = sum(1 for kw in keywords if kw in text_lower)
             boost = min(hits * 0.03, 0.12)  # up to 0.12 boost (4+ keyword hits)
-            boosted.append((i, base_score + boost))
+            boosted.append((i, base_score + boost, boost))
 
         boosted.sort(key=lambda x: x[1], reverse=True)
 
@@ -681,13 +683,19 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "") -> str:
 
         # 5. Format results
         results = []
-        for rank, (i, final_score) in enumerate(boosted[:top_k], 1):
+        for rank, (i, final_score, kw_boost) in enumerate(boosted[:top_k], 1):
             if final_score < 0.1:
                 continue
             text = state["texts"][i]
             if len(text) > 500:
                 text = text[:500] + "..."
-            results.append(f"#{rank} [{final_score:.3f}] {text}")
+            if verbose:
+                cos_s = f"{float(emb_scores[i]):.3f}"
+                ham_s = f"{float(ham_scores[i]):.3f}" if ham_scores is not None and i < len(ham_scores) else "—"
+                kw_s = f"+{kw_boost:.3f}" if kw_boost > 0 else "—"
+                results.append(f"#{rank} [{final_score:.3f}] cos={cos_s} ham={ham_s} kw={kw_s}\n{text}")
+            else:
+                results.append(f"#{rank} [{final_score:.3f}] {text}")
 
         if not results:
             return f"No relevant matches for '{query}' (searched {len(state['texts'])} memories, {elapsed_ms:.0f}ms)"
