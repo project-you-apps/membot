@@ -23,6 +23,9 @@ data/*.json
 # Model cache
 model_cache/
 
+# Downloaded source text caches
+gutenberg_cache/
+
 # Logs
 *.log
 

@@ -182,7 +182,34 @@ def _new_session() -> dict:
         "gpu_available": False,
         "modified": False,        # True if memory_store was called since last save
         "last_access": time.time(),
+        "created_at": time.time(),
+        "query_count": 0,
+        "mount_count": 0,
+        "last_action": None,      # e.g. "search 'earthquake'" or "mount wiki-10k"
+        "last_action_time": None,
     }
+
+
+# --- Depot Activity Log (ring buffer) ---
+DEPOT_ACTIVITY_MAX = 200
+_depot_activity: collections.deque = collections.deque(maxlen=DEPOT_ACTIVITY_MAX)
+_depot_start_time = time.time()
+
+
+def _log_activity(session_id: str, action: str, detail: str = "", latency_ms: float = 0):
+    """Append an entry to the depot activity log and update session state."""
+    entry = {
+        "time": time.time(),
+        "session": session_id,
+        "action": action,
+        "detail": detail,
+        "latency_ms": round(latency_ms, 1),
+    }
+    _depot_activity.append(entry)
+    # Update session last_action
+    if session_id in _sessions:
+        _sessions[session_id]["last_action"] = f"{action} {detail}".strip()
+        _sessions[session_id]["last_action_time"] = time.time()
 
 # session_id → session state dict
 _sessions: dict[str, dict] = {}
@@ -462,6 +489,534 @@ def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str]):
 mcp = FastMCP("Membot")
 
 
+# ============================================================
+# REST API — Simple HTTP endpoints for browser extensions, etc.
+# These bypass MCP protocol overhead for direct tool access.
+# ============================================================
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+
+@mcp.custom_route("/api/store", methods=["POST", "OPTIONS"])
+async def rest_store(request: Request) -> JSONResponse:
+    """REST wrapper for memory_store — used by Heartbeat browser extension."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        data = await request.json()
+        result = memory_store.fn(
+            content=data.get("content", ""),
+            tags=data.get("tags", ""),
+            session_id=data.get("session_id", "")
+        )
+        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/store error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/search", methods=["POST", "OPTIONS"])
+async def rest_search(request: Request) -> JSONResponse:
+    """REST wrapper for memory_search — used by Heartbeat browser extension."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        data = await request.json()
+        result = memory_search.fn(
+            query=data.get("query", ""),
+            top_k=data.get("top_k", 5),
+            session_id=data.get("session_id", "")
+        )
+        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/search error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/status", methods=["GET", "OPTIONS"])
+async def rest_status(request: Request) -> JSONResponse:
+    """REST health check — returns mounted cartridge + memory count."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        result = get_status.fn()
+        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/save", methods=["POST", "OPTIONS"])
+async def rest_save(request: Request) -> JSONResponse:
+    """REST wrapper for save_cartridge — persist to disk."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        result = save_cartridge.fn()
+        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/save error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+def _cors_headers():
+    """CORS headers for browser extension access."""
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    }
+
+
+# ============================================================
+# DEPOT DASHBOARD — Operator status board
+# ============================================================
+
+from starlette.responses import HTMLResponse
+
+
+@mcp.custom_route("/depot/status", methods=["GET", "OPTIONS"])
+async def depot_status(request: Request) -> JSONResponse:
+    """JSON snapshot of all sessions, cartridges, and recent activity."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+
+    now = time.time()
+    uptime_sec = now - _depot_start_time
+
+    # Sessions summary
+    sessions_out = []
+    for sid, s in _sessions.items():
+        idle_sec = now - s["last_access"]
+        if idle_sec > SESSION_TIMEOUT_SEC:
+            status = "expired"
+        elif s.get("last_action_time") and (now - s["last_action_time"]) < 10:
+            status = "active"
+        elif s["cartridge_name"] is None:
+            status = "idle"
+        else:
+            status = "idle" if idle_sec > 30 else "active"
+        sessions_out.append({
+            "session_id": sid,
+            "cartridge": s["cartridge_name"],
+            "status": status,
+            "idle_sec": round(idle_sec, 1),
+            "query_count": s.get("query_count", 0),
+            "mount_count": s.get("mount_count", 0),
+            "last_action": s.get("last_action"),
+            "created_at": s.get("created_at", s["last_access"]),
+        })
+
+    # Cartridge refcounts (how many sessions have each cart mounted)
+    cart_refs = {}
+    for s in _sessions.values():
+        cn = s["cartridge_name"]
+        if cn:
+            if cn not in cart_refs:
+                cart_refs[cn] = {"name": cn, "agents": 0, "entries": len(s["texts"]) if s["texts"] else 0}
+            cart_refs[cn]["agents"] += 1
+
+    # Available cartridges on disk
+    disk_carts = []
+    try:
+        for c in find_cartridges():
+            disk_carts.append({
+                "name": c["name"],
+                "size_mb": c.get("size_mb", 0),
+                "mounted": c["name"] in cart_refs,
+                "agents": cart_refs.get(c["name"], {}).get("agents", 0),
+            })
+    except Exception:
+        pass
+
+    # Recent activity (last 50)
+    activity_out = []
+    for entry in list(_depot_activity)[-50:]:
+        activity_out.append({
+            "time": entry["time"],
+            "ago_sec": round(now - entry["time"], 1),
+            "session": entry["session"],
+            "action": entry["action"],
+            "detail": entry["detail"],
+            "latency_ms": entry["latency_ms"],
+        })
+    activity_out.reverse()  # newest first
+
+    return JSONResponse({
+        "uptime_sec": round(uptime_sec, 0),
+        "active_sessions": len([s for s in sessions_out if s["status"] == "active"]),
+        "total_sessions": len(sessions_out),
+        "sessions": sessions_out,
+        "cartridges": disk_carts,
+        "mounted_carts": list(cart_refs.values()),
+        "activity": activity_out,
+        "gpu": _gpu_state["available"],
+    }, headers=_cors_headers())
+
+
+@mcp.custom_route("/depot", methods=["GET"])
+async def depot_dashboard(request: Request) -> HTMLResponse:
+    """Membot Depot — server rack dashboard."""
+    return HTMLResponse(_DEPOT_HTML)
+
+
+_DEPOT_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Membot Depot</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0e14; color: #c8d0da; font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px; overflow: hidden; height: 100vh;
+  }
+  .header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 20px; background: #111820; border-bottom: 1px solid #1e2a38;
+  }
+  .header h1 { font-size: 16px; font-weight: 600; letter-spacing: 1px; }
+  .header h1 span { color: #3b82f6; }
+  .header-stats { display: flex; gap: 20px; font-size: 12px; color: #6b7b8d; }
+  .header-stats .val { color: #e2e8f0; font-weight: 600; }
+
+  .panels { display: flex; flex-direction: column; height: calc(100vh - 49px); }
+
+  /* Rack panel */
+  .rack-panel {
+    padding: 16px 20px; border-bottom: 1px solid #1e2a38;
+    flex-shrink: 0; position: relative;
+  }
+  .rack-panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #4a5568; margin-bottom: 12px; }
+  .rack-grid { display: flex; flex-wrap: wrap; gap: 12px; }
+
+  .cart-block {
+    width: 130px; background: #141c26; border: 1px solid #1e2a38;
+    border-radius: 6px; padding: 10px; cursor: pointer; transition: all 0.2s;
+    position: relative;
+  }
+  .cart-block:hover { border-color: #3b82f6; background: #182030; }
+  .cart-block.hot { border-color: #22c55e33; box-shadow: 0 0 12px #22c55e11; }
+  .cart-block.cold { opacity: 0.5; }
+  .cart-name { font-size: 12px; font-weight: 600; color: #e2e8f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cart-meta { font-size: 10px; color: #4a5568; margin-top: 2px; }
+  .cart-leds { display: flex; gap: 4px; margin-top: 8px; min-height: 10px; }
+  .led {
+    width: 10px; height: 10px; border-radius: 50%; position: relative;
+    cursor: pointer; transition: all 0.3s;
+  }
+  .led.active { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+  .led.idle { background: #eab308; box-shadow: 0 0 4px #eab30844; }
+  .led.expired { background: #4a5568; }
+  .led-tooltip {
+    display: none; position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: #1e293b; border: 1px solid #334155; border-radius: 4px; padding: 4px 8px;
+    font-size: 10px; white-space: nowrap; z-index: 10; color: #e2e8f0;
+  }
+  .led:hover .led-tooltip { display: block; }
+
+  .empty-slot {
+    width: 130px; height: 72px; border: 1px dashed #1e2a38; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; color: #2a3544;
+  }
+
+  /* Expand button on panels */
+  .expand-btn {
+    position: absolute; top: 8px; right: 12px; background: none; border: none;
+    color: #4a5568; cursor: pointer; font-size: 14px; padding: 4px;
+  }
+  .expand-btn:hover { color: #e2e8f0; }
+
+  /* Activity log */
+  .activity-panel { flex: 1; overflow: hidden; display: flex; flex-direction: column; padding: 0 20px 12px; }
+  .activity-panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;
+    color: #4a5568; padding: 12px 0 8px; flex-shrink: 0; position: relative;
+  }
+  .activity-list { flex: 1; overflow-y: auto; }
+  .activity-list::-webkit-scrollbar { width: 4px; }
+  .activity-list::-webkit-scrollbar-thumb { background: #1e2a38; border-radius: 2px; }
+
+  .activity-row {
+    display: grid; grid-template-columns: 70px 110px 60px 1fr 60px;
+    gap: 8px; padding: 4px 0; font-size: 11px; font-family: 'Cascadia Code', 'Fira Code', monospace;
+    border-bottom: 1px solid #0d1219;
+  }
+  .activity-row .time { color: #4a5568; }
+  .activity-row .session { color: #3b82f6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .activity-row .action { color: #22c55e; }
+  .activity-row .action.mount { color: #eab308; }
+  .activity-row .action.unmount { color: #ef4444; }
+  .activity-row .detail { color: #8892a0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .activity-row .latency { color: #4a5568; text-align: right; }
+
+  /* Detail pane (click cart or LED) */
+  .detail-pane {
+    display: none; position: fixed; right: 0; top: 0; width: 340px; height: 100vh;
+    background: #111820; border-left: 1px solid #1e2a38; padding: 16px; z-index: 100;
+    overflow-y: auto;
+  }
+  .detail-pane.open { display: block; }
+  .detail-pane h3 { font-size: 14px; margin-bottom: 12px; }
+  .detail-pane .close-btn {
+    position: absolute; top: 12px; right: 12px; background: none; border: none;
+    color: #6b7b8d; cursor: pointer; font-size: 16px;
+  }
+  .detail-field { margin-bottom: 8px; }
+  .detail-field .label { font-size: 10px; text-transform: uppercase; color: #4a5568; }
+  .detail-field .value { font-size: 13px; color: #e2e8f0; }
+
+  /* Expanded panel */
+  .panels.rack-expanded .rack-panel { flex: 1; overflow-y: auto; }
+  .panels.rack-expanded .activity-panel { display: none; }
+  .panels.activity-expanded .rack-panel { display: none; }
+  .panels.activity-expanded .activity-panel { flex: 1; }
+
+  /* No data state */
+  .no-data { color: #2a3544; font-style: italic; padding: 20px; text-align: center; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>MEMBOT</span> DEPOT</h1>
+  <div class="header-stats">
+    <div><a href="#" onclick="showCartList();return false" style="color:#4fc3f7;text-decoration:none" title="View cartridge list">Carts: <span class="val" id="hdr-carts">0</span></a></div>
+    <div>Sessions: <span class="val" id="hdr-sessions">0</span></div>
+    <div>Queries: <span class="val" id="hdr-queries">0</span></div>
+    <div>GPU: <span class="val" id="hdr-gpu">—</span></div>
+    <div>Uptime: <span class="val" id="hdr-uptime">—</span></div>
+  </div>
+</div>
+
+<div class="panels" id="panels">
+  <div class="rack-panel" id="rack-panel">
+    <h2>Cartridge Rack</h2>
+    <button class="expand-btn" onclick="toggleExpand('rack')" title="Expand">&#x2922;</button>
+    <div class="rack-grid" id="rack-grid"></div>
+  </div>
+
+  <div class="activity-panel" id="activity-panel">
+    <h2>
+      Recent Activity
+      <button class="expand-btn" onclick="toggleExpand('activity')" title="Expand">&#x2922;</button>
+    </h2>
+    <div class="activity-list" id="activity-list"></div>
+  </div>
+</div>
+
+<div class="detail-pane" id="detail-pane">
+  <button class="close-btn" onclick="closeDetail()">&#x2715;</button>
+  <div id="detail-content"></div>
+</div>
+
+<script>
+const POLL_MS = 2000;
+let lastData = null;
+
+function fmt_time(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('en-US', {hour12: false, hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+
+function fmt_uptime(sec) {
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+function fmt_ago(sec) {
+  if (sec < 5) return '<5s';
+  if (sec < 60) return Math.round(sec) + 's';
+  if (sec < 3600) return Math.round(sec/60) + 'm';
+  return Math.round(sec/3600) + 'h';
+}
+
+function toggleExpand(panel) {
+  const el = document.getElementById('panels');
+  if (el.classList.contains(panel + '-expanded')) {
+    el.className = 'panels';
+  } else {
+    el.className = 'panels ' + panel + '-expanded';
+  }
+}
+
+function closeDetail() {
+  document.getElementById('detail-pane').classList.remove('open');
+}
+
+function showCartList() {
+  const pane = document.getElementById('detail-pane');
+  const content = document.getElementById('detail-content');
+  const carts = lastData?.cartridges || [];
+  const sessions = lastData?.sessions || [];
+  const totalMB = carts.reduce((a, c) => a + (parseFloat(c.size_mb) || 0), 0).toFixed(1);
+  content.innerHTML = '<h3>Available Cartridges (' + carts.length + ')</h3>' +
+    '<div style="color:#8892a0;font-size:12px;margin-bottom:12px">Total: ' + totalMB + ' MB on disk</div>' +
+    (carts.length === 0 ? '<div class="no-data">No cartridges found</div>' :
+      carts.map(c => {
+        const agents = sessions.filter(s => s.cartridge === c.name);
+        const status = c.mounted ? '<span style="color:#4caf50">mounted (' + agents.length + ' agent' + (agents.length !== 1 ? 's' : '') + ')</span>' : '<span style="color:#4a5568">on disk</span>';
+        return '<div style="margin:6px 0;padding:8px;background:#0d1219;border-radius:4px;cursor:pointer" onclick="showCartDetail(' + esc_attr(JSON.stringify(c)) + ')">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center">' +
+            '<span style="color:#e2e8f0;font-weight:600">' + esc(c.name) + '</span>' +
+            '<span style="color:#8892a0;font-size:11px">' + c.size_mb + ' MB</span>' +
+          '</div>' +
+          '<div style="font-size:11px;margin-top:4px">' + status + '</div>' +
+        '</div>';
+      }).join('')
+    );
+  pane.classList.add('open');
+}
+
+function showCartDetail(cart) {
+  const pane = document.getElementById('detail-pane');
+  const content = document.getElementById('detail-content');
+  // Find sessions on this cart
+  const sessions = (lastData?.sessions || []).filter(s => s.cartridge === cart.name);
+  content.innerHTML = '<h3>' + esc(cart.name) + '</h3>' +
+    field('Size', cart.size_mb + ' MB') +
+    field('Agents', cart.agents) +
+    field('Status', cart.mounted ? 'Mounted' : 'On disk') +
+    '<h3 style="margin-top:16px">Connected Agents</h3>' +
+    (sessions.length === 0 ? '<div class="no-data">None</div>' :
+      sessions.map(s =>
+        '<div style="margin:8px 0;padding:8px;background:#0d1219;border-radius:4px">' +
+          field('Session', s.session_id) +
+          field('Queries', s.query_count) +
+          field('Idle', fmt_ago(s.idle_sec)) +
+          field('Last', s.last_action || '—') +
+        '</div>'
+      ).join('')
+    );
+  pane.classList.add('open');
+}
+
+function showSessionDetail(session) {
+  const pane = document.getElementById('detail-pane');
+  const content = document.getElementById('detail-content');
+  const activities = (lastData?.activity || []).filter(a => a.session === session.session_id).slice(0, 20);
+  content.innerHTML = '<h3>' + esc(session.session_id) + '</h3>' +
+    field('Cartridge', session.cartridge || 'None') +
+    field('Status', session.status) +
+    field('Queries', session.query_count) +
+    field('Mounts', session.mount_count) +
+    field('Idle', fmt_ago(session.idle_sec)) +
+    field('Last Action', session.last_action || '—') +
+    '<h3 style="margin-top:16px">Recent Activity</h3>' +
+    (activities.length === 0 ? '<div class="no-data">None</div>' :
+      activities.map(a =>
+        '<div style="font-size:11px;font-family:monospace;padding:2px 0;color:#8892a0">' +
+          fmt_time(a.time) + ' ' + a.action + ' ' + esc(a.detail) +
+          (a.latency_ms > 0 ? ' <span style="color:#4a5568">' + a.latency_ms + 'ms</span>' : '') +
+        '</div>'
+      ).join('')
+    );
+  pane.classList.add('open');
+}
+
+function field(label, val) {
+  return '<div class="detail-field"><div class="label">' + label + '</div><div class="value">' + esc(String(val)) + '</div></div>';
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function render(data) {
+  lastData = data;
+
+  // Header
+  const carts_all = data.cartridges || [];
+  document.getElementById('hdr-carts').textContent = carts_all.length;
+  document.getElementById('hdr-sessions').textContent = data.active_sessions + ' active';
+  const totalQ = (data.sessions || []).reduce((a, s) => a + s.query_count, 0);
+  document.getElementById('hdr-queries').textContent = totalQ;
+  document.getElementById('hdr-gpu').textContent = data.gpu ? 'Ready' : 'CPU only';
+  document.getElementById('hdr-uptime').textContent = fmt_uptime(data.uptime_sec);
+
+  // Rack grid — one block per disk cartridge + empty slots
+  const grid = document.getElementById('rack-grid');
+  const carts = data.cartridges || [];
+  const sessions = data.sessions || [];
+
+  let html = '';
+  for (const cart of carts) {
+    const agents = sessions.filter(s => s.cartridge === cart.name);
+    const isHot = agents.some(a => a.status === 'active');
+    const cls = cart.mounted ? (isHot ? 'hot' : '') : 'cold';
+    html += '<div class="cart-block ' + cls + '" onclick="showCartDetail(' + esc_attr(JSON.stringify(cart)) + ')">';
+    html += '<div class="cart-name">' + esc(cart.name) + '</div>';
+    html += '<div class="cart-meta">' + cart.size_mb + ' MB</div>';
+    html += '<div class="cart-leds">';
+    for (const agent of agents) {
+      html += '<div class="led ' + agent.status + '" onclick="event.stopPropagation();showSessionDetail(' + esc_attr(JSON.stringify(agent)) + ')">';
+      html += '<div class="led-tooltip">' + esc(agent.session_id) + '<br>' + (agent.last_action || 'idle') + '</div>';
+      html += '</div>';
+    }
+    html += '</div></div>';
+  }
+  // Empty slots to fill the row
+  const empties = Math.max(0, 6 - carts.length);
+  for (let i = 0; i < empties; i++) {
+    html += '<div class="empty-slot">empty</div>';
+  }
+  grid.innerHTML = html;
+
+  // Activity log
+  const actList = document.getElementById('activity-list');
+  let actHtml = '';
+  const acts = data.activity || [];
+  if (acts.length === 0) {
+    actHtml = '<div class="no-data">No activity yet — agents will appear here when they connect</div>';
+  }
+  for (const a of acts) {
+    const actionCls = a.action === 'mount' ? 'mount' : a.action === 'unmount' ? 'unmount' : '';
+    actHtml += '<div class="activity-row">';
+    actHtml += '<div class="time">' + fmt_time(a.time) + '</div>';
+    actHtml += '<div class="session">' + esc(a.session) + '</div>';
+    actHtml += '<div class="action ' + actionCls + '">' + a.action + '</div>';
+    actHtml += '<div class="detail">' + esc(a.detail) + '</div>';
+    actHtml += '<div class="latency">' + (a.latency_ms > 0 ? a.latency_ms + 'ms' : '') + '</div>';
+    actHtml += '</div>';
+  }
+  actList.innerHTML = actHtml;
+}
+
+function esc_attr(s) {
+  return s.replace(/&/g,'&amp;').replace(/'/g,'&#39;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+}
+
+async function poll() {
+  try {
+    const base = location.pathname.replace(/\/depot\/?$/, '');
+    const resp = await fetch(base + '/depot/status');
+    if (resp.ok) {
+      const data = await resp.json();
+      render(data);
+    }
+  } catch (e) {
+    // Network error — will retry next cycle
+  }
+}
+
+// Initial load + polling
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
+"""
+
+
 @mcp.tool()
 def list_cartridges() -> str:
     """List available brain cartridges with size and capabilities.
@@ -577,6 +1132,8 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
                 gpu_msg = f", brain load failed: {e}"
                 log.warning(f"Brain load failed: {e}")
 
+        state["mount_count"] = state.get("mount_count", 0) + 1
+        _log_activity(session_id, "mount", cart['name'], elapsed_ms)
         return f"Mounted '{cart['name']}': {n} memories, {dim}-dim, {data['format'].upper()}, integrity={verify_msg}{gpu_msg}. Session: {session_id}"
 
     except PermissionError as e:
@@ -696,6 +1253,9 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
                 results.append(f"#{rank} [{final_score:.3f}] cos={cos_s} ham={ham_s} kw={kw_s}\n{text}")
             else:
                 results.append(f"#{rank} [{final_score:.3f}] {text}")
+
+        state["query_count"] = state.get("query_count", 0) + 1
+        _log_activity(session_id, "search", f"'{query[:40]}' → {len(boosted[:top_k])} results", elapsed_ms)
 
         if not results:
             return f"No relevant matches for '{query}' (searched {len(state['texts'])} memories, {elapsed_ms:.0f}ms)"
@@ -874,6 +1434,7 @@ def unmount(session_id: str = "") -> str:
     state["signatures"] = None
     state["modified"] = False
 
+    _log_activity(session_id, "unmount", name)
     return f"Unmounted '{name}'.{warning}"
 
 
@@ -994,6 +1555,8 @@ if __name__ == "__main__":
                         help="HTTP port (default: 8000)")
     parser.add_argument("--read-only", action="store_true",
                         help="Disable memory_store and save_cartridge (public server mode)")
+    parser.add_argument("--mount", type=str, default=None,
+                        help="Auto-mount a cartridge on startup (creates empty cart if not found)")
     args = parser.parse_args()
 
     _server_config["read_only"] = args.read_only
@@ -1011,6 +1574,44 @@ if __name__ == "__main__":
     # Count available cartridges
     carts = find_cartridges()
     log.info(f"Found {len(carts)} cartridges")
+
+    # Auto-mount cartridge if requested
+    if args.mount:
+        cart_name = args.mount
+        # Check if cartridge exists; if not, create empty one
+        matching = [c for c in carts if cart_name.lower() in c["name"].lower()]
+        if not matching:
+            log.info(f"Cartridge '{cart_name}' not found — creating empty cartridge")
+            save_dir = os.path.join(BASE_DIR, "cartridges")
+            os.makedirs(save_dir, exist_ok=True)
+            empty_path = os.path.join(save_dir, f"{cart_name}.cart.npz")
+            empty_emb = np.zeros((0, 768), dtype=np.float32)
+            save_as_npz(empty_path, empty_emb, [])
+            save_manifest(empty_path, empty_emb, 0)
+            log.info(f"Created empty cartridge: {empty_path}")
+
+        # Mount into default session (bypass @mcp.tool decorator)
+        sid = _resolve_session_id("")
+        state = _get_session(sid)
+        mount_carts = find_cartridges()
+        mount_match = [c for c in mount_carts if cart_name.lower() in c["name"].lower()]
+        if mount_match:
+            cart = mount_match[0]
+            data = load_cartridge_safe(cart["path"])
+            state["embeddings"] = data["embeddings"]
+            state["texts"] = data["texts"]
+            state["cartridge_name"] = cart["name"]
+            state["cartridge_path"] = cart["path"]
+            state["signatures"] = None
+            state["modified"] = False
+            if len(data["embeddings"]) > 0:
+                state["binary_corpus"] = (data["embeddings"] > 0).astype(np.uint8)
+            else:
+                state["binary_corpus"] = None
+            ok, verify_msg = verify_manifest(cart["path"], data["embeddings"], len(data["texts"]))
+            log.info(f"Auto-mounted '{cart['name']}': {len(data['texts'])} memories, integrity={verify_msg}")
+        else:
+            log.error(f"Auto-mount failed: '{cart_name}' still not found after creation")
 
     # Setup HTTP middleware if not in stdio mode
     if args.transport != "stdio":

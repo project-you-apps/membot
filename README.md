@@ -174,6 +174,37 @@ See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working exa
 | `unmount` | Free memory and unload the current cartridge |
 | `get_status` | Server diagnostics (mounted cartridge, memory count, GPU status) |
 
+## Depot Dashboard
+
+Membot includes a built-in operational dashboard showing all cartridges, connected agents, and activity in real time.
+
+```
+https://your-server:8000/depot
+```
+
+![Depot Dashboard](docs/depot-dashboard.png)
+
+The dashboard shows:
+- **Cartridge rack**: Every cartridge on disk as a block, with colored LEDs for connected agents (green = active, amber = idle)
+- **Activity log**: Last 200 events (mounts, searches, unmounts) with session IDs and latency
+- **Detail panes**: Click any cart or agent LED for drill-down stats
+
+The dashboard is a single-page app embedded in the server — no build step, no dependencies. It polls `/depot/status` every 2 seconds.
+
+### Behind a Reverse Proxy
+
+If you serve Membot behind nginx (e.g., at `/membot/`), the dashboard auto-detects its base path:
+
+```nginx
+location /membot/ {
+    proxy_pass http://127.0.0.1:8000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+Then access at `https://your-domain/membot/depot`.
+
 ## How It Works
 
 1. **Mount** a brain cartridge--embeddings, text, and optional brain weights load into memory. A binary corpus (sign-zero encoding) is computed automatically for Hamming search.
@@ -356,8 +387,9 @@ The model downloads automatically on first run (~270 MB). Subsequent starts load
 
 ```
 membot/
-├── membot_server.py              # MCP server entry point
+├── membot_server.py              # MCP server entry point + depot dashboard
 ├── cartridge_builder.py          # CLI tool to build cartridges from documents
+├── build_gutenberg_cartridge.py  # Download + embed 44 Project Gutenberg classics
 ├── multi_lattice_wrapper_v7.py   # Python wrapper for CUDA engine
 ├── requirements.txt
 ├── bin/
