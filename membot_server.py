@@ -596,9 +596,10 @@ async def rest_search(request: Request) -> JSONResponse:
                 tag_end = text.index("]")
                 tags = text[1:tag_end]
                 text = text[tag_end + 1:].strip()
+            full_text = text
             if len(text) > 500:
                 text = text[:500] + "..."
-            results.append({"text": text, "score": round(final_score, 4), "tags": tags, "index": int(i)})
+            results.append({"text": text, "full_text": full_text, "score": round(final_score, 4), "tags": tags, "index": int(i)})
 
         state["query_count"] = state.get("query_count", 0) + 1
         _log_activity(session_id, "search", f"'{query[:40]}' -> {len(results)} results", elapsed_ms)
@@ -1225,6 +1226,22 @@ _APP_HTML = """\
   .result-text mark { background:#eab30830; color:var(--amber); border-radius:2px; padding:0 2px; }
   .result-footer { margin-top:10px; padding-top:8px; border-top:1px solid var(--border); display:flex; gap:12px; font-size:11px; color:var(--text-dim); font-family:var(--mono); }
   .result-footer .tag { background:var(--surface-2); padding:1px 6px; border-radius:3px; }
+  .result-card { cursor:pointer; }
+  .passage-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:900; display:flex; align-items:center; justify-content:center; opacity:0; transition:opacity 0.2s; pointer-events:none; }
+  .passage-overlay.open { opacity:1; pointer-events:auto; }
+  .passage-modal { background:var(--bg); border:1px solid var(--border); border-radius:14px; width:min(800px,90vw); max-height:80vh; display:flex; flex-direction:column; box-shadow:0 24px 80px #00000080; }
+  .passage-modal-header { display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .passage-modal-header .modal-rank { font-size:12px; font-weight:700; color:var(--accent); font-family:var(--mono); }
+  .passage-modal-header .modal-score { font-size:12px; color:var(--text-dim); font-family:var(--mono); margin-left:12px; }
+  .passage-modal-header .modal-close { background:none; border:1px solid var(--border); color:var(--text-dim); width:32px; height:32px; border-radius:6px; cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center; transition:all 0.2s; }
+  .passage-modal-header .modal-close:hover { border-color:var(--red); color:var(--red); background:rgba(239,68,68,0.1); }
+  .passage-modal-body { padding:20px; overflow-y:auto; flex:1; }
+  .passage-modal-body .passage-text { font-size:14px; line-height:1.8; color:var(--text); white-space:pre-wrap; word-break:break-word; }
+  .passage-modal-body .passage-text mark { background:#eab30830; color:var(--amber); border-radius:2px; padding:0 2px; }
+  .passage-modal-footer { padding:12px 20px; border-top:1px solid var(--border); display:flex; justify-content:center; gap:8px; flex-shrink:0; }
+  .passage-nav-btn { background:var(--surface); border:1px solid var(--border); color:var(--text-dim); padding:6px 16px; border-radius:6px; font-size:12px; cursor:not-allowed; opacity:0.4; transition:all 0.2s; font-family:var(--mono); }
+  .passage-nav-btn.enabled { cursor:pointer; opacity:1; }
+  .passage-nav-btn.enabled:hover { border-color:var(--accent); color:var(--accent); }
   .store-section { margin-top:32px; padding-top:24px; border-top:1px solid var(--border); }
   .store-section h2 { font-size:14px; font-weight:600; color:var(--text-bright); margin-bottom:12px; }
   .store-box textarea { width:100%; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:13px; font-family:var(--sans); padding:12px 16px; border-radius:10px; resize:vertical; min-height:100px; outline:none; transition:border-color 0.2s; margin-bottom:8px; }
@@ -1276,6 +1293,19 @@ _APP_HTML = """\
   <div class="loading" id="loadingEl"><div class="spinner"></div> Searching...</div>
   <div class="results" id="resultsEl">
     <div class="empty-state"><div class="icon">&#x1F9E0;</div><p>Search your brain cartridge</p><div class="hint" style="font-size:12px;margin-top:8px">Type a query to find memories by meaning</div></div>
+  </div>
+  <div class="passage-overlay" id="passageOverlay" onclick="if(event.target===this)closePassage()">
+    <div class="passage-modal">
+      <div class="passage-modal-header">
+        <div><span class="modal-rank" id="modalRank"></span><span class="modal-score" id="modalScore"></span></div>
+        <button class="modal-close" onclick="closePassage()" title="Close">&#x2715;</button>
+      </div>
+      <div class="passage-modal-body"><div class="passage-text" id="modalText"></div></div>
+      <div class="passage-modal-footer">
+        <button class="passage-nav-btn" id="btnPrev" title="Previous chunk (when metadata wired)">&#x25C0; Prev</button>
+        <button class="passage-nav-btn" id="btnNext" title="Next chunk (when metadata wired)">Next &#x25B6;</button>
+      </div>
+    </div>
   </div>
   <div class="store-section">
     <h2>Store a Memory</h2>
@@ -1342,9 +1372,11 @@ async function mountCart(name){
     await loadCartridges();
   }catch(e){toast('Mount failed: '+e.message,'error');chips.forEach(c=>c.classList.remove('mounting'));}
 }
+var _lastResults=[], _lastQuery='';
 async function doSearch(){
   const query=$('#searchInput').value.trim();
   if(!query)return;
+  _lastQuery=query;
   const el=$('#resultsEl'),loading=$('#loadingEl'),meta=$('#searchMeta');
   el.innerHTML=''; loading.className='loading active'; meta.textContent='';
   const t0=performance.now();
@@ -1359,9 +1391,10 @@ async function doSearch(){
       var lines=data.result.split(/\\n\\n/);
       for(var li=0;li<lines.length;li++){
         var m=lines[li].match(/^#\\d+\\s+\\[([\\d.]+)\\]\\s+(.*)/s);
-        if(m)items.push({score:parseFloat(m[1]),text:m[2],tags:''});
+        if(m)items.push({score:parseFloat(m[1]),text:m[2],full_text:m[2],tags:''});
       }
     }
+    _lastResults=items||[];
     if(!items||items.length===0){
       el.innerHTML='<div class="empty-state"><div class="icon">&#x1F914;</div><p>No results found</p></div>';
       meta.textContent='0 results in '+elapsed+'ms'; return;
@@ -1371,9 +1404,27 @@ async function doSearch(){
       const text=esc(item.text||item.content||'');
       const score=item.score!=null?item.score.toFixed(4):'';
       const tags=item.tags?item.tags.split(',').map(t=>'<span class="tag">'+esc(t.trim())+'</span>').join(''):'';
-      return '<div class="result-card"><div class="result-header"><span class="result-rank">#'+(i+1)+'</span>'+(score?'<span class="result-score">score: '+score+'</span>':'')+'</div><div class="result-text">'+highlight(text,query)+'</div>'+(tags?'<div class="result-footer">'+tags+'</div>':'')+'</div>';
+      return '<div class="result-card" data-idx="'+i+'"><div class="result-header"><span class="result-rank">#'+(i+1)+'</span>'+(score?'<span class="result-score">score: '+score+'</span>':'')+'</div><div class="result-text">'+highlight(text,query)+'</div>'+(tags?'<div class="result-footer">'+tags+'</div>':'')+'</div>';
     }).join('');
+    el.querySelectorAll('.result-card').forEach(c=>c.addEventListener('click',()=>openPassage(parseInt(c.dataset.idx))));
   }catch(e){ loading.className='loading'; el.innerHTML='<div class="empty-state"><div class="icon">&#x26A0;</div><p>Search failed</p><div style="font-size:12px;margin-top:8px">'+esc(e.message)+'</div></div>'; }
+}
+function openPassage(idx){
+  if(idx<0||idx>=_lastResults.length)return;
+  const item=_lastResults[idx];
+  const full=item.full_text||item.text||'';
+  $('#modalRank').textContent='#'+(idx+1);
+  $('#modalScore').textContent=item.score!=null?'score: '+item.score.toFixed(4):'';
+  $('#modalText').innerHTML=highlight(esc(full),_lastQuery);
+  $('#passageOverlay').classList.add('open');
+  document.addEventListener('keydown',_passageKeys);
+}
+function closePassage(){
+  $('#passageOverlay').classList.remove('open');
+  document.removeEventListener('keydown',_passageKeys);
+}
+function _passageKeys(e){
+  if(e.key==='Escape')closePassage();
 }
 async function doStore(){
   const content=$('#storeContent').value.trim();

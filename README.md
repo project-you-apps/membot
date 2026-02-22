@@ -202,6 +202,7 @@ https://your-server:8000/app
 The app provides:
 - **Cartridge picker**: All available cartridges shown as clickable chips. Click to mount.
 - **Semantic search**: Type a query, get ranked results with scores and source tags
+- **Passage viewer**: Click any result to open the full untruncated text in a modal overlay. Close with X, Escape, or click outside. Prev/Next buttons are wired for future hippocampus linked-list navigation.
 - **Memory store**: Paste text with optional tags to add to the mounted cartridge
 - **Light/dark theme**: Toggle with localStorage persistence
 

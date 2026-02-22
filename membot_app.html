@@ -255,6 +255,22 @@
   .result-footer .tag {
     background: var(--surface-2); padding: 1px 6px; border-radius: 3px;
   }
+  .result-card { cursor: pointer; }
+  .passage-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:900; display:flex; align-items:center; justify-content:center; opacity:0; transition:opacity 0.2s; pointer-events:none; }
+  .passage-overlay.open { opacity:1; pointer-events:auto; }
+  .passage-modal { background:var(--bg); border:1px solid var(--border); border-radius:14px; width:min(800px,90vw); max-height:80vh; display:flex; flex-direction:column; box-shadow:0 24px 80px #00000080; }
+  .passage-modal-header { display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .passage-modal-header .modal-rank { font-size:12px; font-weight:700; color:var(--accent); font-family:var(--mono); }
+  .passage-modal-header .modal-score { font-size:12px; color:var(--text-dim); font-family:var(--mono); margin-left:12px; }
+  .passage-modal-header .modal-close { background:none; border:1px solid var(--border); color:var(--text-dim); width:32px; height:32px; border-radius:6px; cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center; transition:all 0.2s; }
+  .passage-modal-header .modal-close:hover { border-color:var(--red); color:var(--red); background:rgba(239,68,68,0.1); }
+  .passage-modal-body { padding:20px; overflow-y:auto; flex:1; }
+  .passage-modal-body .passage-text { font-size:14px; line-height:1.8; color:var(--text); white-space:pre-wrap; word-break:break-word; }
+  .passage-modal-body .passage-text mark { background:#eab30830; color:var(--amber); border-radius:2px; padding:0 2px; }
+  .passage-modal-footer { padding:12px 20px; border-top:1px solid var(--border); display:flex; justify-content:center; gap:8px; flex-shrink:0; }
+  .passage-nav-btn { background:var(--surface); border:1px solid var(--border); color:var(--text-dim); padding:6px 16px; border-radius:6px; font-size:12px; cursor:not-allowed; opacity:0.4; transition:all 0.2s; font-family:var(--mono); }
+  .passage-nav-btn.enabled { cursor:pointer; opacity:1; }
+  .passage-nav-btn.enabled:hover { border-color:var(--accent); color:var(--accent); }
 
   /* ---- Store Section ---- */
   .store-section {
@@ -419,6 +435,21 @@
     </div>
   </div>
 
+  <!-- Passage Viewer Modal -->
+  <div class="passage-overlay" id="passageOverlay" onclick="if(event.target===this)closePassage()">
+    <div class="passage-modal">
+      <div class="passage-modal-header">
+        <div><span class="modal-rank" id="modalRank"></span><span class="modal-score" id="modalScore"></span></div>
+        <button class="modal-close" onclick="closePassage()" title="Close">&#x2715;</button>
+      </div>
+      <div class="passage-modal-body"><div class="passage-text" id="modalText"></div></div>
+      <div class="passage-modal-footer">
+        <button class="passage-nav-btn" id="btnPrev" title="Previous chunk (when metadata wired)">&#x25C0; Prev</button>
+        <button class="passage-nav-btn" id="btnNext" title="Next chunk (when metadata wired)">Next &#x25B6;</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Store -->
   <div class="store-section">
     <h2>Store a Memory</h2>
@@ -517,15 +548,18 @@ async function mountCart(name) {
 }
 
 // ---- Search ----
+let _lastResults = [], _lastQuery = '';
+
 async function doSearch() {
   const query = $('#searchInput').value.trim();
   if (!query) return;
+  _lastQuery = query;
 
-  const results = $('#resultsEl');
+  const el = $('#resultsEl');
   const loading = $('#loadingEl');
   const meta = $('#searchMeta');
 
-  results.innerHTML = '';
+  el.innerHTML = '';
   loading.className = 'loading active';
   meta.textContent = '';
 
@@ -549,12 +583,13 @@ async function doSearch() {
       const lines = data.result.split(/\n\n/);
       for (const line of lines) {
         const m = line.match(/^#\d+\s+\[([\d.]+)\]\s+(.*)/s);
-        if (m) items.push({ score: parseFloat(m[1]), text: m[2], tags: '' });
+        if (m) items.push({ score: parseFloat(m[1]), text: m[2], full_text: m[2], tags: '' });
       }
     }
+    _lastResults = items || [];
 
     if (!items || items.length === 0) {
-      results.innerHTML = `
+      el.innerHTML = `
         <div class="empty-state">
           <div class="icon">&#x1F914;</div>
           <p>No results found</p>
@@ -566,7 +601,7 @@ async function doSearch() {
 
     meta.textContent = `${items.length} results in ${elapsed}ms`;
 
-    results.innerHTML = items.map((item, i) => {
+    el.innerHTML = items.map((item, i) => {
       const text = esc(item.text || item.content || '');
       const score = item.score != null ? item.score.toFixed(4) : '';
       const tags = item.tags ? item.tags.split(',').map(t =>
@@ -574,7 +609,7 @@ async function doSearch() {
       ).join('') : '';
 
       return `
-        <div class="result-card">
+        <div class="result-card" data-idx="${i}">
           <div class="result-header">
             <span class="result-rank">#${i + 1}</span>
             ${score ? `<span class="result-score">score: ${score}</span>` : ''}
@@ -584,10 +619,34 @@ async function doSearch() {
         </div>`;
     }).join('');
 
+    el.querySelectorAll('.result-card').forEach(c =>
+      c.addEventListener('click', () => openPassage(parseInt(c.dataset.idx)))
+    );
+
   } catch(e) {
     loading.className = 'loading';
-    results.innerHTML = `<div class="empty-state"><div class="icon">&#x26A0;</div><p>Search failed</p><div class="hint">${esc(e.message)}</div></div>`;
+    el.innerHTML = `<div class="empty-state"><div class="icon">&#x26A0;</div><p>Search failed</p><div class="hint">${esc(e.message)}</div></div>`;
   }
+}
+
+function openPassage(idx) {
+  if (idx < 0 || idx >= _lastResults.length) return;
+  const item = _lastResults[idx];
+  const full = item.full_text || item.text || '';
+  $('#modalRank').textContent = '#' + (idx + 1);
+  $('#modalScore').textContent = item.score != null ? 'score: ' + item.score.toFixed(4) : '';
+  $('#modalText').innerHTML = highlight(esc(full), _lastQuery);
+  $('#passageOverlay').classList.add('open');
+  document.addEventListener('keydown', _passageKeys);
+}
+
+function closePassage() {
+  $('#passageOverlay').classList.remove('open');
+  document.removeEventListener('keydown', _passageKeys);
+}
+
+function _passageKeys(e) {
+  if (e.key === 'Escape') closePassage();
 }
 
 // ---- Store ----
