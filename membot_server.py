@@ -627,6 +627,7 @@ async def rest_status(request: Request) -> JSONResponse:
             "gpu": _gpu_state["available"],
             "hamming": state["binary_corpus"] is not None,
             "session_id": sid,
+            "read_only": _server_config.get("read_only", False),
         }, headers=_cors_headers())
     except Exception as e:
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
@@ -1335,6 +1336,12 @@ async function checkStatus(){
     dot.className='status-dot connected';
     _mounted=d.cartridge; _memories=d.memories||0;
     txt.textContent=(_mounted||'No cart')+' ('+_memories.toLocaleString()+' memories)';
+    if(d.read_only){
+      const ta=$('#storeContent');const btn=document.querySelector('.store-row button');const ti=$('#storeTags');
+      if(ta){ta.value='THIS SERVICE NOT YET AVAILABLE';ta.disabled=true;ta.style.opacity='0.5';}
+      if(ti){ti.disabled=true;ti.style.opacity='0.5';}
+      if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='not-allowed';}
+    }
   }catch(e){ dot.className='status-dot error'; txt.textContent='Disconnected'; }
 }
 async function loadCartridges(){
@@ -1438,9 +1445,10 @@ async function doStore(){
   }catch(e){toast('Store failed: '+e.message,'error');}
 }
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+const _STOP=new Set(['the','and','are','was','were','for','that','this','with','from','not','but','has','had','have','does','did','will','can','its','who','what','how','why','about','tell','you','your','some','than','them','then','they','been','more','also','into','would','could','should','just','like','very','much','many','only','other','over','such','after','before','between','through','where','when','which','while','each','there','their','these','those','being','because','during','both','same','own','most','well','way','all','out','one','two','may']);
 function highlight(text,query){
   if(!query)return text;
-  const words=query.split(/\\s+/).filter(w=>w.length>2);
+  const words=query.split(/\\s+/).filter(w=>w.length>2&&!_STOP.has(w.toLowerCase()));
   let r=text;
   for(const w of words){const re=new RegExp('('+w.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')+')','gi');r=r.replace(re,'<mark>$1</mark>');}
   return r;

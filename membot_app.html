@@ -487,6 +487,12 @@ async function checkStatus() {
     dot.className = 'status-dot connected';
     _mounted = d.cartridge; _memories = d.memories || 0;
     dot.title = `Connected: ${_memories} memories`;
+    if(d.read_only){
+      const ta=$('#storeContent');const btn=document.querySelector('.store-section button');const ti=$('#storeTags');
+      if(ta){ta.value='THIS SERVICE NOT YET AVAILABLE';ta.disabled=true;ta.style.opacity='0.5';}
+      if(ti){ti.disabled=true;ti.style.opacity='0.5';}
+      if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='not-allowed';}
+    }
     return d;
   } catch(e) {
     dot.className = 'status-dot error';
@@ -684,9 +690,10 @@ function esc(s) {
   return d.innerHTML;
 }
 
+const _STOP = new Set(['the','and','are','was','were','for','that','this','with','from','not','but','has','had','have','does','did','will','can','its','who','what','how','why','about','tell','you','your','some','than','them','then','they','been','more','also','into','would','could','should','just','like','very','much','many','only','other','over','such','after','before','between','through','where','when','which','while','each','there','their','these','those','being','because','during','both','same','own','most','well','way','all','out','one','two','may']);
 function highlight(text, query) {
   if (!query) return text;
-  const words = query.split(/\s+/).filter(w => w.length > 2);
+  const words = query.split(/\s+/).filter(w => w.length > 2 && !_STOP.has(w.toLowerCase()));
   let result = text;
   for (const word of words) {
     const re = new RegExp(`(${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
