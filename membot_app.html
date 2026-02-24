@@ -478,6 +478,19 @@ const BASE = () => $('#serverUrl').value.replace(/\/$/, '');
 
 let _mounted = null, _memories = 0;
 
+function applyReadOnly(isReadOnly) {
+  const ta = $('#storeContent'), btn = document.querySelector('.store-section button'), ti = $('#storeTags');
+  if (isReadOnly) {
+    if(ta){ta.value='THIS SERVICE NOT YET AVAILABLE';ta.disabled=true;ta.style.opacity='0.5';}
+    if(ti){ti.disabled=true;ti.style.opacity='0.5';}
+    if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='not-allowed';}
+  } else {
+    if(ta){ta.value='';ta.disabled=false;ta.style.opacity='1';}
+    if(ti){ti.disabled=false;ti.style.opacity='1';}
+    if(btn){btn.disabled=false;btn.style.opacity='1';btn.style.cursor='pointer';}
+  }
+}
+
 // ---- Status ----
 async function checkStatus() {
   const dot = $('#statusDot');
@@ -487,12 +500,7 @@ async function checkStatus() {
     dot.className = 'status-dot connected';
     _mounted = d.cartridge; _memories = d.memories || 0;
     dot.title = `Connected: ${_memories} memories`;
-    if(d.read_only){
-      const ta=$('#storeContent');const btn=document.querySelector('.store-section button');const ti=$('#storeTags');
-      if(ta){ta.value='THIS SERVICE NOT YET AVAILABLE';ta.disabled=true;ta.style.opacity='0.5';}
-      if(ti){ti.disabled=true;ti.style.opacity='0.5';}
-      if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='not-allowed';}
-    }
+    applyReadOnly(d.read_only);
     return d;
   } catch(e) {
     dot.className = 'status-dot error';
@@ -513,6 +521,7 @@ async function loadCartridges() {
     const dot = $('#statusDot');
     dot.className = 'status-dot connected';
     dot.title = `Connected: ${_memories} memories`;
+    applyReadOnly(sr.read_only);
 
     const carts = cr.cartridges || [];
     if (carts.length === 0) {
@@ -534,6 +543,16 @@ async function loadCartridges() {
 
 async function mountCart(name) {
   if (name === _mounted) return;
+  // Clear stale results from previous cart
+  $('#resultsEl').innerHTML = `
+    <div class="empty-state">
+      <div class="icon">&#x1F9E0;</div>
+      <p>Search your brain cartridge</p>
+      <div class="hint">Type a query above to find memories by meaning, not just keywords</div>
+    </div>`;
+  $('#searchMeta').textContent = '';
+  _lastResults = []; _lastQuery = '';
+
   const chips = document.querySelectorAll('.cart-chip');
   chips.forEach(c => { if (c.dataset.name === name) c.classList.add('mounting'); });
   toast('Mounting ' + name + '...');
@@ -635,24 +654,77 @@ async function doSearch() {
   }
 }
 
-function openPassage(idx) {
-  if (idx < 0 || idx >= _lastResults.length) return;
-  const item = _lastResults[idx];
-  const full = item.full_text || item.text || '';
-  $('#modalRank').textContent = '#' + (idx + 1);
-  $('#modalScore').textContent = item.score != null ? 'score: ' + item.score.toFixed(4) : '';
-  $('#modalText').innerHTML = highlight(esc(full), _lastQuery);
+let _currentPassage = null;  // {index, full_text, prev_idx, next_idx, score, rank}
+
+function openPassage(resultIdx) {
+  if (resultIdx < 0 || resultIdx >= _lastResults.length) return;
+  const item = _lastResults[resultIdx];
+  _showPassage({
+    index: item.index,
+    full_text: item.full_text || item.text || '',
+    prev_idx: item.prev_idx,
+    next_idx: item.next_idx,
+    score: item.score,
+    rank: resultIdx + 1,
+  });
+}
+
+function _showPassage(p) {
+  _currentPassage = p;
+  $('#modalRank').textContent = p.rank ? '#' + p.rank : 'idx:' + p.index;
+  $('#modalScore').textContent = p.score != null ? 'score: ' + p.score.toFixed(4) : '';
+  $('#modalText').innerHTML = highlight(esc(p.full_text), _lastQuery);
+
+  // Wire PREV/NEXT buttons
+  const btnP = $('#btnPrev'), btnN = $('#btnNext');
+  if (p.prev_idx != null) {
+    btnP.className = 'passage-nav-btn enabled';
+    btnP.onclick = () => navigatePassage(p.prev_idx);
+  } else {
+    btnP.className = 'passage-nav-btn';
+    btnP.onclick = null;
+  }
+  if (p.next_idx != null) {
+    btnN.className = 'passage-nav-btn enabled';
+    btnN.onclick = () => navigatePassage(p.next_idx);
+  } else {
+    btnN.className = 'passage-nav-btn';
+    btnN.onclick = null;
+  }
+
   $('#passageOverlay').classList.add('open');
   document.addEventListener('keydown', _passageKeys);
 }
 
+async function navigatePassage(idx) {
+  try {
+    const r = await fetch(BASE() + '/api/passage?idx=' + idx);
+    const data = await r.json();
+    if (data.error) { toast(data.error, 'error'); return; }
+    const p = data.passage;
+    _showPassage({
+      index: p.index,
+      full_text: p.full_text,
+      prev_idx: p.prev_idx,
+      next_idx: p.next_idx,
+      score: null,
+      rank: null,
+    });
+  } catch(e) {
+    toast('Navigation failed: ' + e.message, 'error');
+  }
+}
+
 function closePassage() {
   $('#passageOverlay').classList.remove('open');
+  _currentPassage = null;
   document.removeEventListener('keydown', _passageKeys);
 }
 
 function _passageKeys(e) {
   if (e.key === 'Escape') closePassage();
+  if (e.key === 'ArrowLeft' && _currentPassage?.prev_idx != null) navigatePassage(_currentPassage.prev_idx);
+  if (e.key === 'ArrowRight' && _currentPassage?.next_idx != null) navigatePassage(_currentPassage.next_idx);
 }
 
 // ---- Store ----

@@ -445,8 +445,19 @@ def load_npz_cartridge(path: str) -> dict:
 
     # Load hippocampus metadata if present (mcp-v4+)
     if "hippocampus" in data:
-        result["hippocampus"] = _unpack_hippocampus(data["hippocampus"])
+        raw_hippo = data["hippocampus"]
+        log.info(f"[HIPPO] Found hippocampus in NPZ: shape={raw_hippo.shape}, dtype={raw_hippo.dtype}")
+        result["hippocampus"] = _unpack_hippocampus(raw_hippo)
+        log.info(f"[HIPPO] Unpacked {len(result['hippocampus'])} entries. First: {result['hippocampus'][0] if result['hippocampus'] else 'EMPTY'}")
+        # Log a sample entry that should have links
+        for h in result["hippocampus"][:20]:
+            if h["prev"] is not None or h["next"] is not None:
+                log.info(f"[HIPPO] Sample linked entry: {h}")
+                break
+        else:
+            log.warning("[HIPPO] No linked entries found in first 20 hippocampus records!")
     else:
+        log.info(f"[HIPPO] No hippocampus key in NPZ. Keys present: {list(data.keys())}")
         result["hippocampus"] = None
 
     return result
@@ -639,7 +650,21 @@ async def rest_search(request: Request) -> JSONResponse:
             full_text = text
             if len(text) > 500:
                 text = text[:500] + "..."
-            results.append({"text": text, "full_text": full_text, "score": round(final_score, 4), "tags": tags, "index": int(i)})
+            entry = {"text": text, "full_text": full_text, "score": round(final_score, 4), "tags": tags, "index": int(i)}
+            # Include hippocampus nav if available
+            hippo = state.get("hippocampus")
+            if hippo and i < len(hippo):
+                meta = hippo[i]
+                log.info(f"[HIPPO-SEARCH] idx={i} pattern_id={meta['pattern_id']} prev_raw={meta['prev']} next_raw={meta['next']}")
+                if meta["prev"] is not None:
+                    entry["prev_idx"] = meta["prev"] - 1  # pattern_id 1-based → text 0-based
+                if meta["next"] is not None:
+                    entry["next_idx"] = meta["next"] - 1
+            elif not hippo:
+                log.info(f"[HIPPO-SEARCH] No hippocampus in session state!")
+            else:
+                log.info(f"[HIPPO-SEARCH] idx={i} out of range, hippo len={len(hippo)}")
+            results.append(entry)
 
         state["query_count"] = state.get("query_count", 0) + 1
         _log_activity(session_id, "search", f"'{query[:40]}' -> {len(results)} results", elapsed_ms)
@@ -707,6 +732,39 @@ async def rest_mount(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mount error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/passage", methods=["GET", "OPTIONS"])
+async def rest_passage(request: Request) -> JSONResponse:
+    """REST endpoint to fetch any passage by index, with hippocampus nav links."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        idx = int(request.query_params.get("idx", -1))
+        session_id = _resolve_session_id(request.query_params.get("session_id", ""))
+        state = _get_session(session_id)
+
+        if state["cartridge_name"] is None:
+            return JSONResponse({"status": "error", "error": "No cartridge mounted"}, headers=_cors_headers())
+
+        texts = state["texts"]
+        if idx < 0 or idx >= len(texts):
+            return JSONResponse({"status": "error", "error": f"Index {idx} out of range"}, headers=_cors_headers())
+
+        entry = {"index": idx, "full_text": texts[idx]}
+
+        hippo = state.get("hippocampus")
+        if hippo and idx < len(hippo):
+            meta = hippo[idx]
+            if meta["prev"] is not None:
+                entry["prev_idx"] = meta["prev"] - 1
+            if meta["next"] is not None:
+                entry["next_idx"] = meta["next"] - 1
+
+        return JSONResponse({"status": "ok", "passage": entry}, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/passage error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
 
 
@@ -1364,6 +1422,18 @@ _APP_HTML = """\
 <script>
 const $=s=>document.querySelector(s);
 let _mounted=null, _memories=0;
+function applyReadOnly(ro){
+  const ta=$('#storeContent'),btn=document.querySelector('.store-row button'),ti=$('#storeTags');
+  if(ro){
+    if(ta){ta.value='THIS SERVICE NOT YET AVAILABLE';ta.disabled=true;ta.style.opacity='0.5';}
+    if(ti){ti.disabled=true;ti.style.opacity='0.5';}
+    if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='not-allowed';}
+  }else{
+    if(ta){ta.value='';ta.disabled=false;ta.style.opacity='1';}
+    if(ti){ti.disabled=false;ti.style.opacity='1';}
+    if(btn){btn.disabled=false;btn.style.opacity='1';btn.style.cursor='pointer';}
+  }
+}
 const BASE=()=>{
   const loc=location.pathname.replace(/\\/app\\/?$/,'');
   return location.protocol==='file:'?'http://137.184.227.79:8000':location.origin+loc;
@@ -1376,12 +1446,7 @@ async function checkStatus(){
     dot.className='status-dot connected';
     _mounted=d.cartridge; _memories=d.memories||0;
     txt.textContent=(_mounted||'No cart')+' ('+_memories.toLocaleString()+' memories)';
-    if(d.read_only){
-      const ta=$('#storeContent');const btn=document.querySelector('.store-row button');const ti=$('#storeTags');
-      if(ta){ta.value='THIS SERVICE NOT YET AVAILABLE';ta.disabled=true;ta.style.opacity='0.5';}
-      if(ti){ti.disabled=true;ti.style.opacity='0.5';}
-      if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.style.cursor='not-allowed';}
-    }
+    applyReadOnly(d.read_only);
   }catch(e){ dot.className='status-dot error'; txt.textContent='Disconnected'; }
 }
 async function loadCartridges(){
@@ -1395,6 +1460,7 @@ async function loadCartridges(){
     const dot=$('#statusDot'),txt=$('#statusText');
     dot.className='status-dot connected';
     txt.textContent=(_mounted||'No cart')+' ('+_memories.toLocaleString()+' memories)';
+    applyReadOnly(sr.read_only);
     const carts=cr.cartridges||[];
     if(carts.length===0){bar.innerHTML='<div class="cart-chip"><div class="name" style="color:var(--text-dim)">No cartridges found</div></div>';return;}
     bar.innerHTML=carts.map(c=>{
@@ -1408,6 +1474,8 @@ async function loadCartridges(){
 }
 async function mountCart(name){
   if(name===_mounted)return;
+  $('#resultsEl').innerHTML='<div class="empty-state"><div class="icon">&#x1F9E0;</div><p>Search your brain cartridge</p><div class="hint" style="font-size:12px;margin-top:8px">Type a query to find memories by meaning</div></div>';
+  $('#searchMeta').textContent=''; _lastResults=[]; _lastQuery='';
   const chips=document.querySelectorAll('.cart-chip');
   chips.forEach(c=>{if(c.dataset.name===name)c.classList.add('mounting');});
   toast('Mounting '+name+'...');
@@ -1442,6 +1510,7 @@ async function doSearch(){
       }
     }
     _lastResults=items||[];
+    console.log('[HIPPO] Search results:', JSON.stringify(items?.map(r=>({idx:r.index,prev:r.prev_idx,next:r.next_idx}))));
     if(!items||items.length===0){
       el.innerHTML='<div class="empty-state"><div class="icon">&#x1F914;</div><p>No results found</p></div>';
       meta.textContent='0 results in '+elapsed+'ms'; return;
@@ -1456,22 +1525,44 @@ async function doSearch(){
     el.querySelectorAll('.result-card').forEach(c=>c.addEventListener('click',()=>openPassage(parseInt(c.dataset.idx))));
   }catch(e){ loading.className='loading'; el.innerHTML='<div class="empty-state"><div class="icon">&#x26A0;</div><p>Search failed</p><div style="font-size:12px;margin-top:8px">'+esc(e.message)+'</div></div>'; }
 }
-function openPassage(idx){
-  if(idx<0||idx>=_lastResults.length)return;
-  const item=_lastResults[idx];
-  const full=item.full_text||item.text||'';
-  $('#modalRank').textContent='#'+(idx+1);
-  $('#modalScore').textContent=item.score!=null?'score: '+item.score.toFixed(4):'';
-  $('#modalText').innerHTML=highlight(esc(full),_lastQuery);
+var _currentPassage=null;
+function openPassage(resultIdx){
+  if(resultIdx<0||resultIdx>=_lastResults.length)return;
+  const item=_lastResults[resultIdx];
+  console.log('[HIPPO] openPassage resultIdx='+resultIdx+' item.index='+item.index+' prev_idx='+item.prev_idx+' next_idx='+item.next_idx, item);
+  _showPassage({index:item.index,full_text:item.full_text||item.text||'',prev_idx:item.prev_idx,next_idx:item.next_idx,score:item.score,rank:resultIdx+1});
+}
+function _showPassage(p){
+  _currentPassage=p;
+  $('#modalRank').textContent=p.rank?'#'+p.rank:'idx:'+p.index;
+  $('#modalScore').textContent=p.score!=null?'score: '+p.score.toFixed(4):'';
+  $('#modalText').innerHTML=highlight(esc(p.full_text),_lastQuery);
+  const btnP=$('#btnPrev'),btnN=$('#btnNext');
+  if(p.prev_idx!=null){btnP.className='passage-nav-btn enabled';btnP.onclick=()=>navigatePassage(p.prev_idx);}
+  else{btnP.className='passage-nav-btn';btnP.onclick=null;}
+  if(p.next_idx!=null){btnN.className='passage-nav-btn enabled';btnN.onclick=()=>navigatePassage(p.next_idx);}
+  else{btnN.className='passage-nav-btn';btnN.onclick=null;}
   $('#passageOverlay').classList.add('open');
   document.addEventListener('keydown',_passageKeys);
 }
+async function navigatePassage(idx){
+  try{
+    const r=await fetch(BASE()+'/api/passage?idx='+idx);
+    const data=await r.json();
+    if(data.error){toast(data.error,'error');return;}
+    const p=data.passage;
+    _showPassage({index:p.index,full_text:p.full_text,prev_idx:p.prev_idx,next_idx:p.next_idx,score:null,rank:null});
+  }catch(e){toast('Navigation failed: '+e.message,'error');}
+}
 function closePassage(){
   $('#passageOverlay').classList.remove('open');
+  _currentPassage=null;
   document.removeEventListener('keydown',_passageKeys);
 }
 function _passageKeys(e){
   if(e.key==='Escape')closePassage();
+  if(e.key==='ArrowLeft'&&_currentPassage&&_currentPassage.prev_idx!=null)navigatePassage(_currentPassage.prev_idx);
+  if(e.key==='ArrowRight'&&_currentPassage&&_currentPassage.next_idx!=null)navigatePassage(_currentPassage.next_idx);
 }
 async function doStore(){
   const content=$('#storeContent').value.trim();
