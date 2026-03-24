@@ -426,6 +426,31 @@ sudo systemctl start membot
 
 **Requirements**: Python 3.10+ and ~2 GB RAM (SentenceTransformer model). No GPU needed for search.
 
+## Troubleshooting
+
+### "Session not found" error (-32600)
+
+```text
+Streamable HTTP error: Error POSTing to endpoint:
+{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}
+```
+
+**Cause:** The MCP client is sending a stale session ID. This happens after a server restart, a server crash (e.g., from mounting a cart that exceeds available RAM), or after the 30-minute session timeout.
+
+**Fix:** Restart your MCP client so it establishes a fresh session:
+
+- **OpenClaw TUI:** `openclaw gateway stop && openclaw gateway start`, then relaunch TUI
+- **Claude Code:** Restart VS Code, or restart the Claude Code extension
+- **Claude Desktop:** Quit and reopen
+
+The server itself is fine--it's the client holding an expired session ID.
+
+### Server crashes when mounting large cartridges
+
+If you mount a cart that exceeds available RAM (e.g., a 3 GB all-in-one cart on a 2 GB server), the Python process will be killed by the OS. The systemd service will auto-restart, but all connected clients will get "Session not found" errors (see above).
+
+**Prevention:** Use [split carts](#split-cart-format-index--sqlite) for large datasets on memory-constrained servers. A split cart keeps only the search index in RAM (~400 MB for 2.4M entries) with full text paged from disk via SQLite.
+
 ## Security
 
 - **NPZ-first**: New cartridges are always saved as `.npz` (NumPy archive --no code execution)
