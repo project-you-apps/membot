@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Membot &mdash; Brain cartridges for AI agents</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ── Navbar ──────────────────────────────────────────── -->
+<header class="navbar">
+  <span class="logo">membot</span>
+  <nav>
+    <a href="#what">What</a>
+    <a href="#how">How</a>
+    <a href="#why">Why</a>
+    <a href="#start">Get Started</a>
+    <a href="https://github.com/project-you-apps/membot" target="_blank">GitHub</a>
+  </nav>
+</header>
+
+<!-- ── Hero ────────────────────────────────────────────── -->
+<section class="hero">
+  <h1>Brain cartridges for AI agents.</h1>
+  <p class="tagline">A <span class="tip">neuromorphic substrate<span class="tip-text">A physics-based memory layer inspired by biological neural networks &mdash; Hopfield attractors, Hebbian learning, content-addressable recall.<a class="tip-link" href="concepts/neuromorphic.html">Deep dive &rarr;</a></span></span> that plugs in via <span class="tip">MCP<span class="tip-text">Model Context Protocol &mdash; an open standard by Anthropic that lets AI agents connect to external tools through a universal interface.<a class="tip-link" href="concepts/mcp.html">Deep dive &rarr;</a></span></span>.</p>
+  <p class="sub-tagline">No LLM in the pipeline.</p>
+  <div class="cta-group">
+    <a href="#start" class="btn btn-primary">Get Started</a>
+    <a href="https://github.com/project-you-apps/membot" class="btn btn-secondary" target="_blank">View on GitHub</a>
+  </div>
+</section>
+
+<!-- ── Stats ───────────────────────────────────────────── -->
+<div class="stats">
+  <div class="stat">
+    <span class="number">4.8M</span>
+    <span class="label">entries indexed</span>
+  </div>
+  <div class="stat">
+    <span class="number">$12/mo</span>
+    <span class="label">server cost</span>
+  </div>
+  <div class="stat">
+    <span class="number">0</span>
+    <span class="label">LLM calls</span>
+  </div>
+</div>
+
+<!-- ── What ────────────────────────────────────────────── -->
+<section class="section" id="what">
+  <h2>What is Membot?</h2>
+  <p>Membot is an <span class="tip">MCP server<span class="tip-text">A process that exposes tools to AI agents via the Model Context Protocol. The agent discovers and calls tools without custom integration code.<a class="tip-link" href="concepts/mcp.html">Deep dive &rarr;</a></span></span> that gives AI agents long-term, searchable memory. Think of it as <strong>brain cartridges</strong> &mdash; self-contained memory modules that you can mount, search, swap, and share.</p>
+
+  <div class="grid-3">
+    <div class="card">
+      <h3>Mount</h3>
+      <p>Load a brain cartridge &mdash; a pre-built memory archive &mdash; and make its contents instantly searchable. Cartridges are portable: share them, version them, swap them.</p>
+    </div>
+    <div class="card">
+      <h3>Search</h3>
+      <p>Hybrid retrieval blends <span class="tip">cosine<span class="tip-text">Measures the angle between two vectors in high-dimensional space. Captures semantic similarity &mdash; how close two meanings are.<a class="tip-link" href="concepts/cosine.html">Deep dive &rarr;</a></span></span> similarity, <span class="tip">Hamming<span class="tip-text">Counts differing bits between two binary strings using XOR + popcount. Extremely fast &mdash; runs in nanoseconds on modern CPUs.<a class="tip-link" href="concepts/hamming.html">Deep dive &rarr;</a></span></span> distance, and keyword boosting into a single ranked result. No LLM required.</p>
+    </div>
+    <div class="card">
+      <h3>Store &amp; Swap</h3>
+      <p>Add new memories on the fly. Mount different cartridges for different tasks. Each cartridge is verified with <span class="tip">SHA-256<span class="tip-text">A cryptographic hash function that produces a unique 256-bit fingerprint. Any changed byte produces a completely different hash.<a class="tip-link" href="concepts/sha256.html">Deep dive &rarr;</a></span></span> integrity checks.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── How ─────────────────────────────────────────────── -->
+<section class="section" id="how">
+  <h2>How search works</h2>
+  <p>Every query passes through a three-signal pipeline. Each signal catches what the others miss.</p>
+
+  <h3>Signal weights</h3>
+  <div class="signal-bars">
+    <div class="signal-row">
+      <span class="label"><span class="tip">Cosine<span class="tip-text">Measures semantic similarity by computing the angle between embedding vectors. Weight: 70%.<a class="tip-link" href="concepts/cosine.html">Deep dive &rarr;</a></span></span></span>
+      <div class="bar-track"><div class="bar-fill cyan" style="width:70%"></div></div>
+      <span class="value">70%</span>
+    </div>
+    <div class="signal-row">
+      <span class="label"><span class="tip">Hamming<span class="tip-text">Binary comparison via XOR + popcount on sign-zero encoded vectors. Weight: 30%.<a class="tip-link" href="concepts/hamming.html">Deep dive &rarr;</a></span></span></span>
+      <div class="bar-track"><div class="bar-fill warm" style="width:30%"></div></div>
+      <span class="value">30%</span>
+    </div>
+    <div class="signal-row">
+      <span class="label">Keyword boost</span>
+      <div class="bar-track"><div class="bar-fill green" style="width:15%"></div></div>
+      <span class="value">boost</span>
+    </div>
+  </div>
+
+  <h3>The pipeline</h3>
+  <div class="pipeline">
+    <span class="node">Query</span>
+    <span class="arrow">&rarr;</span>
+    <span class="node"><span class="tip">Nomic embed<span class="tip-text">nomic-ai/nomic-embed-text-v1.5 &mdash; a 768-dimensional embedding model (~270 MB) that runs locally. No API calls needed.<a class="tip-link" href="concepts/embeddings.html">Deep dive &rarr;</a></span></span></span>
+    <span class="arrow">&rarr;</span>
+    <span class="node"><span class="tip">Sign-zero encode<span class="tip-text">Converts float vectors to packed bits: positive &rarr; 1, else &rarr; 0. Achieves 33x compression while preserving semantic fingerprint.<a class="tip-link" href="concepts/signzero.html">Deep dive &rarr;</a></span></span></span>
+    <span class="arrow">&rarr;</span>
+    <span class="node">Cosine + Hamming + Keyword</span>
+    <span class="arrow">&rarr;</span>
+    <span class="node">Blended rank</span>
+  </div>
+
+  <h3>The binary trick</h3>
+  <p><span class="tip">Sign-zero encoding<span class="tip-text">Positive values become 1, everything else becomes 0. Pack 8 values into one byte. 3072 floats (12 KB) become 384 bits (48 bytes). Based on SimHash (Charikar, 2002).<a class="tip-link" href="concepts/signzero.html">Deep dive &rarr;</a></span></span> collapses each embedding dimension to a single bit: positive &rarr; 1, else &rarr; 0. Then pack 8 bits into a byte. A 3,072-float vector (12 KB) becomes 384 bytes &mdash; <strong>33x smaller</strong>. Comparison becomes <span class="tip">XOR + popcount<span class="tip-text">XOR highlights differing bits. Popcount counts them. Both are single CPU instructions &mdash; the comparison runs in nanoseconds.<a class="tip-link" href="concepts/hamming.html">Deep dive &rarr;</a></span></span> &mdash; a single CPU instruction per chunk.</p>
+
+  <h3>Accuracy</h3>
+  <table>
+    <tr><th>Method</th><th>Correlation with full cosine</th></tr>
+    <tr><td>Hamming on sign-zero</td><td>r = 0.891</td></tr>
+    <tr><td>Full float cosine</td><td>r = 1.000</td></tr>
+  </table>
+
+  <h3>Hamming-only mode</h3>
+  <p>For maximum speed, Membot can search using only Hamming distance on the binary index. This skips the float cosine pass entirely, making search over millions of entries nearly instantaneous on commodity hardware.</p>
+
+  <h3>Neuromorphic layer</h3>
+  <p>Beyond search, Membot includes a <span class="tip">neuromorphic lattice<span class="tip-text">A physics-based neural network using Hopfield attractor dynamics and Hebbian learning for content-addressable recall and cross-modal binding.<a class="tip-link" href="concepts/neuromorphic.html">Deep dive &rarr;</a></span></span> &mdash; a 64&times;64 grid of neural regions with <span class="tip">Hebbian weights<span class="tip-text">Connection strengths that grow when neurons activate together &mdash; "neurons that fire together wire together" (Donald Hebb, 1949).<a class="tip-link" href="concepts/hebbian.html">Deep dive &rarr;</a></span></span>, Mexican-hat inhibition, and <span class="tip">attractor dynamics<span class="tip-text">The network settles into stable states (attractors) like a ball rolling into valleys on a landscape. Partial or noisy input converges to the nearest stored memory.<a class="tip-link" href="concepts/neuromorphic.html">Deep dive &rarr;</a></span></span>. This enables noise-tolerant recall and cross-modal association.</p>
+
+  <h3>Cross-modal association</h3>
+  <p>The neuromorphic layer can bind text, image (<span class="tip">CLIP<span class="tip-text">Contrastive Language-Image Pre-training (OpenAI, 2021). Maps images and text into the same vector space, enabling cross-modal search.<a class="tip-link" href="concepts/clip.html">Deep dive &rarr;</a></span></span>), and audio (<span class="tip">CLAP<span class="tip-text">Contrastive Language-Audio Pre-training. Maps audio and text into the same vector space, enabling sound-to-text and text-to-sound retrieval.<a class="tip-link" href="concepts/clap.html">Deep dive &rarr;</a></span></span>) embeddings together via <span class="tip">Hebbian weight matrix<span class="tip-text">A learned matrix of connection strengths between neural regions. Trained with Hebb's rule: co-activated neurons strengthen their connections.<a class="tip-link" href="concepts/hebbian.html">Deep dive &rarr;</a></span></span> training, so a text query can retrieve images and a sound can retrieve text.</p>
+</section>
+
+<!-- ── Brain cartridges ───────────────────────────────── -->
+<section class="section">
+  <h2>Brain cartridges</h2>
+  <p>A brain cartridge is a self-contained, portable memory archive. Two formats are supported:</p>
+
+  <table>
+    <tr><th>File</th><th>Format</th><th>Contents</th></tr>
+    <tr><td><code>.cart.npz</code></td><td>Standard</td><td>Vectors + texts + metadata in a single compressed archive</td></tr>
+    <tr><td><code>_index.npz</code> + <code>_text.db</code></td><td>Split</td><td>Vectors in NumPy, texts in <span class="tip">SQLite<span class="tip-text">A self-contained, serverless SQL database engine. Ships with Python. Enables paged text access without loading everything into RAM.<a class="tip-link" href="concepts/sqlite.html">Deep dive &rarr;</a></span></span> &mdash; scales to millions</td></tr>
+    <tr><td><code>_brain.npy</code></td><td>Neuromorphic</td><td>Hebbian weight matrix for cross-modal recall</td></tr>
+    <tr><td><code>_manifest.json</code></td><td>Manifest</td><td>SHA-256 hashes, build metadata, integrity verification</td></tr>
+  </table>
+
+  <h3>Split cart format</h3>
+  <p>At scale (millions of entries), the split format keeps the vector index in RAM for fast search while storing raw text on disk in SQLite. Text lookups are ~1 ms. This lets you search 4.8M entries on a $12/month server.</p>
+</section>
+
+<!-- ── Why ─────────────────────────────────────────────── -->
+<section class="section" id="why">
+  <h2>Why Membot?</h2>
+
+  <table>
+    <tr><th>Feature</th><th>Typical AI memory</th><th>Membot</th></tr>
+    <tr><td>LLM dependency</td><td>Requires LLM for retrieval</td><td>Zero LLM calls</td></tr>
+    <tr><td>Storage</td><td>Cloud vector DB</td><td>Local files + SQLite</td></tr>
+    <tr><td>Scale</td><td>Thousands</td><td>Millions (4.8M tested)</td></tr>
+    <tr><td>Physics layer</td><td>None</td><td>Hopfield attractors, Hebbian learning</td></tr>
+    <tr><td>Cross-modal</td><td>Text only</td><td>Text + image + audio</td></tr>
+    <tr><td>Energy</td><td>GPU inference per query</td><td>CPU bit ops</td></tr>
+  </table>
+
+  <div class="quote">
+    Memory should be a physics problem, not a language problem. Bits, not tokens.
+  </div>
+</section>
+
+<!-- ── Get Started ─────────────────────────────────────── -->
+<section class="section" id="start">
+  <h2>Get started</h2>
+
+  <h3>1. Install</h3>
+  <div class="code-block"><span class="keyword">pip</span> install membot</div>
+
+  <h3>2. Run</h3>
+  <div class="code-block"><span class="comment"># Start the MCP server</span>
+<span class="keyword">membot</span> serve</div>
+
+  <h3>3. Connect your agent</h3>
+  <div class="grid-2">
+    <div class="card">
+      <h3>Claude Code (local)</h3>
+      <div class="code-block"><span class="comment">// .mcp.json</span>
+{
+  <span class="string">"mcpServers"</span>: {
+    <span class="string">"membot"</span>: {
+      <span class="string">"command"</span>: <span class="string">"membot"</span>,
+      <span class="string">"args"</span>: [<span class="string">"serve"</span>]
+    }
+  }
+}</div>
+    </div>
+    <div class="card">
+      <h3>Claude Code (remote)</h3>
+      <div class="code-block"><span class="comment">// .mcp.json</span>
+{
+  <span class="string">"mcpServers"</span>: {
+    <span class="string">"membot"</span>: {
+      <span class="string">"type"</span>: <span class="string">"sse"</span>,
+      <span class="string">"url"</span>: <span class="string">"https://your-server/sse"</span>
+    }
+  }
+}</div>
+    </div>
+  </div>
+
+  <h3>4. Use it</h3>
+  <div class="code-block"><span class="comment"># Search memory</span>
+membot_search query=<span class="string">"how does the trust tensor work"</span>
+
+<span class="comment"># Store a memory</span>
+membot_store content=<span class="string">"The trust tensor maps agent reliability across domains"</span>
+
+<span class="comment"># Mount a cartridge</span>
+membot_mount path=<span class="string">"/data/web4-docs.cart.npz"</span></div>
+
+  <h3>5. Build cartridges</h3>
+  <p>Use <a href="https://github.com/project-you-apps/vector-plus-studio" target="_blank">Vector+ Studio</a> to build cartridges from documents, codebases, or any text corpus.</p>
+</section>
+
+<!-- ── Available tools ─────────────────────────────────── -->
+<section class="section">
+  <h2>Available tools</h2>
+  <table>
+    <tr><th>Tool</th><th>Description</th></tr>
+    <tr><td><code>membot_search</code></td><td>Search mounted memory with hybrid retrieval</td></tr>
+    <tr><td><code>membot_store</code></td><td>Store a new memory entry</td></tr>
+    <tr><td><code>membot_mount</code></td><td>Mount a brain cartridge</td></tr>
+    <tr><td><code>membot_unmount</code></td><td>Unmount the current cartridge</td></tr>
+    <tr><td><code>membot_status</code></td><td>Show server status and mounted cartridge info</td></tr>
+    <tr><td><code>membot_list</code></td><td>List available cartridges</td></tr>
+    <tr><td><code>membot_recall</code></td><td>Neuromorphic recall (physics-based retrieval)</td></tr>
+    <tr><td><code>membot_verify</code></td><td>Verify cartridge integrity via SHA-256</td></tr>
+    <tr><td><code>membot_stats</code></td><td>Show search and performance statistics</td></tr>
+  </table>
+</section>
+
+<!-- ── Deployment ──────────────────────────────────────── -->
+<section class="section">
+  <h2>Deployment options</h2>
+  <div class="grid-3">
+    <div class="card">
+      <h3>Public dispensary</h3>
+      <p>A shared Membot server with pre-built cartridges. Connect any MCP-compatible agent and start searching immediately.</p>
+    </div>
+    <div class="card">
+      <h3>Team server</h3>
+      <p>Run Membot on your own infrastructure. Mount team-specific cartridges. SSE transport for remote agents.</p>
+    </div>
+    <div class="card">
+      <h3>Personal server</h3>
+      <p>Run locally via stdio. Your memories stay on your machine. Zero network dependency.</p>
+    </div>
+  </div>
+
+  <h3>Live deployment</h3>
+  <p>The public dispensary currently serves 4.8M entries on a single $12/month VPS &mdash; no GPU, no cloud vector database, no LLM API calls.</p>
+</section>
+
+<!-- ── Concept deep dives ─────────────────────────────── -->
+<section class="section">
+  <h2>Concept deep dives</h2>
+  <p>Each concept page explains the theory, the math, and how Membot uses it.</p>
+  <div class="grid-3">
+    <a class="card" href="concepts/cosine.html" style="text-decoration:none;color:inherit;">
+      <h3>Cosine Similarity</h3>
+      <p>Measuring meaning by measuring angles.</p>
+    </a>
+    <a class="card" href="concepts/hamming.html" style="text-decoration:none;color:inherit;">
+      <h3>Hamming Distance</h3>
+      <p>Binary comparison via XOR + popcount.</p>
+    </a>
+    <a class="card" href="concepts/signzero.html" style="text-decoration:none;color:inherit;">
+      <h3>Sign-Zero Encoding</h3>
+      <p>33x compression that preserves meaning.</p>
+    </a>
+    <a class="card" href="concepts/embeddings.html" style="text-decoration:none;color:inherit;">
+      <h3>Embeddings</h3>
+      <p>Turning text into searchable vectors.</p>
+    </a>
+    <a class="card" href="concepts/neuromorphic.html" style="text-decoration:none;color:inherit;">
+      <h3>Neuromorphic Substrate</h3>
+      <p>Hopfield networks and attractor dynamics.</p>
+    </a>
+    <a class="card" href="concepts/hebbian.html" style="text-decoration:none;color:inherit;">
+      <h3>Hebbian Learning</h3>
+      <p>Neurons that fire together wire together.</p>
+    </a>
+    <a class="card" href="concepts/mcp.html" style="text-decoration:none;color:inherit;">
+      <h3>MCP</h3>
+      <p>The USB port for AI tools.</p>
+    </a>
+    <a class="card" href="concepts/clip.html" style="text-decoration:none;color:inherit;">
+      <h3>CLIP</h3>
+      <p>Images and text in the same space.</p>
+    </a>
+    <a class="card" href="concepts/clap.html" style="text-decoration:none;color:inherit;">
+      <h3>CLAP</h3>
+      <p>Audio and text in the same space.</p>
+    </a>
+    <a class="card" href="concepts/sha256.html" style="text-decoration:none;color:inherit;">
+      <h3>SHA-256</h3>
+      <p>Cryptographic integrity verification.</p>
+    </a>
+    <a class="card" href="concepts/sqlite.html" style="text-decoration:none;color:inherit;">
+      <h3>SQLite</h3>
+      <p>Serverless database for text storage.</p>
+    </a>
+  </div>
+</section>
+
+<!-- ── Footer ──────────────────────────────────────────── -->
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; brain cartridges for AI agents</p>
+  <p style="margin-top:0.5rem;">
+    <a href="https://github.com/project-you-apps/membot">GitHub</a> &middot;
+    <a href="https://project-you.app">Project You</a> &middot;
+    <a href="https://github.com/project-you-apps/vector-plus-studio">Vector+ Studio</a>
+  </p>
+</footer>
+
+</body>
+</html>

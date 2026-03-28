@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hamming Distance &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>Hamming Distance</h1>
+  <p class="subtitle">Binary comparison via XOR + popcount.</p>
+
+  <h2>The intuition</h2>
+  <p>Richard Hamming introduced this metric in 1950 while working on error-correcting codes at Bell Labs. The idea is simple: given two binary strings of the same length, count the number of positions where they differ.</p>
+  <p>If two strings are identical, Hamming distance is 0. If every bit differs, the distance equals the string length. It measures structural similarity at the most fundamental level &mdash; individual bits.</p>
+
+  <h2>Why it's fast</h2>
+  <p>The comparison requires exactly two CPU instructions:</p>
+  <ol style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>XOR</strong> &mdash; highlights every differing bit (produces 1 where bits differ, 0 where they match)</li>
+    <li><strong>popcount</strong> &mdash; counts the number of 1s in the result</li>
+  </ol>
+  <p>Both are single-cycle operations on modern CPUs. Comparing two 384-byte binary vectors takes nanoseconds.</p>
+
+  <div class="code-block"><span class="comment"># XOR + popcount example</span>
+A = <span class="number">11010110</span>
+B = <span class="number">10011010</span>
+
+A XOR B = <span class="number">01001100</span>   <span class="comment"># bits that differ</span>
+popcount = <span class="number">3</span>          <span class="comment"># Hamming distance = 3</span></div>
+
+  <h2>In Membot</h2>
+  <p>Hamming distance carries <strong>30%</strong> of the search weight. It operates on sign-zero encoded vectors &mdash; binary fingerprints derived from the full float embeddings. This approach is based on <strong>SimHash</strong> (Charikar, 2002), which proved that the Hamming distance on sign-encoded vectors correlates with cosine similarity.</p>
+  <p>The measured correlation: <strong>r = 0.891</strong>. This means 30% of the signal comes from a comparison that costs almost nothing computationally.</p>
+
+  <h2>Population coding</h2>
+  <p>Biological neurons also use population codes &mdash; patterns of activation across groups of neurons. The brain doesn't compare individual neuron firing rates; it compares patterns. Hamming distance on binary vectors is the computational analogue: comparing activation patterns, not magnitudes.</p>
+  <p>This biological parallel is why Hamming distance fits naturally into Membot's neuromorphic architecture.</p>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="signzero.html">Sign-Zero Encoding</a> &mdash; how vectors become bits<br>
+    <a href="cosine.html">Cosine Similarity</a> &mdash; the semantic complement<br>
+    <a href="neuromorphic.html">Neuromorphic Substrate</a> &mdash; the physics layer
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

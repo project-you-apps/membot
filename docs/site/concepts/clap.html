@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CLAP &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>CLAP</h1>
+  <p class="subtitle">Contrastive Language-Audio Pre-training.</p>
+
+  <h2>What is it?</h2>
+  <p>CLAP is a model developed by Microsoft and collaborators (2022-2023) that maps <strong>audio and text into the same vector space</strong>. A recording of birdsong and the text "birds singing in a forest" produce similar vectors. This enables text-to-audio search and audio-to-text retrieval without task-specific fine-tuning.</p>
+
+  <h2>How it works</h2>
+  <p>Like CLIP for images, CLAP uses contrastive learning on paired audio-text data. The model learns two encoders:</p>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>Audio encoder</strong> &mdash; processes spectrograms or raw waveforms into vectors</li>
+    <li><strong>Text encoder</strong> &mdash; processes descriptions into vectors in the same space</li>
+  </ul>
+  <p>The training pushes matching audio-text pairs together and non-matching pairs apart in vector space.</p>
+
+  <h2>In Membot</h2>
+  <p>CLAP provides the audio modality for cross-modal memory. Combined with CLIP (images) and Nomic Embed (text), it enables any combination of modalities:</p>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li>Text &rarr; Audio: "find sounds of rain"</li>
+    <li>Audio &rarr; Text: "what documents mention this sound?"</li>
+    <li>Audio &rarr; Image: via Hebbian binding through shared text space</li>
+  </ul>
+  <p>The Hebbian weight matrix binds all three modalities together, so cross-modal retrieval works through attractor dynamics in the neuromorphic layer.</p>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="clip.html">CLIP</a> &mdash; the image equivalent<br>
+    <a href="hebbian.html">Hebbian Learning</a> &mdash; how modalities are bound<br>
+    <a href="neuromorphic.html">Neuromorphic Substrate</a> &mdash; the physics layer
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>
