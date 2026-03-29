@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SHA-256 &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>SHA-256</h1>
+  <p class="subtitle">Cryptographic integrity verification.</p>
+
+  <h2>What is it?</h2>
+  <p>SHA-256 is a cryptographic hash function that produces a unique 256-bit (32-byte) fingerprint for any input. Change a single byte of the input and the hash changes completely. It is computationally infeasible to find two different inputs that produce the same hash.</p>
+
+  <h2>In Membot</h2>
+  <p>Every brain cartridge includes a <code>_manifest.json</code> file containing SHA-256 hashes of all cartridge components. When a cartridge is mounted, Membot recomputes the hashes and compares them to the manifest. If any file has been tampered with, the mount is rejected.</p>
+
+  <div class="code-block"><span class="comment">// Example _manifest.json</span>
+{
+  <span class="string">"name"</span>: <span class="string">"web4-docs"</span>,
+  <span class="string">"version"</span>: <span class="string">"1.0.0"</span>,
+  <span class="string">"model"</span>: <span class="string">"nomic-ai/nomic-embed-text-v1.5"</span>,
+  <span class="string">"entries"</span>: <span class="number">24817</span>,
+  <span class="string">"hashes"</span>: {
+    <span class="string">"_index.npz"</span>: <span class="string">"a3f8c9...d41e"</span>,
+    <span class="string">"_text.db"</span>: <span class="string">"7b2e01...f983"</span>,
+    <span class="string">"_brain.npy"</span>: <span class="string">"e5c412...b07a"</span>
+  }
+}</div>
+
+  <h2>Why it matters</h2>
+  <p>Brain cartridges are designed to be portable &mdash; shared, downloaded, and swapped between systems. Without integrity verification, a tampered cartridge could inject false memories into an agent's recall. SHA-256 hashing ensures that what you mount is exactly what was built.</p>
+
+  <h2>Properties</h2>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>Deterministic</strong> &mdash; same input always produces the same hash</li>
+    <li><strong>Avalanche effect</strong> &mdash; a single changed bit produces a completely different hash</li>
+    <li><strong>One-way</strong> &mdash; cannot reconstruct the input from the hash</li>
+    <li><strong>Collision resistant</strong> &mdash; infeasible to find two inputs with the same hash</li>
+  </ul>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="../index.html">Brain cartridges</a> &mdash; the file format overview
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

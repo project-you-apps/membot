@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>MCP</h1>
+  <p class="subtitle">Model Context Protocol &mdash; the USB port for AI tools.</p>
+
+  <h2>What is MCP?</h2>
+  <p>The Model Context Protocol is an open standard introduced by Anthropic that provides a universal way for AI agents to connect to external tools and data sources. Think of it as USB for AI &mdash; a single interface that any tool can implement and any agent can use.</p>
+  <p>Before MCP, every tool integration required custom code: API wrappers, authentication handling, response parsing. MCP replaces all of that with a single protocol.</p>
+
+  <h2>How it works</h2>
+  <p>The protocol defines three roles:</p>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>Server</strong> &mdash; exposes tools (Membot is an MCP server)</li>
+    <li><strong>Client</strong> &mdash; the AI agent that discovers and calls tools</li>
+    <li><strong>Transport</strong> &mdash; the communication channel between server and client</li>
+  </ul>
+  <p>The server declares its tools (name, description, parameters). The client discovers them at startup and can call them during conversations. The protocol handles serialization, error handling, and lifecycle management.</p>
+
+  <h2>Transport modes</h2>
+  <div class="code-block"><span class="comment"># stdio &mdash; local process, fastest</span>
+<span class="keyword">membot</span> serve
+
+<span class="comment"># HTTP + SSE &mdash; remote server</span>
+<span class="keyword">membot</span> serve --transport sse --port <span class="number">8080</span>
+
+<span class="comment"># The agent connects to whichever transport is configured</span></div>
+
+  <h2>Why MCP matters for Membot</h2>
+  <p><strong>Zero integration code.</strong> Any MCP-compatible agent can use Membot immediately. No SDK, no wrapper library, no API client. Just point the agent at the server and it discovers the tools.</p>
+  <p><strong>Composable.</strong> Membot can run alongside other MCP servers. An agent might use Membot for memory, a filesystem server for file access, and a web search server for live data &mdash; all through the same protocol.</p>
+
+  <h2>Compatible agents</h2>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>Claude Code</strong> &mdash; Anthropic's CLI agent</li>
+    <li><strong>Claude Desktop</strong> &mdash; Anthropic's desktop app</li>
+    <li><strong>OpenClaw</strong> &mdash; open-source Claude Code fork</li>
+    <li>Any agent implementing the MCP client specification</li>
+  </ul>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="https://modelcontextprotocol.io" target="_blank">modelcontextprotocol.io</a> &mdash; official MCP specification<br>
+    <a href="../index.html#start">Get started</a> &mdash; connect Membot to your agent
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

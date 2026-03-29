@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CLIP &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>CLIP</h1>
+  <p class="subtitle">Contrastive Language-Image Pre-training.</p>
+
+  <h2>What is it?</h2>
+  <p>CLIP is a model introduced by OpenAI in 2021 that learns to map <strong>images and text into the same vector space</strong>. A photo of a dog and the text "a photo of a dog" end up as nearby vectors. This means you can search images with text queries and vice versa &mdash; without any task-specific training.</p>
+
+  <h2>How it's trained</h2>
+  <p>CLIP is trained on hundreds of millions of image-text pairs scraped from the internet. The training objective is contrastive: given a batch of image-text pairs, the model learns to maximize the similarity between matching pairs and minimize the similarity between non-matching pairs.</p>
+  <p>The result is two encoders &mdash; one for images, one for text &mdash; that produce vectors in a shared space. The cosine similarity between an image vector and a text vector indicates how well they match.</p>
+
+  <h2>In Membot</h2>
+  <p>CLIP provides the image modality for cross-modal memory. When building a cartridge with images:</p>
+  <ol style="margin:1rem 0 1rem 1.5rem;">
+    <li>Each image is embedded using CLIP's image encoder</li>
+    <li>Each associated text is embedded using <a href="embeddings.html">Nomic Embed</a> (the text encoder)</li>
+    <li>Hebbian learning binds the image and text representations together</li>
+  </ol>
+  <p>After training, the neuromorphic layer can retrieve images from text queries or find text associated with similar images. Combined with CLAP (audio), this enables any-to-any modality search.</p>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="clap.html">CLAP</a> &mdash; the audio equivalent<br>
+    <a href="hebbian.html">Hebbian Learning</a> &mdash; how modalities are bound<br>
+    <a href="embeddings.html">Embeddings</a> &mdash; the text embedding model
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

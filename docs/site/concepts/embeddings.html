@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Embeddings &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>Embeddings</h1>
+  <p class="subtitle">Turning text into searchable vectors.</p>
+
+  <h2>What is an embedding?</h2>
+  <p>An embedding is a list of numbers that represents the meaning of a piece of text. "Dog" and "puppy" get similar lists. "Dog" and "quantum mechanics" get very different lists. The model learns these representations from vast amounts of text, encoding semantic relationships as geometric relationships &mdash; similar meanings become nearby points in a high-dimensional space.</p>
+
+  <h2>The model</h2>
+  <p>Membot uses <strong>nomic-ai/nomic-embed-text-v1.5</strong>:</p>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>768 dimensions</strong> per vector</li>
+    <li><strong>~270 MB</strong> model size</li>
+    <li>Runs <strong>locally</strong> &mdash; no API calls, no network dependency</li>
+    <li>Open weights, Apache 2.0 license</li>
+  </ul>
+  <p>The model runs on CPU. A single embedding takes a few milliseconds. Batch embedding (for building cartridges) processes thousands of texts per second.</p>
+
+  <h2>Contrastive training</h2>
+  <p>Embedding models are trained on pairs of related texts. The training objective: make related texts produce similar vectors and unrelated texts produce dissimilar vectors. This is called <em>contrastive learning</em>.</p>
+  <p>The result is a vector space where geometric proximity encodes semantic similarity. You can search this space using cosine similarity (angle between vectors) or Hamming distance (on binarized versions).</p>
+
+  <h2>Important constraint</h2>
+  <p>The model used to <strong>build</strong> a cartridge must be the same model used to <strong>search</strong> it. Different models produce different vector spaces &mdash; "dog" might point in completely different directions. Membot records the model name in the cartridge manifest to prevent mismatches.</p>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="cosine.html">Cosine Similarity</a> &mdash; measuring distance in vector space<br>
+    <a href="signzero.html">Sign-Zero Encoding</a> &mdash; compressing embeddings to bits<br>
+    <a href="neuromorphic.html">Neuromorphic Substrate</a> &mdash; the physics layer on top
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

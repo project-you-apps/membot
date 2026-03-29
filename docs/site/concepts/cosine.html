@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cosine Similarity &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>Cosine Similarity</h1>
+  <p class="subtitle">Measuring meaning by measuring angles.</p>
+
+  <h2>The intuition</h2>
+  <p>Imagine two arrows in a high-dimensional space. Each arrow represents the meaning of a piece of text &mdash; its embedding vector. Cosine similarity measures the <em>angle</em> between those arrows, ignoring their length. Two texts about the same topic point in roughly the same direction, so the angle between them is small and the cosine is close to 1.</p>
+  <p>It doesn't matter how long the vectors are (how many words, how much emphasis). What matters is the direction &mdash; the shape of meaning.</p>
+
+  <h2>The math</h2>
+  <div class="code-block"><span class="comment"># Cosine similarity formula</span>
+<span class="keyword">cos</span>(A, B) = (A &middot; B) / (|A| &times; |B|)
+
+<span class="comment"># Where:</span>
+<span class="comment">#   A &middot; B    = dot product (sum of element-wise products)</span>
+<span class="comment">#   |A|, |B| = magnitudes (Euclidean norms)</span>
+<span class="comment">#</span>
+<span class="comment"># Range: -1 (opposite) to 0 (unrelated) to 1 (identical)</span></div>
+  <p>In practice, embedding models produce normalized vectors, so the magnitudes are 1 and cosine similarity reduces to a simple dot product.</p>
+
+  <h2>In Membot</h2>
+  <p>Cosine similarity carries <strong>70%</strong> of the search weight. It is the semantic backbone &mdash; it understands that "canine" and "dog" are related even though they share no characters. The embeddings come from <a href="embeddings.html">Nomic Embed</a>, a local 768-dimensional model that runs without API calls.</p>
+
+  <h2>Why not cosine alone?</h2>
+  <p>Cosine captures meaning but can miss exact keywords. A query for "error code 4012" might match texts about errors in general but miss the one that contains the exact code. That's why Membot blends cosine with <a href="hamming.html">Hamming distance</a> (which provides a fast, coarse semantic check on binary signatures) and keyword boosting (which catches exact term matches).</p>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="embeddings.html">Embeddings</a> &mdash; how text becomes vectors<br>
+    <a href="hamming.html">Hamming Distance</a> &mdash; the binary complement<br>
+    <a href="signzero.html">Sign-Zero Encoding</a> &mdash; compressing vectors to bits
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

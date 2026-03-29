@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign-Zero Encoding &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>Sign-Zero Encoding</h1>
+  <p class="subtitle">33x compression that preserves semantic fingerprints.</p>
+
+  <h2>The idea</h2>
+  <p>Take a float vector. For each dimension: if the value is positive, write 1. Otherwise, write 0. Then pack 8 bits into one byte.</p>
+
+  <div class="code-block"><span class="comment"># Float vector (768 dimensions)</span>
+[ <span class="number">0.23</span>, <span class="number">-0.41</span>, <span class="number">0.08</span>, <span class="number">-0.15</span>, <span class="number">0.67</span>, <span class="number">-0.02</span>, <span class="number">0.31</span>, <span class="number">0.0</span>, ... ]
+
+<span class="comment"># Sign-zero encoded</span>
+[   <span class="number">1</span>,      <span class="number">0</span>,     <span class="number">1</span>,      <span class="number">0</span>,     <span class="number">1</span>,      <span class="number">0</span>,     <span class="number">1</span>,    <span class="number">0</span>,  ... ]
+
+<span class="comment"># Packed into bytes</span>
+[ <span class="number">0xAA</span>, ... ]   <span class="comment"># 768 dims &rarr; 96 bytes (was 3072 bytes as float32)</span></div>
+
+  <p>A 768-dimensional float32 vector occupies 3,072 bytes. After sign-zero encoding and packing: <strong>96 bytes</strong>. That's a 32x reduction. For Nomic's 768-dim model, the full index at 2.4M entries drops from gigabytes to a fraction.</p>
+
+  <h2>Why it works</h2>
+  <p>This is based on <strong>SimHash</strong>, introduced by Moses Charikar in 2002. The key insight: for vectors produced by contrastive training (like embedding models), the <em>sign pattern</em> captures most of the directional information. The Hamming distance between two sign-zero vectors correlates with the cosine distance between the original floats at <strong>r = 0.891</strong>.</p>
+  <p>Contrastive training spreads information across all dimensions roughly equally, so no single dimension dominates. Discarding magnitude loses surprisingly little.</p>
+
+  <h2>Implementation</h2>
+  <p>In NumPy, the entire encoding is one line:</p>
+  <div class="code-block">binary = np.packbits((vectors > <span class="number">0</span>).astype(np.uint8), axis=<span class="number">1</span>)</div>
+  <p>That's it. No learned quantization, no calibration, no training. Just the sign of each dimension.</p>
+
+  <h2>Scale impact</h2>
+  <table>
+    <tr><th>Format</th><th>Size at 2.4M entries</th><th>Search speed</th></tr>
+    <tr><td>Full float32</td><td>~7 GB</td><td>Baseline</td></tr>
+    <tr><td>Sign-zero only</td><td>~220 MB</td><td>~30x faster (XOR + popcount)</td></tr>
+  </table>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="hamming.html">Hamming Distance</a> &mdash; comparing the binary vectors<br>
+    <a href="embeddings.html">Embeddings</a> &mdash; where the float vectors come from<br>
+    <a href="cosine.html">Cosine Similarity</a> &mdash; the full-precision alternative
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

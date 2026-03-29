@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hebbian Learning &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>Hebbian Learning</h1>
+  <p class="subtitle">Neurons that fire together wire together.</p>
+
+  <h2>The principle</h2>
+  <p>Donald Hebb proposed in 1949 that when two neurons are active at the same time, the connection between them should strengthen. This simple rule &mdash; "neurons that fire together wire together" &mdash; turns out to be sufficient for building associative memory.</p>
+
+  <div class="code-block"><span class="comment"># Hebb's learning rule</span>
+&Delta;w<sub>ij</sub> = &eta; &times; x<sub>i</sub> &times; x<sub>j</sub>
+
+<span class="comment"># Where:</span>
+<span class="comment">#   &Delta;w_ij = change in connection weight between neurons i and j</span>
+<span class="comment">#   &eta;     = learning rate</span>
+<span class="comment">#   x_i     = activation of neuron i</span>
+<span class="comment">#   x_j     = activation of neuron j</span></div>
+
+  <h2>No backpropagation</h2>
+  <p>Unlike modern deep learning, Hebbian learning is <em>local</em>. Each connection updates based only on the activity of the two neurons it connects. There is no global error signal, no loss function, no gradient propagation through layers. This makes it biologically plausible and computationally cheap.</p>
+  <p>The tradeoff: Hebbian learning doesn't optimize for a specific task. Instead, it captures the statistical structure of whatever patterns are presented &mdash; which is exactly what you want for associative memory.</p>
+
+  <h2>In Membot</h2>
+  <p>When you build a cartridge with the <code>--train</code> flag, Membot trains Hebbian weights on the embedded vectors. The result is a weight matrix (~128 MB) saved as <code>_brain.npy</code>.</p>
+  <p>These weights enable three capabilities:</p>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>Associative recall</strong> &mdash; retrieve memories from partial or noisy input</li>
+    <li><strong>Noise tolerance</strong> &mdash; the attractor dynamics correct for corrupted bits</li>
+    <li><strong>Cross-modal binding</strong> &mdash; link text, image, and audio representations</li>
+  </ul>
+
+  <h2>Cross-modal binding</h2>
+  <p>By presenting <a href="clip.html">CLIP</a> (Contrastive Language-Image Pre-training) and <a href="clap.html">CLAP</a> (Contrastive Language-Audio Pre-training) embeddings alongside text embeddings during training, the Hebbian weights learn associations across modalities. Three training passes are typically used:</p>
+  <table>
+    <tr><th>Pass</th><th>Cosine correlation</th></tr>
+    <tr><td>1</td><td>0.9998</td></tr>
+    <tr><td>2</td><td>0.9969</td></tr>
+    <tr><td>3</td><td>0.9945</td></tr>
+  </table>
+  <p>After training, a text query can retrieve images, and an audio clip can retrieve text &mdash; the Hebbian weights bridge the modalities.</p>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="neuromorphic.html">Neuromorphic Substrate</a> &mdash; the physics layer<br>
+    <a href="clip.html">CLIP</a> &mdash; image embeddings<br>
+    <a href="clap.html">CLAP</a> &mdash; audio embeddings
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

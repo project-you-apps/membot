@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Neuromorphic Substrate &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>Neuromorphic Substrate</h1>
+  <p class="subtitle">Hopfield networks, attractor dynamics, and content-addressable recall.</p>
+
+  <h2>What is it?</h2>
+  <p>Membot's neuromorphic layer is a <em>physics simulation</em>, not a deep learning model. There is no gradient descent, no backpropagation, no GPU inference. Instead, it models a network of neurons governed by energy dynamics &mdash; the same principles that describe physical systems settling into stable states.</p>
+
+  <h2>The architecture</h2>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>64&times;64 grid</strong> of cells, each containing 64 neural units (64 &times; 64 &times; 64 = 262,144 units; with internal neuron populations per unit, the total is ~16M simulated neurons)</li>
+    <li><strong>Hebbian weights</strong> &mdash; connections that strengthen when neurons fire together</li>
+    <li><strong>Mexican-hat inhibition</strong> &mdash; a connectivity pattern where nearby neurons excite each other while distant ones inhibit, sharpening activation patterns and suppressing noise (the same lateral inhibition mechanism found in biological visual cortex)</li>
+    <li><strong>Energy dynamics</strong> &mdash; the network evolves to minimize an energy function, settling into stable attractor states</li>
+  </ul>
+
+  <h2>Content-addressable memory</h2>
+  <p>Think of a landscape with valleys. Each stored memory creates a valley (an attractor basin). When you present a query, it's like placing a ball on the landscape. The ball rolls downhill into the nearest valley &mdash; the closest matching memory.</p>
+  <p>This means you can recall a memory from a <em>partial</em> or <em>noisy</em> input. The ball doesn't need to start at the exact bottom of the valley; it just needs to be close enough to roll in.</p>
+
+  <h2>Hopfield networks</h2>
+  <p>The theoretical foundation comes from John Hopfield's 1982 paper on associative memory. Hopfield showed that a network of binary neurons with symmetric connections has a well-defined energy function, and the network dynamics naturally minimize this energy. Each local minimum of the energy function corresponds to a stored memory.</p>
+  <p>Membot extends the classical Hopfield model with continuous activations, a spatial lattice structure, and multi-modal binding through Hebbian learning.</p>
+
+  <h2>Validation</h2>
+  <p>The lattice has been validated on 1 million Wikipedia embeddings (768-dim Nomic vectors, queried with 1,000 held-out entries):</p>
+  <table>
+    <tr><th>Metric</th><th>Result</th><th>Conditions</th></tr>
+    <tr><td>Recall@1</td><td>1.000</td><td>Clean query vectors &mdash; exact patterns presented to the lattice</td></tr>
+    <tr><td>Erasure tolerance</td><td>Recovers</td><td>Up to 30% of input dimensions zeroed out</td></tr>
+    <tr><td>Bitflip tolerance</td><td>Recovers</td><td>Up to 10% of sign bits randomly flipped</td></tr>
+  </table>
+  <p style="font-size:0.85rem;color:var(--color-text-muted);margin-top:0.5rem;">Note: R@1=1.000 on clean queries reflects the lattice acting as a content-addressable store (like a Hopfield network) &mdash; it means stored patterns are faithfully recovered, not that the lattice outperforms embedding-based search on novel queries. See <a href="https://github.com/project-you-apps/membot" target="_blank">the repo</a> for test scripts and methodology.</p>
+
+  <h2>Two access modes</h2>
+  <p><strong>Search</strong> (binary, fast): Uses the sign-zero encoded vectors and Hamming distance. No physics simulation. Returns ranked results in milliseconds.</p>
+  <p><strong>Recall</strong> (physics-based): Activates the neuromorphic lattice. The query pattern propagates through Hebbian weights and the network settles into an attractor state. Slower, but handles partial/noisy queries and can make cross-modal leaps (e.g., text query retrieving images).</p>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="hebbian.html">Hebbian Learning</a> &mdash; how weights are trained<br>
+    <a href="hamming.html">Hamming Distance</a> &mdash; the fast binary path<br>
+    <a href="clip.html">CLIP</a> &mdash; image embeddings for cross-modal<br>
+    <a href="clap.html">CLAP</a> &mdash; audio embeddings for cross-modal
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>

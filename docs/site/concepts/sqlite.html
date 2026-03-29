@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SQLite &mdash; Membot</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <nav>
+    <a href="../index.html">Home</a>
+    <a href="../index.html#how">How It Works</a>
+  </nav>
+</header>
+
+<main class="deep-dive">
+  <a class="back-link" href="../index.html">&larr; Back to overview</a>
+  <h1>SQLite</h1>
+  <p class="subtitle">Serverless database for on-disk text storage.</p>
+
+  <h2>What is it?</h2>
+  <p>SQLite is a self-contained, serverless SQL database engine. It requires no separate process, no configuration, no administration. The entire database lives in a single file. It ships with Python's standard library and is the most widely deployed database engine in the world.</p>
+
+  <h2>In Membot</h2>
+  <p>The split cartridge format uses SQLite for text storage. The vector index (<code>_index.npz</code>) stays in RAM for fast search, while the raw text lives on disk in a SQLite database (<code>_text.db</code>). After search identifies the top results by vector similarity, Membot fetches only those texts from SQLite &mdash; typically taking <strong>~1 ms</strong> per lookup.</p>
+  <p>This architecture means you can search millions of entries without loading all the text into memory.</p>
+
+  <h2>Format comparison</h2>
+  <table>
+    <tr><th>Aspect</th><th>Standard (.cart.npz)</th><th>Split (_index.npz + _text.db)</th></tr>
+    <tr><td>Text storage</td><td>In-memory (pickle)</td><td>On-disk (SQLite)</td></tr>
+    <tr><td>RAM at 2.4M</td><td>~8 GB</td><td>~1.5 GB (vectors only)</td></tr>
+    <tr><td>Text lookup</td><td>Instant (in RAM)</td><td>~1 ms (disk)</td></tr>
+    <tr><td>Portability</td><td>Single file</td><td>Two files</td></tr>
+    <tr><td>Max practical scale</td><td>~500K entries</td><td>Millions+</td></tr>
+  </table>
+
+  <h2>Why SQLite?</h2>
+  <ul style="margin:1rem 0 1rem 1.5rem;">
+    <li><strong>Zero setup</strong> &mdash; no database server to install or manage</li>
+    <li><strong>Built-in</strong> &mdash; ships with Python, no pip install needed</li>
+    <li><strong>Portable</strong> &mdash; the .db file works on any platform</li>
+    <li><strong>Concurrent reads</strong> &mdash; multiple processes can read simultaneously</li>
+    <li><strong>Paged access</strong> &mdash; only loads the data pages actually needed from disk</li>
+  </ul>
+
+  <h2>Further reading</h2>
+  <p>
+    <a href="../index.html">Brain cartridges</a> &mdash; the file format overview<br>
+    <a href="signzero.html">Sign-Zero Encoding</a> &mdash; how the index is compressed
+  </p>
+</main>
+
+<footer class="footer">
+  <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
+</footer>
+
+</body>
+</html>
