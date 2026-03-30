@@ -45,6 +45,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             result = mb.memory_search(
                 query=body.get('query', ''),
                 top_k=body.get('top_k', 5),
+                verbose=body.get('verbose', False),
                 session_id=_default_session,
             )
             self._json({'ok': True, 'raw': result})

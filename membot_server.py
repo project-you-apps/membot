@@ -2064,6 +2064,7 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
                     corpus_bin = state["binary_corpus"]
                     n_bin = min(len(corpus_bin), len(emb_scores))
                     ham = hamming_scores(query_emb, corpus_bin[:n_bin])
+                    ham_scores = ham  # Expose raw Hamming scores for verbose display
 
                     blended = np.copy(emb_scores)
                     blended[:n_bin] = (1.0 - HAMMING_BLEND) * emb_scores[:n_bin] + HAMMING_BLEND * ham
