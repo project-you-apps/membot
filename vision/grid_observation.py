@@ -61,6 +61,59 @@ class GridObservation:
     # Optional: perception notes
     perception_notes: Optional[str] = None
 
+    def to_dict(self) -> Dict:
+        """Serialize to JSON-compatible dict.
+
+        Numpy arrays are converted:
+        - frame_raw: nested lists (64x64 ints, compact)
+        - embedding: base64-encoded float32 bytes (512 floats = 2KB)
+        """
+        import base64
+
+        return {
+            "frame_raw": self.frame_raw.tolist(),
+            "objects": self.objects,
+            "changes": self.changes,
+            "moved": self.moved,
+            "embedding_b64": base64.b64encode(self.embedding.tobytes()).decode("ascii"),
+            "embedding_dim": len(self.embedding),
+            "step_number": self.step_number,
+            "action_taken": self.action_taken,
+            "level_id": self.level_id,
+            "num_objects": self.num_objects,
+            "num_changes": self.num_changes,
+            "num_colors": self.num_colors,
+            "background_color": self.background_color,
+            "perception_notes": self.perception_notes,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "GridObservation":
+        """Deserialize from a dict produced by to_dict().
+
+        Restores numpy arrays from their serialized forms.
+        """
+        import base64
+
+        embedding_bytes = base64.b64decode(d["embedding_b64"])
+        embedding = np.frombuffer(embedding_bytes, dtype=np.float32).copy()
+
+        return cls(
+            frame_raw=np.array(d["frame_raw"], dtype=np.int8),
+            objects=d["objects"],
+            changes=d["changes"],
+            moved=d["moved"],
+            embedding=embedding,
+            step_number=d["step_number"],
+            action_taken=d["action_taken"],
+            level_id=d["level_id"],
+            num_objects=d.get("num_objects", 0),
+            num_changes=d.get("num_changes", 0),
+            num_colors=d.get("num_colors", 0),
+            background_color=d.get("background_color", 0),
+            perception_notes=d.get("perception_notes"),
+        )
+
 
 # ─── Connected component analysis ─────────────────────────────────────
 def parse_objects(frame: np.ndarray, background: int = None) -> List[Dict]:
