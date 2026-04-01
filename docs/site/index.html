@@ -140,7 +140,7 @@
   </table>
 
   <h3>Split cart format</h3>
-  <p>At scale (millions of entries), the split format keeps the vector index in RAM for fast search while storing raw text on disk in SQLite. Text lookups are ~1 ms. This lets you search 4.8M entries on a $12/month server.</p>
+  <p>At scale (millions of entries), the split format keeps the vector index in RAM for fast search while storing raw text on disk in SQLite. Text lookups are ~1 ms. This lets you search 4.8M entries on an affordable consumer host (currently $28/month on DigitalOcean for 4 GB).</p>
 </section>
 
 <!-- ── Why ─────────────────────────────────────────────── -->
@@ -151,7 +151,7 @@
     <tr><th>Feature</th><th>Cloud vector DBs (Pinecone, Weaviate, etc.)</th><th>Membot</th></tr>
     <tr><td>LLM dependency</td><td>None for search (embedding model required for ingest)</td><td>None for search (same embedding model for ingest)</td></tr>
     <tr><td>Hosting</td><td>Managed cloud service (subscription pricing)</td><td>Self-hosted &mdash; portable files you own</td></tr>
-    <tr><td>Cost at 4.8M entries</td><td>$70&ndash;200+/mo depending on provider</td><td>$12/mo VPS (split cart format)</td></tr>
+    <tr><td>Cost at 4.8M entries</td><td>$70&ndash;200+/mo depending on provider</td><td>$28/mo VPS (split cart format)</td></tr>
     <tr><td>Physics layer</td><td>None</td><td>Hopfield attractors, Hebbian learning, noise-tolerant recall</td></tr>
     <tr><td>Cross-modal</td><td>Supported via multi-modal embeddings</td><td>Native Hebbian binding &mdash; text + image + audio in one substrate</td></tr>
     <tr><td>Portability</td><td>Vendor-specific APIs and formats</td><td>Cartridge files &mdash; copy, share, version like any file</td></tr>
@@ -265,7 +265,7 @@ python cartridge_builder.py paper.pdf --name paper</div>
   </div>
 
   <h3>Live deployment</h3>
-  <p>The public dispensary currently serves 4.8M entries on a single $12/month DigitalOcean droplet (2 GB RAM, 50 GB disk) &mdash; no GPU, no cloud vector database, no LLM API calls.</p>
+  <p>The public dispensary currently serves 4.8M entries on a single $28/month DigitalOcean droplet (4 GB RAM, 80 GB disk) &mdash; no GPU, no cloud vector database, no LLM API calls.</p>
 
   <table>
     <tr><th>Cart</th><th>Entries</th><th>Index (RAM)</th><th>Text (disk)</th></tr>
