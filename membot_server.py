@@ -2563,7 +2563,8 @@ def federate_publish(session_file: str, machine_id: str, fleet_dir: str) -> str:
 
 @mcp.tool()
 def federate_consolidate(fleet_dir: str, output_dir: str = "",
-                         similarity_threshold: float = 0.85) -> str:
+                         similarity_threshold: float = 0.85,
+                         mode: str = "preserve") -> str:
     """Mount every machine cart in fleet_dir, find cross-machine pattern
     matches, and write a consolidated cart with cross-machine consensus
     captured as confirming-machine metadata. Drop-in replacement for
@@ -2575,22 +2576,30 @@ def federate_consolidate(fleet_dir: str, output_dir: str = "",
             fleet_dir/../consolidated)
         similarity_threshold: Patterns with cross-machine cosine+hamming
             score above this count as CONFIRMED_BY (default 0.85)
+        mode: Consolidation strategy. "preserve" (default, recommended for
+            federated fleets) keeps ALL variants from every machine and
+            stores cross-cart edges as metadata so the solver can weight
+            trust contextually — aligns with the Web4 trust model. "collapse"
+            picks one representative per CONFIRMED_BY component (smaller
+            cart, loses individual machine voices).
     """
-    log.info(f"federate_consolidate({fleet_dir}, output_dir={output_dir!r}, threshold={similarity_threshold})")
+    log.info(f"federate_consolidate({fleet_dir}, output_dir={output_dir!r}, threshold={similarity_threshold}, mode={mode!r})")
     try:
         result = _fed.consolidate(
             fleet_dir,
             output_dir=output_dir or None,
             similarity_threshold=similarity_threshold,
+            mode=mode,
         )
         if result.get("error"):
             return f"federate_consolidate: {result['error']}"
         return (
             f"Consolidated {result['n_machines']} machines, "
             f"{result['total_input_patterns']} input patterns → "
-            f"{result['n_consolidated_patterns']} unique "
+            f"{result['n_consolidated_patterns']} consolidated "
             f"({result['n_confirmed_pairs']} confirmed pairs, "
-            f"{result['n_contradicted_pairs']} contradicted pairs) "
+            f"{result['n_contradicted_pairs']} contradicted pairs, "
+            f"mode={result['mode']}) "
             f"in {result['elapsed_seconds']}s. "
             f"Output: {result['output_path']}"
         )

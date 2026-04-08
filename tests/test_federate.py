@@ -149,16 +149,17 @@ def main():
         print("  cross-fleet search: PASS")
         print()
 
-        # --- Test 4: consolidate ---
-        print("--- Test 4: consolidate ---")
-        # Unmount first because consolidate will mount everything fresh
+        # --- Test 4a: consolidate in PRESERVE mode (the new default) ---
+        print("--- Test 4a: consolidate mode='preserve' (new default) ---")
         mc.unmount_all()
         consolidated_dir = os.path.join(tmpdir, "consolidated")
         cons_result = federate.consolidate(
             fleet_dir,
             output_dir=consolidated_dir,
             similarity_threshold=0.85,
+            mode="preserve",
         )
+        print(f"  mode: {cons_result['mode']}")
         print(f"  n_machines: {cons_result['n_machines']}")
         print(f"  total_input_patterns: {cons_result['total_input_patterns']}")
         print(f"  n_consolidated_patterns: {cons_result['n_consolidated_patterns']}")
@@ -167,10 +168,35 @@ def main():
         print(f"  elapsed: {cons_result['elapsed_seconds']}s")
         print(f"  output: {cons_result.get('output_path')}")
         assert cons_result["n_machines"] == 2
-        assert cons_result["total_input_patterns"] >= line_count * 2  # both machines
-        # Since cbp and sprout have identical text content, almost everything
-        # should be confirmed across machines
+        assert cons_result["total_input_patterns"] >= line_count * 2
         assert cons_result["n_confirmed_pairs"] > 0, "expected some cross-machine confirmations"
+        # In preserve mode, every input pattern should be in the consolidated cart
+        assert cons_result["n_consolidated_patterns"] == cons_result["total_input_patterns"], (
+            f"preserve mode should keep all variants: "
+            f"got {cons_result['n_consolidated_patterns']} consolidated vs "
+            f"{cons_result['total_input_patterns']} input"
+        )
+        print("  preserve mode keeps all variants: PASS")
+        print()
+
+        # --- Test 4b: consolidate in COLLAPSE mode (legacy) ---
+        print("--- Test 4b: consolidate mode='collapse' (legacy) ---")
+        collapse_dir = os.path.join(tmpdir, "consolidated_collapse")
+        cons_collapse = federate.consolidate(
+            fleet_dir,
+            output_dir=collapse_dir,
+            similarity_threshold=0.85,
+            mode="collapse",
+        )
+        print(f"  mode: {cons_collapse['mode']}")
+        print(f"  n_consolidated_patterns: {cons_collapse['n_consolidated_patterns']}")
+        # Collapse mode produces fewer patterns than preserve mode
+        assert cons_collapse["n_consolidated_patterns"] < cons_result["n_consolidated_patterns"], (
+            f"collapse mode should produce fewer patterns: "
+            f"got {cons_collapse['n_consolidated_patterns']} (collapse) vs "
+            f"{cons_result['n_consolidated_patterns']} (preserve)"
+        )
+        print("  collapse mode produces fewer patterns: PASS")
         print()
 
         # --- Test 5: load consolidated cart and search ---

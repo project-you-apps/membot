@@ -439,13 +439,14 @@ def publish_session(session_file: str, machine_id: str, fleet_dir: str) -> dict:
 
 def consolidate(fleet_dir: str, output_dir: Optional[str] = None,
                 similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
-                contradiction_threshold: float = DEFAULT_CONTRADICTION_EMBEDDING_THRESHOLD) -> dict:
+                contradiction_threshold: float = DEFAULT_CONTRADICTION_EMBEDDING_THRESHOLD,
+                mode: str = "preserve") -> dict:
     """Mount every machine cart in fleet_dir, find cross-machine pattern
     matches, and write a consolidated cart that captures the cross-machine
     consensus and disagreements.
 
-    Replaces Dennis's consolidate.py JSONL deduplication script. The output
-    is a single brain cart that any solver can mount to get the fleet's
+    Replaces Dennis Palatov's consolidate.py JSONL deduplication script.
+    The output is a brain cart that any solver can mount to get the fleet's
     accumulated learning, with corroboration and contradiction signals
     preserved instead of dedup'd away.
 
@@ -458,11 +459,23 @@ def consolidate(fleet_dir: str, output_dir: Optional[str] = None,
         contradiction_threshold: Patterns with similarity in [contradiction,
             similarity_threshold) and low text overlap count as
             CONTRADICTED_BY candidates (default 0.75)
+        mode: How to handle cross-machine matches. Two options:
+            - "preserve" (DEFAULT): Keep ALL variants from every machine in the
+              consolidated cart. Cross-cart edges are stored as metadata
+              (confirming_machines, contradicting_machines lists). The
+              relying party (solver) sees all voices and weighs them itself.
+              This aligns with the Web4 trust model — trust is contextual,
+              not collapsed by the consolidator. Recommended for federated
+              fleets where multiple machines should remain distinct.
+            - "collapse": Pick one representative per CONFIRMED_BY connected
+              component. Smaller cart, less duplication, but loses individual
+              machine voices. Useful when storage is constrained and you
+              don't need per-machine attribution.
 
     Returns:
         dict with keys: output_path, n_machines, total_input_patterns,
         n_consolidated_patterns, n_confirmed_pairs, n_contradicted_pairs,
-        elapsed_seconds
+        mode, elapsed_seconds
     """
     import multi_cart as mc
 
@@ -546,13 +559,24 @@ def consolidate(fleet_dir: str, output_dir: Optional[str] = None,
                             "type": "CONTRADICTED_BY",
                         })
 
-    # Build the consolidated cart from the original patterns + cross-cart edges
-    # The consolidated cart contains:
-    #   - All unique patterns (one representative per CONFIRMED_BY group)
-    #   - Per-pattern metadata that lists all confirming machines
-    consolidated_texts, consolidated_meta, n_unique = _build_consolidated_set(
-        machine_carts, confirmed_pairs, contradicted_pairs
-    )
+    # Build the consolidated cart from the original patterns + cross-cart edges.
+    # Two modes:
+    #   - "preserve" (DEFAULT, per Dennis's Web4 trust framing): keep ALL variants
+    #     from every machine, just annotate cross-cart edges as metadata. Trust is
+    #     contextual and evaluated by the relying party (the solver), not collapsed
+    #     by the consolidator. Larger output cart but no information loss.
+    #   - "collapse": pick one representative per CONFIRMED_BY connected component.
+    #     Smaller cart but loses individual machine voices.
+    if mode == "preserve":
+        consolidated_texts, consolidated_meta = _build_preserved_set(
+            machine_carts, confirmed_pairs, contradicted_pairs
+        )
+    elif mode == "collapse":
+        consolidated_texts, consolidated_meta, _ = _build_consolidated_set(
+            machine_carts, confirmed_pairs, contradicted_pairs
+        )
+    else:
+        raise ValueError(f"Unknown consolidate mode: {mode!r}. Use 'preserve' or 'collapse'.")
 
     output_cart_path = os.path.join(output_dir, f"{DEFAULT_CONSOLIDATED_CART_NAME}.cart.npz")
     if consolidated_texts:
@@ -579,6 +603,7 @@ def consolidate(fleet_dir: str, output_dir: Optional[str] = None,
         "n_contradicted_pairs": len(contradicted_pairs),
         "similarity_threshold": similarity_threshold,
         "contradiction_threshold": contradiction_threshold,
+        "mode": mode,
         "elapsed_seconds": round(time.time() - t0, 2),
     }
     with open(os.path.join(output_dir, "last_consolidated.json"), "w") as f:
@@ -609,12 +634,101 @@ def _text_overlap(a: str, b: str) -> float:
     return len(intersection) / len(union)
 
 
+def _build_preserved_set(machine_carts: list[str],
+                          confirmed_pairs: list[dict],
+                          contradicted_pairs: list[dict]) -> tuple[list[str], list[dict]]:
+    """Build a consolidated cart that PRESERVES all variants from every machine.
+
+    Every original pattern from every machine appears in the output. Cross-cart
+    edges (CONFIRMED_BY, CONTRADICTED_BY) are stored as metadata on each pattern
+    so the relying party (the solver) can see who confirmed it and who
+    disagreed, and weight the trust signal contextually.
+
+    This is the Web4 trust model applied to federation: trust is not collapsed
+    by the consolidator. The consolidator's job is to FIND relationships, not to
+    decide whose voice wins. The solver decides.
+
+    Returns (texts, metadata_list). One entry per (machine, original pattern).
+    """
+    import multi_cart as mc
+
+    # Index: (cart_id, addr) → set of confirming (cart_id, addr) keys
+    confirmed_by: dict = {}
+    for pair in confirmed_pairs:
+        a = pair["from"]
+        b = pair["to"]
+        confirmed_by.setdefault(a, set()).add(b)
+        confirmed_by.setdefault(b, set()).add(a)
+
+    contradicted_by: dict = {}
+    for pair in contradicted_pairs:
+        a = pair["from"]
+        b = pair["to"]
+        contradicted_by.setdefault(a, set()).add(b)
+        contradicted_by.setdefault(b, set()).add(a)
+
+    out_texts: list[str] = []
+    out_meta: list[dict] = []
+
+    for cart_id in machine_carts:
+        state = mc.get_cart(cart_id)
+        if not state:
+            continue
+        for local_addr in range(state["n_patterns"]):
+            key = (cart_id, local_addr)
+            text = state["texts"][local_addr] if local_addr < len(state["texts"]) else ""
+
+            # Collect cross-cart edges for this specific pattern
+            confirmations = sorted(confirmed_by.get(key, set()))
+            contradictions = sorted(contradicted_by.get(key, set()))
+
+            # Confirming machines (deduplicated, alphabetical)
+            confirming_machines = sorted(set(c[0] for c in confirmations))
+            contradicting_machines = sorted(set(c[0] for c in contradictions))
+
+            # Build a list of (machine, addr) pointers for the solver to follow
+            confirmed_by_list = [
+                {"machine": c[0], "local_addr": c[1]} for c in confirmations
+            ]
+            contradicted_by_list = [
+                {"machine": c[0], "local_addr": c[1]} for c in contradictions
+            ]
+
+            meta = {
+                "consolidated": True,
+                "preserve_mode": True,
+                "source_machine": cart_id,
+                "source_local_addr": local_addr,
+                "confirming_machines": confirming_machines,
+                "contradicting_machines": contradicting_machines,
+                "n_confirmations": len(confirmations),
+                "n_contradictions": len(contradictions),
+                "confirmed_by": confirmed_by_list,
+                "contradicted_by": contradicted_by_list,
+                # Trust hint for the solver — but the solver decides what to do with it
+                "trust_signal": (
+                    "high_corroboration" if len(confirming_machines) >= 2 else
+                    "single_corroboration" if len(confirming_machines) == 1 else
+                    "single_source"
+                ),
+            }
+
+            out_texts.append(text)
+            out_meta.append(meta)
+
+    return out_texts, out_meta
+
+
 def _build_consolidated_set(machine_carts: list[str],
                              confirmed_pairs: list[dict],
                              contradicted_pairs: list[dict]) -> tuple[list[str], list[dict], int]:
     """Walk every pattern in every machine cart and produce a deduplicated set
     where CONFIRMED_BY pairs collapse to one representative pattern with all
     confirming machines listed in the metadata.
+
+    NOTE: This is the legacy "collapse" mode. New code should prefer
+    _build_preserved_set() which keeps all variants per the Web4 trust model
+    decision (2026-04-08, requested by dp-web4 fleet).
 
     Returns (texts, metadata_list, n_unique).
     """

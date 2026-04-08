@@ -302,3 +302,42 @@ Total: ~8-10 days, after multi-cart-query-spec.md is done.
 ---
 
 *Federation isn't a separate feature. It's what multi-cart query looks like when the carts come from multiple machines instead of multiple cognitive functions.*
+
+---
+
+## Amendment 1: Consolidation Mode (2026-04-08, dp-web4 design input)
+
+After the Phase 1 PR was merged into dp-web4/membot, Dennis Palatov flagged a fundamental design choice in `consolidate()`. The original implementation picked one representative per CONFIRMED_BY connected component and discarded the duplicates. Dennis pushed back:
+
+> "We prefer keeping all variants and using CONFIRMED_BY edges as trust signals rather than picking one representative. This aligns with our Web4 trust model — trust is contextual and evaluated by the relying party, not collapsed to a single truth by the consolidator. The solver should see that 3 machines agree on a mechanic and weigh that differently than a single observation."
+
+He's right. The consolidator's job is to **find** cross-machine relationships, not to **decide** whose voice wins. Trust is contextual to the relying party (the solver). Three machines independently arriving at the same conclusion is *information* that should be visible at search time, not metadata that gets compressed into "we picked the cbp version because it came first alphabetically."
+
+### The fix
+
+`consolidate()` now takes a `mode` parameter:
+
+- **`mode="preserve"`** (DEFAULT): Keep all variants from every machine in the consolidated cart. Cross-cart edges are stored as per-pattern metadata (`confirming_machines`, `contradicting_machines`, `confirmed_by`, `contradicted_by`, `n_confirmations`, `n_contradictions`, `trust_signal`). The solver sees every voice and weighs them itself.
+- **`mode="collapse"`**: Legacy behavior. Pick one representative per CONFIRMED_BY connected component. Smaller output cart but loses individual machine voices. Use only when storage is constrained and per-machine attribution doesn't matter.
+
+### Why this matters beyond SAGE
+
+The Web4 framing — "trust is contextual, evaluated by the relying party" — applies to *any* federation use case, not just Dennis's fleet. A multi-team knowledge base (Membox in federated mode) should preserve disagreements between teams instead of collapsing them. A multi-source RAG corpus should let the model see which sources corroborate each other and which contradict, not just the deduplicated answer. Preserve mode is the correct default for federation, period.
+
+### Trust signal hint
+
+In preserve mode, each consolidated pattern gets a `trust_signal` field set to one of:
+
+- `high_corroboration` — confirmed by 2+ other machines
+- `single_corroboration` — confirmed by exactly 1 other machine
+- `single_source` — only the source machine has this pattern
+
+The solver MAY use this as a confidence boost, MAY ignore it, MAY apply its own trust calculation based on which machines confirmed (e.g. trust Sprout's confirmations more than CBP's because Sprout is in a deeper raising phase). The hint is a *suggestion*, not a verdict.
+
+### Phase 3 alignment
+
+This amendment puts us closer to the Phase 3 vision (cross-cart h-row edges) than the original collapse-mode implementation. In Phase 3, the cross-cart edges in metadata become first-class h-row entries with proper navigation. The preserve-mode consolidated cart already has all the information needed to construct those edges; the difference is just the storage format. The metadata blob today can be lifted into h-row entries tomorrow without re-running consolidation.
+
+### Status
+
+Shipped 2026-04-08 in the same branch as the original Phase 1 PR (claude/federate-phase-1).
