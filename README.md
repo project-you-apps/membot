@@ -214,7 +214,57 @@ mcporter call membot.memory_search query="your query" top_k=5
 
 See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working example.
 
+## What's New (April 2026)
+
+### Multi-Cart Query — One Membot, Many Mounted Carts
+
+The single-cart `mount_cartridge` API still works exactly as before. In addition, Membot now supports a parallel **multi-cart pool** that can hold many carts mounted simultaneously and query across them with namespaced result attribution.
+
+```python
+multi_mount("./identity.cart", cart_id="me", role="identity")
+multi_mount("./gutenberg.cart", cart_id="library", role="reference")
+multi_mount("./fleet/cbp.cart", cart_id="cbp", role="federated")
+
+multi_search("uncertainty tolerance", scope="all")
+# → results attributed to source carts: [me#42], [library#9131], [cbp#3]
+```
+
+`scope` accepts `"all"`, `"local"`, a single `cart_id`, or a list. `role_filter` narrows further — `multi_search(q, role_filter="federated")` searches only federated carts.
+
+This is the foundation that turns Membot from a single-relation library into a multi-relation database. See [docs/RFC/multi-cart-query-spec.md](docs/RFC/multi-cart-query-spec.md) for the full design.
+
+### Federated Mode — Multi-Machine Brain Cart Sync
+
+Built on top of multi-cart, `federate.py` provides drop-in federation for fleets of machines that share a git directory of per-machine learning logs. Each machine writes only to its own cart (no git conflicts), consolidation finds cross-machine matches and writes them as cross-cart edges instead of dedup'ing them away.
+
+```python
+import federate
+
+# One-time migration from existing JSONL to brain carts
+federate.migrate_jsonl("shared-context/arc-agi-3/fleet-learning", in_place=True)
+
+# Daily consolidation (replaces consolidate.py)
+federate.consolidate("shared-context/arc-agi-3/fleet-learning")
+
+# Solver entry point: mount the whole fleet for cross-machine search
+federate.load_fleet("shared-context/arc-agi-3/fleet-learning")
+```
+
+The `federate.publish_session()` and `federate.consolidate()` functions are designed as drop-in replacements for Dennis Palatov's `publish_learning.py` and `consolidate.py` from the dp-web4/SAGE federated learning architecture. Same git-sync model, same per-machine append-only writes — just brain carts as the substrate instead of JSONL files.
+
+Validated against real SAGE fleet data: 28 input patterns from 2 simulated machines → 73 cross-machine confirmed pairs → 3 unique consolidated patterns in 0.4s.
+
+See [docs/RFC/federated-cart-spec.md](docs/RFC/federated-cart-spec.md) for the full design and the drop-in API for SAGE.
+
+### Membox (Coming Next) — Multiuser CRUD with Locking
+
+The third mode of the same substrate: multiple users sharing one cart with locking, version chains, and dispute preservation. Phase 1 (locking + tagging) is the next implementation step. Spec at [docs/RFC/membox-multiuser-dbms-spec.md](docs/RFC/membox-multiuser-dbms-spec.md).
+
+Together, the three modes (single-user, federated, multiuser) make Membot the first working **neuromorphic database** — multi-relation, multi-machine, multi-user, all on the same substrate.
+
 ## Tools
+
+### Single-cart (per-session)
 
 | Tool | Description |
 |------|-------------|
@@ -227,6 +277,25 @@ See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working exa
 | `get_passage` | Retrieve a specific passage by index (for navigation and drill-down) |
 | `passage_links` | Get navigation links (prev/next/parent/related) for a passage |
 | `get_status` | Server diagnostics (mounted cartridge, memory count, GPU status) |
+
+### Multi-cart (process-global pool, query across many carts)
+
+| Tool | Description |
+|------|-------------|
+| `multi_mount` | Add a cart to the multi-cart pool with optional `cart_id` and `role` |
+| `multi_unmount` | Remove a cart from the pool by `cart_id` |
+| `multi_list` | List every cart currently mounted in the pool |
+| `multi_mount_directory` | Mount every cart in a directory matching a glob pattern (used by federation) |
+| `multi_search` | Search across mounted carts with `scope` and `role_filter`, results attributed to source |
+
+### Federate (federation drop-in for SAGE-style fleets)
+
+| Tool | Description |
+|------|-------------|
+| `federate_publish` | Append session learning entries to a machine's federated cart |
+| `federate_consolidate` | Find cross-machine matches across mounted carts, write a consolidated cart |
+| `federate_migrate_jsonl` | One-time migration from JSONL learning logs to brain carts |
+| `federate_load` | Mount every machine's federated cart in a fleet directory at once |
 
 ## Depot Dashboard
 

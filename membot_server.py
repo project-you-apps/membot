@@ -2364,6 +2364,302 @@ def unmount(session_id: str = "") -> str:
     return f"Unmounted '{name}'.{warning}"
 
 
+# =============================================================================
+# MULTI-CART API — query across many mounted carts at once
+# =============================================================================
+# Spec: docs/RFC/multi-cart-query-spec.md
+# Implementation: multi_cart.py (parallel layer alongside the single-cart code above)
+#
+# The single-cart tools above (mount_cartridge, memory_search, etc.) keep
+# working unchanged — they use per-session state. The multi-cart tools below
+# share a process-global pool of mounted carts so one process can hold many
+# carts and query across them. Both layers can coexist.
+
+import multi_cart as _mc
+
+
+@mcp.tool()
+def multi_mount(cart_path: str, cart_id: str = "", role: str = "",
+                verify_integrity: bool = True) -> str:
+    """Mount a cart by file path into the multi-cart pool. Multiple carts can
+    be mounted at once and queried across via multi_search.
+
+    Args:
+        cart_path: Filesystem path to the cart file (.npz, .pkl, or split format)
+        cart_id: Short stable identifier for this mount (defaults to filename)
+        role: Optional semantic tag — 'identity', 'episodic', 'semantic',
+              'working', 'federated', 'consolidated', etc. Used to filter
+              searches by role.
+        verify_integrity: If True (default), reject carts with stale or
+              mismatched manifests. Set False to override for known-stale
+              carts (testing or migration).
+    """
+    log.info(f"multi_mount({cart_path}, cart_id={cart_id!r}, role={role!r}, verify={verify_integrity})")
+    try:
+        result = _mc.mount(
+            cart_path,
+            cart_id=cart_id or None,
+            role=role or None,
+            verify_integrity=verify_integrity,
+        )
+        return (
+            f"Mounted '{result['cart_id']}' (role={result['role']}, "
+            f"{result['n_patterns']} patterns, {result['embedding_dim']}-dim, "
+            f"{result['elapsed_ms']}ms)"
+        )
+    except Exception as e:
+        return f"multi_mount failed: {e}"
+
+
+@mcp.tool()
+def multi_unmount(cart_id: str) -> str:
+    """Remove a cart from the multi-cart pool by cart_id."""
+    log.info(f"multi_unmount({cart_id})")
+    result = _mc.unmount(cart_id)
+    if result["status"] == "not_mounted":
+        return f"Cart '{cart_id}' is not mounted."
+    return (
+        f"Unmounted '{cart_id}' (was role={result['role']}, "
+        f"{result['n_patterns']} patterns)"
+    )
+
+
+@mcp.tool()
+def multi_list() -> str:
+    """List every cart currently mounted in the multi-cart pool."""
+    log.info("multi_list()")
+    mounts = _mc.list_mounts()
+    if not mounts:
+        return "No carts mounted in the multi-cart pool."
+    lines = [f"Multi-cart pool: {len(mounts)} carts, {_mc.total_patterns_mounted()} total patterns"]
+    for m in mounts:
+        role_label = f" [role={m['role']}]" if m["role"] else ""
+        split_label = " (split)" if m["is_split_cart"] else ""
+        lines.append(
+            f"  '{m['cart_id']}'{role_label}: {m['n_patterns']} patterns, "
+            f"{m['embedding_dim']}-dim{split_label}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def multi_mount_directory(dir_path: str, role: str = "", pattern: str = "*.cart") -> str:
+    """Mount every cart file in a directory matching the glob pattern.
+    Used for federated mode — point at a fleet-learning directory and get
+    every machine's cart mounted with the same role.
+
+    Args:
+        dir_path: Directory to scan
+        role: Role to apply to every mounted cart (e.g. 'federated')
+        pattern: Glob pattern (default '*.cart' — also try '*.npz', '*.pkl')
+    """
+    log.info(f"multi_mount_directory({dir_path}, role={role!r}, pattern={pattern!r})")
+    try:
+        results = _mc.mount_directory(dir_path, role=role or None, pattern=pattern)
+        ok = sum(1 for r in results if r.get("status") == "mounted")
+        err = sum(1 for r in results if r.get("status") == "error")
+        lines = [f"mount_directory({dir_path}): {ok} mounted, {err} errors"]
+        for r in results:
+            if r.get("status") == "mounted":
+                lines.append(f"  ✓ {r['cart_id']}: {r['n_patterns']} patterns")
+            else:
+                lines.append(f"  ✗ {r.get('cart_id', '?')}: {r.get('error', 'unknown')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"multi_mount_directory failed: {e}"
+
+
+@mcp.tool()
+def multi_search(query: str, top_k: int = 10, scope: str = "all",
+                 role_filter: str = "") -> str:
+    """Search across every mounted cart in the multi-cart pool. Results are
+    globally ranked and attributed to their source cart.
+
+    Args:
+        query: Natural language search query
+        top_k: Number of top results to return across all carts (default 10)
+        scope: 'all' (default), 'local' (first cart only), or a specific cart_id
+        role_filter: Optional role tag to restrict the search to matching carts
+                     (e.g. 'federated' to search only federated-mode carts)
+    """
+    if len(query) > MAX_QUERY_LENGTH:
+        return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
+    log.info(f"multi_search('{query[:60]}', top_k={top_k}, scope={scope!r}, role_filter={role_filter!r})")
+
+    try:
+        result = _mc.search(
+            query,
+            top_k=top_k,
+            scope=scope,
+            role_filter=role_filter or None,
+        )
+    except Exception as e:
+        return f"multi_search error: {e}"
+
+    if result.get("error"):
+        return f"multi_search: {result['error']}"
+
+    results = result["results"]
+    if not results:
+        return (
+            f"No relevant matches for '{query}' "
+            f"(searched {result['cart_count']} carts, "
+            f"{result['total_patterns']} patterns, {result['elapsed_ms']}ms)"
+        )
+
+    header = (
+        f"multi_search [scope={scope}, role_filter={role_filter or 'any'}]: "
+        f"{len(results)} results from {result['cart_count']} carts "
+        f"({result['total_patterns']} patterns, {result['elapsed_ms']}ms)\n"
+    )
+    lines = [header]
+    for rank, r in enumerate(results, 1):
+        if r["score"] < 0.1:
+            continue
+        cart_label = f"[{r['cart_id']}"
+        if r.get("role"):
+            cart_label += f"/{r['role']}"
+        cart_label += f"#{r['local_addr']}]"
+        lines.append(f"#{rank} {cart_label} [{r['score']:.3f}] {r['text']}")
+    return "\n\n".join(lines)
+
+
+# =============================================================================
+# FEDERATE — Federated cart mode (drop-in for Dennis's federated learning)
+# =============================================================================
+# Spec: docs/RFC/federated-cart-spec.md
+# Implementation: federate.py (built on multi_cart.py)
+#
+# Use these tools to manage a fleet of machine carts that share a git directory
+# the way Dennis's SAGE fleet shares its JSONL learning data. publish_session()
+# appends to a machine's cart; consolidate() finds cross-machine matches and
+# writes a consolidated cart; load_fleet() mounts the whole fleet for solver use.
+
+import federate as _fed
+
+
+@mcp.tool()
+def federate_publish(session_file: str, machine_id: str, fleet_dir: str) -> str:
+    """Append session learning entries to a machine's federated cart.
+    Drop-in replacement for Dennis Palatov's publish_learning.py.
+
+    Args:
+        session_file: Path to a .jsonl file (one JSON object per line) or a
+            .json file with a 'learning_entries' or 'entries' key.
+        machine_id: Machine identifier (e.g. 'cbp', 'sprout', 'mcnugget')
+        fleet_dir: Root of the fleet-learning directory (parent of machine dirs)
+    """
+    log.info(f"federate_publish({session_file}, {machine_id}, {fleet_dir})")
+    try:
+        result = _fed.publish_session(session_file, machine_id, fleet_dir)
+        return (
+            f"Published to '{machine_id}': added {result['added']}, "
+            f"skipped {result['skipped']} dedup, "
+            f"total {result['total_in_cart']} → {result['cart_path']}"
+        )
+    except Exception as e:
+        return f"federate_publish failed: {e}"
+
+
+@mcp.tool()
+def federate_consolidate(fleet_dir: str, output_dir: str = "",
+                         similarity_threshold: float = 0.85) -> str:
+    """Mount every machine cart in fleet_dir, find cross-machine pattern
+    matches, and write a consolidated cart with cross-machine consensus
+    captured as confirming-machine metadata. Drop-in replacement for
+    Dennis's consolidate.py.
+
+    Args:
+        fleet_dir: Root of the fleet-learning directory
+        output_dir: Where to write the consolidated cart (defaults to
+            fleet_dir/../consolidated)
+        similarity_threshold: Patterns with cross-machine cosine+hamming
+            score above this count as CONFIRMED_BY (default 0.85)
+    """
+    log.info(f"federate_consolidate({fleet_dir}, output_dir={output_dir!r}, threshold={similarity_threshold})")
+    try:
+        result = _fed.consolidate(
+            fleet_dir,
+            output_dir=output_dir or None,
+            similarity_threshold=similarity_threshold,
+        )
+        if result.get("error"):
+            return f"federate_consolidate: {result['error']}"
+        return (
+            f"Consolidated {result['n_machines']} machines, "
+            f"{result['total_input_patterns']} input patterns → "
+            f"{result['n_consolidated_patterns']} unique "
+            f"({result['n_confirmed_pairs']} confirmed pairs, "
+            f"{result['n_contradicted_pairs']} contradicted pairs) "
+            f"in {result['elapsed_seconds']}s. "
+            f"Output: {result['output_path']}"
+        )
+    except Exception as e:
+        return f"federate_consolidate failed: {e}"
+
+
+@mcp.tool()
+def federate_migrate_jsonl(jsonl_dir: str, output_dir: str = "",
+                            in_place: bool = False) -> str:
+    """One-time migration from JSONL learning files to brain carts.
+    Walks a directory of fleet-learning/{machine}/*_learning.jsonl files and
+    builds a kb.cart.npz for each machine.
+
+    Args:
+        jsonl_dir: Directory with per-machine subdirs containing JSONL files
+        output_dir: Target directory for the new carts (defaults to jsonl_dir
+            if in_place=True or jsonl_dir if not specified)
+        in_place: Write carts alongside the JSONL files in their original
+            machine directories. Non-destructive — JSONL files are not removed.
+    """
+    log.info(f"federate_migrate_jsonl({jsonl_dir}, output_dir={output_dir!r}, in_place={in_place})")
+    try:
+        result = _fed.migrate_jsonl(
+            jsonl_dir,
+            output_dir=output_dir or None,
+            in_place=in_place,
+        )
+        lines = [
+            f"Migration: {result['carts_built']} carts built from "
+            f"{result['machines_processed']} machine dirs, "
+            f"{result['total_entries']} entries in {result['elapsed_seconds']}s"
+        ]
+        if result["errors"]:
+            lines.append(f"  {len(result['errors'])} errors:")
+            for err in result["errors"][:5]:
+                lines.append(f"    ! {err}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"federate_migrate_jsonl failed: {e}"
+
+
+@mcp.tool()
+def federate_load(fleet_dir: str) -> str:
+    """Mount every machine's federated cart in fleet_dir into the multi-cart
+    pool with role='federated'. Used by solvers at session start to make the
+    fleet's accumulated learning available for cross-machine search via
+    multi_search(scope='all', role_filter='federated').
+
+    Args:
+        fleet_dir: Root of the fleet-learning directory (parent of machine dirs)
+    """
+    log.info(f"federate_load({fleet_dir})")
+    try:
+        result = _fed.load_fleet(fleet_dir)
+        machine_list = ", ".join(result["machines"]) if result["machines"] else "none"
+        out = (
+            f"Loaded fleet from {fleet_dir}: {len(result['mounted'])} machines mounted "
+            f"({machine_list}), {result['total_patterns']} total patterns"
+        )
+        if result["errors"]:
+            out += f"\n  {len(result['errors'])} errors:"
+            for err in result["errors"][:3]:
+                out += f"\n    ! {err.get('machine', '?')}: {err.get('error', '?')}"
+        return out
+    except Exception as e:
+        return f"federate_load failed: {e}"
+
+
 @mcp.tool()
 def get_status(session_id: str = "") -> str:
     """Get server status: mounted cartridge, memory count, GPU availability.
