@@ -1,5 +1,134 @@
 # Membot Devlog
 
+## 2026-04-08 (afternoon) — Membox Phase 1 SHIPPED — All Three Modes Live
+
+The third mode of the three-mode framework is now operational. Membot is the first **neuromorphic database** with single-user, federated multi-machine, AND multiuser-shared modes all running on the same substrate.
+
+### What landed
+
+- **`membot/membox.py`** — `CartLock` (write mutex with lease-based crash recovery), `imprint(cart_id, text, agent_id, ...)` convenience API, `search(cart_id, query)` (delegates to multi_cart, enriches results with `membox_meta`), `mount/unmount/list_mounts/status`. Reads never block on writes — classic many-readers-one-writer.
+- **`multi_cart.imprint_with_meta(cart_id, text, per_pattern_meta)`** — the general-purpose runtime imprint API used by Membox (and any future write path). Embeds new text, appends to in-memory state, persists the cart preserving hippocampus + pattern0 + per_pattern_meta + sign_bits + version. `_persist_cart()` is the on-disk write helper.
+- **9 new MCP tools**: `membox_mount`, `membox_unmount`, `membox_list`, `membox_imprint`, `membox_search`, `membox_acquire_lock`, `membox_release_lock`, `membox_lock_holder`, `membox_status`.
+- **`tests/test_membox.py`** — 11 tests, all pass first run. Mount, single-agent imprint, lock holder query, lock timeout under contention (~205ms), invalid release raises PermissionError, read never blocks (28ms while lock held), two-agent concurrent imprint via Python threads (both serialize correctly with unique local_addrs and proper attribution), agent_id stamping survives in per_pattern_meta, status reports per-agent write counts, lease-based crash recovery.
+- **Spec docs**: new `docs/RFC/membox-phase1-implementation.md` (concrete implementation spec), Amendment 2 added to `docs/RFC/membox-multiuser-dbms-spec.md` (Phase 1 SHIPPED marker + test results).
+- **README** "What's New" section updated to mark Membox Phase 1 SHIPPED with code example.
+
+### Performance numbers (RTX 4080 Super local)
+
+- First imprint: 2,131ms (Nomic cold load)
+- Subsequent imprints: ~19ms (warm cache + append + persist)
+- Read while write lock held: 28ms (zero blocking)
+- ~50 writes/sec per agent under contention
+
+### Why this matters
+
+Multi-cart query (foundation) + Federation (multi-machine) were powerful but invisible to a non-technical observer. Membox is the **product unlock** because it has a 90-second visible demo: two textareas, two agents, both writing to the same cart with serialized attribution, lock indicator showing who's holding the write lock right now. That's the demo an angel investor can grasp in 30 seconds because they've used Google Docs.
+
+The pitch becomes "Google Docs for AI memory." Phase 2 (version chains + dispute detection) adds the conflict-resolution UI moment. Phase 3 (permissions) makes it multi-tenant. Phase 4 (admin agent) handles HITL workflows. Phase 5 (VPS integration) makes it the visible product.
+
+Andy's framing: *"This multi-user/multi-cart feature that gives us true CRUD suddenly puts project-you over the top. And it potentially moves VPS into being an actual product I can pitch to angels that they might understand BY SHOWING IT TO THEM DIRECTLY."*
+
+### Status of all three modes
+
+- ✅ **Single-user** (legacy Membot, untouched)
+- ✅ **Federated** (Phase 1 shipped 2026-04-08 morning, production-validated by Dennis on Nomad — see `DEVLOG-SAGE-COLLAB.md`)
+- ✅ **Multiuser/Membox** (Phase 1 shipped 2026-04-08 afternoon, 11/11 tests pass)
+
+PR #11 on `project-you-apps/membot`, branch `claude/federate-phase-1`, will get a new commit containing all of this Membox work.
+
+---
+
+## 2026-04-08 — Multi-Cart Phase 1 + Federate Phase 1 + scope_mode polish
+
+The substrate change that turns Membot from a single-relation library into a multi-relation neuromorphic database. Three commits on PR #11 (project-you-apps/membot, branch `claude/federate-phase-1`):
+
+### multi_cart.py (the foundation)
+
+Process-global cart pool with namespaced query and result attribution. Existing single-cart per-session API stays unchanged.
+
+```python
+multi_mount("./identity.cart", cart_id="me", role="identity")
+multi_mount("./gutenberg.cart", cart_id="lib", role="reference")
+multi_mount("./fleet/cbp.cart", cart_id="cbp", role="federated")
+
+multi_search("uncertainty tolerance", scope="all")
+# → [me#42], [lib#9131], [cbp#3]  ← attributed to source carts
+```
+
+API: `mount`, `unmount`, `list_mounts`, `mount_directory`, `search`, `get_cart`, `total_patterns_mounted`, `unmount_all`.
+
+Search supports `scope` (`"all"` / `"local"` / cart_id / list) and `role_filter` (one role string or list). 5 new MCP tools expose the API.
+
+Validated by `tests/test_multi_cart.py` (10 tests, all pass against real cartridges).
+
+### federate.py (drop-in for Dennis Palatov's SAGE federated learning)
+
+Built on multi_cart. Same git-sync model and per-machine append-only writes as Dennis's existing JSONL architecture, brain carts as the substrate.
+
+- `publish_session(session_file, machine_id, fleet_dir)` — replaces his `publish_learning.py`
+- `consolidate(fleet_dir, output_dir, mode='preserve')` — replaces his `consolidate.py`
+- `migrate_jsonl(jsonl_dir, in_place=True)` — one-time JSONL → cart migration (non-destructive)
+- `load_fleet(fleet_dir)` — solver entry point: mount every machine's cart with `role='federated'`
+
+`consolidate()` defaults to `mode='preserve'` (per Dennis's Web4 trust feedback): keeps every machine's variants and stores cross-cart edges as per-pattern metadata. The legacy `mode='collapse'` is still available for callers that need a smaller cart and don't care about per-machine attribution.
+
+Per-pattern metadata in preserve mode includes `confirming_machines`, `contradicting_machines`, `confirmed_by`, `contradicted_by`, `n_confirmations`, `n_contradictions`, `trust_signal` (`high_corroboration` / `single_corroboration` / `single_source`). Trust signals are *hints*, not verdicts — the solver weighs them however it wants.
+
+4 new MCP tools: `federate_publish`, `federate_consolidate`, `federate_migrate_jsonl`, `federate_load`.
+
+Validated by `tests/test_federate.py` (8 tests, all pass against Dennis's real `sb26_learning.jsonl`).
+
+### scope_mode polish
+
+`multi_search` now takes a `scope_mode` parameter for fair cross-cart ranking when carts are different sizes:
+
+| scope_mode | Behavior | Use when |
+|---|---|---|
+| `"global"` (default) | True top-K across all carts. Backward-compatible. | "What's the single best answer regardless of source?" |
+| `"per_cart"` | Top-K from EACH cart, no cross-cart re-rank. Up to K × N_carts results. | "Show me each source's best answer for comparison." |
+| `"balanced"` | Top-K candidates per cart, then global re-rank to top-K. | "Fair representation AND global ranking." |
+| `"diagnostic"` | Top-K from every cart, no merging, fully labeled. | Debugging cross-cart search behavior. |
+
+`per_cart` and `diagnostic` also return a `grouped_results` dict in the response keyed by cart_id.
+
+Real-world test: 24-pattern attention paper cart vs 18,040-pattern gutenberg cart, query "memory and recall":
+- `global` mode: all 5 results came from gutenberg (Bertrand Russell on memory dominated)
+- `per_cart` mode: 6 results, 3 from each cart (both represented)
+- `balanced` mode: 3 results, all from gutenberg (the attention paper's best candidate genuinely scored lower than gutenberg's third-best — balanced doesn't artificially boost, it ensures fair *opportunity*)
+- `diagnostic` mode: 6 results fully grouped by source
+
+The four modes give the caller their choice of semantics. Spec amendment in `docs/RFC/multi-cart-query-spec.md`.
+
+### What this unblocks
+
+- **Federated mode for SAGE**: Dennis already merged the PR into dp-web4/membot fork and is testing on Nomad
+- **Cart-per-cognitive-function**: a Membot instance can hold raising_kb + game_kb + working_memory + identity carts simultaneously, queried as one substrate
+- **Membox Phase 1** (next): the third mode of the three-mode framework — multiuser CRUD with locking + tagging
+- **The "neuromorphic DBMS" launch positioning**: with multi-cart + federation real, the framing is no longer aspirational
+
+### Files added or changed
+
+```
+multi_cart.py                          (new, ~450 lines)
+federate.py                            (new, ~700 lines)
+membot_server.py                       (+9 MCP tools, ~400 lines)
+tests/test_multi_cart.py               (new, ~200 lines)
+tests/test_federate.py                 (new, ~200 lines)
+tests/README.md                        (new, conventions)
+.gitignore                             (test artifact patterns)
+docs/RFC/multi-cart-query-spec.md      (new, foundational spec + Amendment 1)
+docs/RFC/federated-cart-spec.md        (new, federation spec + Amendment 1)
+docs/RFC/membox-multiuser-dbms-spec.md (new, v2 amendments folding modes)
+docs/DEVLOG-SAGE-COLLAB.md             (new, sustained collab narrative)
+README.md                              ("What's New" section)
+```
+
+PR: https://github.com/project-you-apps/membot/pull/11
+
+Detailed collaboration narrative: `docs/DEVLOG-SAGE-COLLAB.md`
+
+---
+
 ## 2026-04-01 — Membox RFC: Multi-User Neuromorphic DBMS
 
 Concept crystallized: extend Membot from single-user carts to multi-user DBMS with CRUD, locking, versioning, access control, and conflict resolution. Append-only version chains (Git for memories), DISPUTED flags for semantic conflicts, membox.txt for default permissions, admin agent template for automated governance. VPS = human frontend, MCP = agent backend, same cart.

@@ -1,6 +1,8 @@
 {
-  "version": "mcp-v3",
-  "count": 189,
-  "fingerprint": "d3337f780f62d57f",
-  "timestamp": "2026-03-30T00:00:29Z"
+  "version": "mcp-v4",
+  "count": 24,
+  "has_hippocampus": true,
+  "fingerprint": "c26c5978e9fc62e8",
+  "timestamp": "2026-04-08T15:10:46Z",
+  "rebuilt_by": "scripts/rebuild_attention_cart.py"
 }

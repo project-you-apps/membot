@@ -29,6 +29,15 @@ gutenberg_cache/
 # Logs
 *.log
 
+# Test artifacts — keep test scripts in git, ignore their output
+tests/*_test_results/
+tests/*_test_output/
+tests/tmp/
+tests/scratch/
+test_*_results/
+test_*_output/
+federate_test_*/
+
 # OS
 .DS_Store
 Thumbs.db

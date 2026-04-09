@@ -2364,6 +2364,603 @@ def unmount(session_id: str = "") -> str:
     return f"Unmounted '{name}'.{warning}"
 
 
+# =============================================================================
+# MULTI-CART API — query across many mounted carts at once
+# =============================================================================
+# Spec: docs/RFC/multi-cart-query-spec.md
+# Implementation: multi_cart.py (parallel layer alongside the single-cart code above)
+#
+# The single-cart tools above (mount_cartridge, memory_search, etc.) keep
+# working unchanged — they use per-session state. The multi-cart tools below
+# share a process-global pool of mounted carts so one process can hold many
+# carts and query across them. Both layers can coexist.
+
+import multi_cart as _mc
+
+
+@mcp.tool()
+def multi_mount(cart_path: str, cart_id: str = "", role: str = "",
+                verify_integrity: bool = True) -> str:
+    """Mount a cart by file path into the multi-cart pool. Multiple carts can
+    be mounted at once and queried across via multi_search.
+
+    Args:
+        cart_path: Filesystem path to the cart file (.npz, .pkl, or split format)
+        cart_id: Short stable identifier for this mount (defaults to filename)
+        role: Optional semantic tag — 'identity', 'episodic', 'semantic',
+              'working', 'federated', 'consolidated', etc. Used to filter
+              searches by role.
+        verify_integrity: If True (default), reject carts with stale or
+              mismatched manifests. Set False to override for known-stale
+              carts (testing or migration).
+    """
+    log.info(f"multi_mount({cart_path}, cart_id={cart_id!r}, role={role!r}, verify={verify_integrity})")
+    try:
+        result = _mc.mount(
+            cart_path,
+            cart_id=cart_id or None,
+            role=role or None,
+            verify_integrity=verify_integrity,
+        )
+        return (
+            f"Mounted '{result['cart_id']}' (role={result['role']}, "
+            f"{result['n_patterns']} patterns, {result['embedding_dim']}-dim, "
+            f"{result['elapsed_ms']}ms)"
+        )
+    except Exception as e:
+        return f"multi_mount failed: {e}"
+
+
+@mcp.tool()
+def multi_unmount(cart_id: str) -> str:
+    """Remove a cart from the multi-cart pool by cart_id."""
+    log.info(f"multi_unmount({cart_id})")
+    result = _mc.unmount(cart_id)
+    if result["status"] == "not_mounted":
+        return f"Cart '{cart_id}' is not mounted."
+    return (
+        f"Unmounted '{cart_id}' (was role={result['role']}, "
+        f"{result['n_patterns']} patterns)"
+    )
+
+
+@mcp.tool()
+def multi_list() -> str:
+    """List every cart currently mounted in the multi-cart pool."""
+    log.info("multi_list()")
+    mounts = _mc.list_mounts()
+    if not mounts:
+        return "No carts mounted in the multi-cart pool."
+    lines = [f"Multi-cart pool: {len(mounts)} carts, {_mc.total_patterns_mounted()} total patterns"]
+    for m in mounts:
+        role_label = f" [role={m['role']}]" if m["role"] else ""
+        split_label = " (split)" if m["is_split_cart"] else ""
+        lines.append(
+            f"  '{m['cart_id']}'{role_label}: {m['n_patterns']} patterns, "
+            f"{m['embedding_dim']}-dim{split_label}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def multi_mount_directory(dir_path: str, role: str = "", pattern: str = "*.cart") -> str:
+    """Mount every cart file in a directory matching the glob pattern.
+    Used for federated mode — point at a fleet-learning directory and get
+    every machine's cart mounted with the same role.
+
+    Args:
+        dir_path: Directory to scan
+        role: Role to apply to every mounted cart (e.g. 'federated')
+        pattern: Glob pattern (default '*.cart' — also try '*.npz', '*.pkl')
+    """
+    log.info(f"multi_mount_directory({dir_path}, role={role!r}, pattern={pattern!r})")
+    try:
+        results = _mc.mount_directory(dir_path, role=role or None, pattern=pattern)
+        ok = sum(1 for r in results if r.get("status") == "mounted")
+        err = sum(1 for r in results if r.get("status") == "error")
+        lines = [f"mount_directory({dir_path}): {ok} mounted, {err} errors"]
+        for r in results:
+            if r.get("status") == "mounted":
+                lines.append(f"  ✓ {r['cart_id']}: {r['n_patterns']} patterns")
+            else:
+                lines.append(f"  ✗ {r.get('cart_id', '?')}: {r.get('error', 'unknown')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"multi_mount_directory failed: {e}"
+
+
+@mcp.tool()
+def multi_search(query: str, top_k: int = 10, scope: str = "all",
+                 role_filter: str = "", scope_mode: str = "global") -> str:
+    """Search across every mounted cart in the multi-cart pool. Results are
+    ranked and attributed to their source cart.
+
+    Args:
+        query: Natural language search query
+        top_k: Number of top results to return (interpretation depends on scope_mode)
+        scope: 'all' (default), 'local' (first cart only), or a specific cart_id
+        role_filter: Optional role tag to restrict the search to matching carts
+                     (e.g. 'federated' to search only federated-mode carts)
+        scope_mode: How results across carts are ranked. Use this when carts
+                    are very different sizes and you don't want one large cart
+                    to dominate the results. Options:
+                    - 'global' (default): true top-K across all carts. Best
+                      for "what's the single best answer regardless of source?"
+                    - 'per_cart': top-K from EACH cart, no cross-cart re-ranking.
+                      Returns up to K × N_carts results. Best for "show me each
+                      source's best answer for comparison."
+                    - 'balanced': top-K candidates per cart, then globally rerank
+                      to top-K. Guarantees small carts aren't drowned but the
+                      final ranking still reflects global score. Best when
+                      you want fair representation AND global ranking.
+                    - 'diagnostic': top-K from every cart, no merging at all,
+                      fully labeled. Useful for debugging.
+    """
+    if len(query) > MAX_QUERY_LENGTH:
+        return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
+    log.info(f"multi_search('{query[:60]}', top_k={top_k}, scope={scope!r}, role_filter={role_filter!r}, scope_mode={scope_mode!r})")
+
+    try:
+        result = _mc.search(
+            query,
+            top_k=top_k,
+            scope=scope,
+            role_filter=role_filter or None,
+            scope_mode=scope_mode,
+        )
+    except ValueError as e:
+        return f"multi_search error: {e}"
+    except Exception as e:
+        return f"multi_search error: {e}"
+
+    if result.get("error"):
+        return f"multi_search: {result['error']}"
+
+    results = result["results"]
+    if not results:
+        return (
+            f"No relevant matches for '{query}' "
+            f"(searched {result['cart_count']} carts, "
+            f"{result['total_patterns']} patterns, {result['elapsed_ms']}ms, "
+            f"scope_mode={scope_mode})"
+        )
+
+    header = (
+        f"multi_search [scope={scope}, role_filter={role_filter or 'any'}, "
+        f"scope_mode={scope_mode}]: "
+        f"{len(results)} results from {result['cart_count']} carts "
+        f"({result['total_patterns']} patterns, {result['elapsed_ms']}ms)\n"
+    )
+    lines = [header]
+
+    # For per_cart and diagnostic modes, group output by cart_id for readability
+    grouped = result.get("grouped_results")
+    if grouped and scope_mode in ("per_cart", "diagnostic"):
+        for cart_id, cart_results in grouped.items():
+            if not cart_results:
+                continue
+            role_tag = ""
+            if cart_results[0].get("role"):
+                role_tag = f"/{cart_results[0]['role']}"
+            lines.append(f"\n=== {cart_id}{role_tag} ===")
+            for rank, r in enumerate(cart_results, 1):
+                if r["score"] < 0.1:
+                    continue
+                lines.append(f"#{rank} [#{r['local_addr']}] [{r['score']:.3f}] {r['text']}")
+    else:
+        # Global / balanced — flat list with full attribution per result
+        for rank, r in enumerate(results, 1):
+            if r["score"] < 0.1:
+                continue
+            cart_label = f"[{r['cart_id']}"
+            if r.get("role"):
+                cart_label += f"/{r['role']}"
+            cart_label += f"#{r['local_addr']}]"
+            lines.append(f"#{rank} {cart_label} [{r['score']:.3f}] {r['text']}")
+    return "\n\n".join(lines)
+
+
+# =============================================================================
+# FEDERATE — Federated cart mode (drop-in for Dennis's federated learning)
+# =============================================================================
+# Spec: docs/RFC/federated-cart-spec.md
+# Implementation: federate.py (built on multi_cart.py)
+#
+# Use these tools to manage a fleet of machine carts that share a git directory
+# the way Dennis's SAGE fleet shares its JSONL learning data. publish_session()
+# appends to a machine's cart; consolidate() finds cross-machine matches and
+# writes a consolidated cart; load_fleet() mounts the whole fleet for solver use.
+
+import federate as _fed
+
+
+@mcp.tool()
+def federate_publish(session_file: str, machine_id: str, fleet_dir: str) -> str:
+    """Append session learning entries to a machine's federated cart.
+    Drop-in replacement for Dennis Palatov's publish_learning.py.
+
+    Args:
+        session_file: Path to a .jsonl file (one JSON object per line) or a
+            .json file with a 'learning_entries' or 'entries' key.
+        machine_id: Machine identifier (e.g. 'cbp', 'sprout', 'mcnugget')
+        fleet_dir: Root of the fleet-learning directory (parent of machine dirs)
+    """
+    log.info(f"federate_publish({session_file}, {machine_id}, {fleet_dir})")
+    try:
+        result = _fed.publish_session(session_file, machine_id, fleet_dir)
+        return (
+            f"Published to '{machine_id}': added {result['added']}, "
+            f"skipped {result['skipped']} dedup, "
+            f"total {result['total_in_cart']} → {result['cart_path']}"
+        )
+    except Exception as e:
+        return f"federate_publish failed: {e}"
+
+
+@mcp.tool()
+def federate_consolidate(fleet_dir: str, output_dir: str = "",
+                         similarity_threshold: float = 0.85,
+                         mode: str = "preserve") -> str:
+    """Mount every machine cart in fleet_dir, find cross-machine pattern
+    matches, and write a consolidated cart with cross-machine consensus
+    captured as confirming-machine metadata. Drop-in replacement for
+    Dennis's consolidate.py.
+
+    Args:
+        fleet_dir: Root of the fleet-learning directory
+        output_dir: Where to write the consolidated cart (defaults to
+            fleet_dir/../consolidated)
+        similarity_threshold: Patterns with cross-machine cosine+hamming
+            score above this count as CONFIRMED_BY (default 0.85)
+        mode: Consolidation strategy. "preserve" (default, recommended for
+            federated fleets) keeps ALL variants from every machine and
+            stores cross-cart edges as metadata so the solver can weight
+            trust contextually — aligns with the Web4 trust model. "collapse"
+            picks one representative per CONFIRMED_BY component (smaller
+            cart, loses individual machine voices).
+    """
+    log.info(f"federate_consolidate({fleet_dir}, output_dir={output_dir!r}, threshold={similarity_threshold}, mode={mode!r})")
+    try:
+        result = _fed.consolidate(
+            fleet_dir,
+            output_dir=output_dir or None,
+            similarity_threshold=similarity_threshold,
+            mode=mode,
+        )
+        if result.get("error"):
+            return f"federate_consolidate: {result['error']}"
+        return (
+            f"Consolidated {result['n_machines']} machines, "
+            f"{result['total_input_patterns']} input patterns → "
+            f"{result['n_consolidated_patterns']} consolidated "
+            f"({result['n_confirmed_pairs']} confirmed pairs, "
+            f"{result['n_contradicted_pairs']} contradicted pairs, "
+            f"mode={result['mode']}) "
+            f"in {result['elapsed_seconds']}s. "
+            f"Output: {result['output_path']}"
+        )
+    except Exception as e:
+        return f"federate_consolidate failed: {e}"
+
+
+@mcp.tool()
+def federate_migrate_jsonl(jsonl_dir: str, output_dir: str = "",
+                            in_place: bool = False) -> str:
+    """One-time migration from JSONL learning files to brain carts.
+    Walks a directory of fleet-learning/{machine}/*_learning.jsonl files and
+    builds a kb.cart.npz for each machine.
+
+    Args:
+        jsonl_dir: Directory with per-machine subdirs containing JSONL files
+        output_dir: Target directory for the new carts (defaults to jsonl_dir
+            if in_place=True or jsonl_dir if not specified)
+        in_place: Write carts alongside the JSONL files in their original
+            machine directories. Non-destructive — JSONL files are not removed.
+    """
+    log.info(f"federate_migrate_jsonl({jsonl_dir}, output_dir={output_dir!r}, in_place={in_place})")
+    try:
+        result = _fed.migrate_jsonl(
+            jsonl_dir,
+            output_dir=output_dir or None,
+            in_place=in_place,
+        )
+        lines = [
+            f"Migration: {result['carts_built']} carts built from "
+            f"{result['machines_processed']} machine dirs, "
+            f"{result['total_entries']} entries in {result['elapsed_seconds']}s"
+        ]
+        if result["errors"]:
+            lines.append(f"  {len(result['errors'])} errors:")
+            for err in result["errors"][:5]:
+                lines.append(f"    ! {err}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"federate_migrate_jsonl failed: {e}"
+
+
+@mcp.tool()
+def federate_load(fleet_dir: str) -> str:
+    """Mount every machine's federated cart in fleet_dir into the multi-cart
+    pool with role='federated'. Used by solvers at session start to make the
+    fleet's accumulated learning available for cross-machine search via
+    multi_search(scope='all', role_filter='federated').
+
+    Args:
+        fleet_dir: Root of the fleet-learning directory (parent of machine dirs)
+    """
+    log.info(f"federate_load({fleet_dir})")
+    try:
+        result = _fed.load_fleet(fleet_dir)
+        machine_list = ", ".join(result["machines"]) if result["machines"] else "none"
+        out = (
+            f"Loaded fleet from {fleet_dir}: {len(result['mounted'])} machines mounted "
+            f"({machine_list}), {result['total_patterns']} total patterns"
+        )
+        if result["errors"]:
+            out += f"\n  {len(result['errors'])} errors:"
+            for err in result["errors"][:3]:
+                out += f"\n    ! {err.get('machine', '?')}: {err.get('error', '?')}"
+        return out
+    except Exception as e:
+        return f"federate_load failed: {e}"
+
+
+# =============================================================================
+# MEMBOX — Multi-user shared cart with locking + agent attribution
+# =============================================================================
+# Spec: docs/RFC/membox-phase1-implementation.md
+# Implementation: membox.py (built on multi_cart.py)
+#
+# Membox is the third mode of the three-mode framework (single-user / federated
+# / multiuser). Multiple agents safely write to the same cart with per-agent
+# attribution and a write mutex that guarantees serialization without blocking
+# reads. Phase 1 ships locking + tagging only — version chains, dispute
+# detection, and permissions come in Phases 2-4.
+
+import membox as _mb
+
+
+@mcp.tool()
+def membox_mount(cart_path: str, cart_id: str = "", role: str = "",
+                 lease_seconds: int = 30, verify_integrity: bool = True) -> str:
+    """Mount a brain cart in Membox mode (multi-user shared with locking).
+
+    Multiple agents can write to the cart safely via membox_imprint, with
+    each write attributed to the calling agent_id. Reads via membox_search
+    never block on the write lock.
+
+    Args:
+        cart_path: Filesystem path to the cart file (.npz, .pkl, or split format)
+        cart_id: Stable identifier for the mount (defaults to filename)
+        role: Optional semantic tag (e.g. 'team_kb', 'project_notes')
+        lease_seconds: Auto-release timeout if a holder crashes (default 30)
+        verify_integrity: Reject carts with stale manifests (default True)
+    """
+    log.info(f"membox_mount({cart_path}, cart_id={cart_id!r}, role={role!r}, lease={lease_seconds}s)")
+    try:
+        result = _mb.mount(
+            cart_path,
+            cart_id=cart_id or None,
+            role=role or None,
+            lease_seconds=lease_seconds,
+            verify_integrity=verify_integrity,
+        )
+        return (
+            f"Mounted '{result['cart_id']}' in Membox mode "
+            f"(role={result.get('role')}, n_patterns={result['n_patterns']}, "
+            f"lease={result['lease_seconds']}s)"
+        )
+    except Exception as e:
+        return f"membox_mount failed: {e}"
+
+
+@mcp.tool()
+def membox_unmount(cart_id: str) -> str:
+    """Unmount a Membox cart. Releases the lock if held."""
+    log.info(f"membox_unmount({cart_id})")
+    try:
+        result = _mb.unmount(cart_id)
+        return f"Unmounted Membox cart '{cart_id}' (was {result.get('n_patterns', '?')} patterns)"
+    except Exception as e:
+        return f"membox_unmount failed: {e}"
+
+
+@mcp.tool()
+def membox_list() -> str:
+    """List every Membox-mounted cart with current lock state and write stats."""
+    log.info("membox_list()")
+    try:
+        mounts = _mb.list_mounts()
+        if not mounts:
+            return "No carts mounted in Membox mode."
+        lines = [f"Membox pool: {len(mounts)} carts"]
+        for m in mounts:
+            lock = m["lock"]
+            holder = lock.get("holder") or "(idle)"
+            lines.append(
+                f"  '{m['cart_id']}' role={m.get('role')} "
+                f"n_patterns={m['n_patterns']} "
+                f"lock_holder={holder} "
+                f"acquires={lock.get('acquire_count', 0)}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"membox_list failed: {e}"
+
+
+@mcp.tool()
+def membox_imprint(cart_id: str, text: str, agent_id: str,
+                   tags: str = "", reasoning: str = "",
+                   origin: str = "agent", timeout_ms: int = 5000) -> str:
+    """Write a new pattern to a Membox cart with agent_id attribution.
+
+    Acquires the write lock, writes the pattern with full per-agent metadata
+    (agent_id, written_at, origin, tags, reasoning), releases the lock.
+    Returns the new local_addr or an error if the lock can't be acquired
+    within timeout_ms.
+
+    Args:
+        cart_id: Membox-mounted cart to write to
+        text: Pattern text content (the thing to embed and store)
+        agent_id: Who's writing — REQUIRED, no anonymous writes in Membox
+        tags: Optional comma-separated tags
+        reasoning: Optional explanation of WHY this is being written (audit trail)
+        origin: 'agent' (default) | 'human' | 'system'
+        timeout_ms: How long to wait for the write lock (default 5000)
+    """
+    log.info(f"membox_imprint(cart_id={cart_id}, agent={agent_id}, text_len={len(text)})")
+    try:
+        result = _mb.imprint(
+            cart_id, text=text, agent_id=agent_id,
+            tags=tags, reasoning=reasoning, origin=origin,
+            timeout_ms=timeout_ms,
+        )
+    except ValueError as e:
+        return f"membox_imprint error: {e}"
+    except Exception as e:
+        return f"membox_imprint failed: {e}"
+
+    if not result.get("ok"):
+        if result.get("error") == "lock_timeout":
+            return (
+                f"Lock timeout — cart '{cart_id}' is currently held by "
+                f"{result.get('current_holder')!r}. Try again or increase timeout_ms."
+            )
+        return f"membox_imprint failed: {result.get('error')}"
+
+    return (
+        f"Imprinted to '{cart_id}' as agent {agent_id!r} "
+        f"at local_addr={result['local_addr']} (written_at={result['written_at']})"
+    )
+
+
+@mcp.tool()
+def membox_search(cart_id: str, query: str, top_k: int = 10,
+                  agent_id: str = "") -> str:
+    """Search a Membox cart. Never blocks on the write lock — reads always
+    succeed even while another agent is writing.
+
+    Returns ranked results with per-pattern Membox metadata visible
+    (agent_id, written_at, origin, reasoning, tags) so the consumer can
+    see who wrote what.
+
+    Args:
+        cart_id: Membox-mounted cart to search
+        query: Natural language query
+        top_k: Max results to return (default 10)
+        agent_id: Optional — who's reading (for audit logging in Phase 4)
+    """
+    if len(query) > MAX_QUERY_LENGTH:
+        return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
+    log.info(f"membox_search(cart_id={cart_id}, query={query[:60]!r})")
+
+    try:
+        result = _mb.search(cart_id, query, top_k=top_k, agent_id=agent_id or None)
+    except ValueError as e:
+        return f"membox_search error: {e}"
+    except Exception as e:
+        return f"membox_search failed: {e}"
+
+    results = result.get("results", [])
+    if not results:
+        return f"No results for '{query}' in '{cart_id}' ({result.get('elapsed_ms', '?')}ms)"
+
+    lines = [f"membox_search '{cart_id}': {len(results)} results in {result.get('elapsed_ms', '?')}ms\n"]
+    for rank, r in enumerate(results, 1):
+        if r.get("score", 0) < 0.1:
+            continue
+        membox_meta = r.get("membox_meta") or {}
+        attrib = ""
+        if isinstance(membox_meta, dict) and membox_meta.get("agent_id"):
+            written = membox_meta.get("written_at", "")
+            attrib = f"  [agent={membox_meta['agent_id']} @ {written[:19]}]"
+        lines.append(f"#{rank} [#{r['local_addr']}] [{r['score']:.3f}]{attrib} {r['text'][:300]}")
+    return "\n\n".join(lines)
+
+
+@mcp.tool()
+def membox_acquire_lock(cart_id: str, agent_id: str, timeout_ms: int = 5000) -> str:
+    """Manually acquire the write lock on a Membox cart. Most callers should
+    use membox_imprint instead, which handles acquire+write+release atomically.
+
+    Use this directly only when you need to do multiple writes in sequence
+    without releasing the lock between them.
+
+    Args:
+        cart_id: Membox-mounted cart
+        agent_id: Who's acquiring (required)
+        timeout_ms: How long to wait if the lock is held (default 5000)
+    """
+    log.info(f"membox_acquire_lock(cart_id={cart_id}, agent={agent_id})")
+    try:
+        ok = _mb.acquire_lock(cart_id, agent_id, timeout_ms=timeout_ms)
+    except ValueError as e:
+        return f"membox_acquire_lock error: {e}"
+    if ok:
+        return f"Lock acquired on '{cart_id}' by agent {agent_id!r}"
+    holder = _mb.lock_holder(cart_id)
+    return f"Lock timeout — '{cart_id}' is held by {holder!r}, try again or increase timeout_ms"
+
+
+@mcp.tool()
+def membox_release_lock(cart_id: str, agent_id: str) -> str:
+    """Release the write lock on a Membox cart. Only the current holder may release.
+
+    Args:
+        cart_id: Membox-mounted cart
+        agent_id: The agent currently holding the lock
+    """
+    log.info(f"membox_release_lock(cart_id={cart_id}, agent={agent_id})")
+    try:
+        _mb.release_lock(cart_id, agent_id)
+        return f"Lock released on '{cart_id}' by agent {agent_id!r}"
+    except (ValueError, PermissionError, RuntimeError) as e:
+        return f"membox_release_lock error: {e}"
+
+
+@mcp.tool()
+def membox_lock_holder(cart_id: str) -> str:
+    """Return the agent_id currently holding the write lock, or '(idle)'."""
+    log.info(f"membox_lock_holder(cart_id={cart_id})")
+    try:
+        holder = _mb.lock_holder(cart_id)
+    except ValueError as e:
+        return f"membox_lock_holder error: {e}"
+    if holder is None:
+        return f"'{cart_id}': lock is idle"
+    return f"'{cart_id}': lock held by agent {holder!r}"
+
+
+@mcp.tool()
+def membox_status(cart_id: str) -> str:
+    """Return Membox status for a cart: lock state, write counts per agent,
+    pattern count, recent write log.
+    """
+    log.info(f"membox_status(cart_id={cart_id})")
+    try:
+        s = _mb.status(cart_id)
+    except ValueError as e:
+        return f"membox_status error: {e}"
+    lines = [
+        f"Membox status for '{cart_id}':",
+        f"  Patterns: {s['n_patterns']}",
+        f"  Lock holder: {s['lock'].get('holder') or '(idle)'}",
+        f"  Lock acquires: {s['lock'].get('acquire_count', 0)}",
+        f"  Lock waits: {s['lock'].get('wait_count', 0)}",
+        f"  Writes by agent:",
+    ]
+    for agent, count in sorted(s["writes_by_agent"].items()):
+        lines.append(f"    {agent}: {count}")
+    if s.get("recent_writes"):
+        lines.append(f"  Recent writes (last {len(s['recent_writes'])}):")
+        for w in s["recent_writes"]:
+            lines.append(
+                f"    [{w['written_at'][:19]}] {w['agent_id']} → addr={w['local_addr']}: "
+                f"{w['text_preview'][:80]}"
+            )
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def get_status(session_id: str = "") -> str:
     """Get server status: mounted cartridge, memory count, GPU availability.
