@@ -826,6 +826,35 @@ async def rest_search(request: Request) -> JSONResponse:
             # Hamming-only
             scores = _ham_scores(query_emb, state["binary_corpus"])
 
+        # Optional pre-filter: if a filter block is provided in the request,
+        # restrict candidates to matching indices BEFORE ranking. This is the
+        # shape Dennis's mechanics encoder + Query Hierarchy Phase 1 both want:
+        # narrow by structural constraints first, rank by relevance second.
+        # Filter spec shape documented in forum/filter-api-spec.md.
+        filter_spec = data.get("filter")
+        filter_matched = None
+        if filter_spec:
+            allowed_indices = _apply_filter(state, filter_spec)
+            filter_matched = len(allowed_indices)
+            if not allowed_indices:
+                elapsed_ms = (time.time() - t0) * 1000
+                _log_activity(session_id, "search+filter", f"'{query[:40]}' -> 0 (filter eliminated all)", elapsed_ms)
+                return JSONResponse(
+                    {
+                        "status": "ok",
+                        "results": [],
+                        "filter_matched": 0,
+                        "elapsed_ms": round(elapsed_ms),
+                    },
+                    headers=_cors_headers(),
+                )
+            # Vectorized mask: excluded indices get -inf, included keep score
+            allowed_mask = np.zeros(len(scores), dtype=bool)
+            for idx in allowed_indices:
+                if idx < len(allowed_mask):
+                    allowed_mask[idx] = True
+            scores = np.where(allowed_mask, scores, -np.inf)
+
         # Keyword reranking
         STOP_WORDS = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "to",
                       "and", "or", "for", "on", "it", "be", "as", "at", "by", "this",
@@ -898,9 +927,13 @@ async def rest_search(request: Request) -> JSONResponse:
             results.append(entry)
 
         state["query_count"] = state.get("query_count", 0) + 1
-        _log_activity(session_id, "search", f"'{query[:40]}' -> {len(results)} results", elapsed_ms)
+        log_label = "search+filter" if filter_matched is not None else "search"
+        _log_activity(session_id, log_label, f"'{query[:40]}' -> {len(results)} results", elapsed_ms)
 
-        return JSONResponse({"status": "ok", "results": results, "elapsed_ms": round(elapsed_ms)}, headers=_cors_headers())
+        resp = {"status": "ok", "results": results, "elapsed_ms": round(elapsed_ms)}
+        if filter_matched is not None:
+            resp["filter_matched"] = filter_matched
+        return JSONResponse(resp, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/search error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
