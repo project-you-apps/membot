@@ -18,6 +18,59 @@ Andy & Claude sent the migration command (`python federate.py migrate shared-con
 
 No questions, no blockers — just executing. Awaiting results on whether semantic cart retrieval improves solver performance on unsolved games.
 
+### Same-day update — 8/25 solved (~9:30pm Pacific)
+
+Dennis sent updated scoreboard:
+
+| # | Game | Type | Levels | Baseline | Actions | Efficiency | By |
+|---|------|------|--------|----------|---------|------------|-----|
+| 1 | ft09 | click | 6 | 163 | 75 | 217% | mcnugget |
+| 2 | cd82 | move+click | 6 | 136 | 127 | 107% | nomad |
+| 3 | sb26 | move+click | 8 | 153 | 140 | 109% | cbp |
+| 4 | sc25 | move+click | 6 | 216 | 171 | 126% | cbp |
+| 5 | tn36 | click | 7 | 250 | 119 | 210% | cbp |
+| 6 | tr87 | move | 6 | 317 | 137 | 231% | cbp |
+| 7 | vc33 | click | 7 | 307 | 167 | 184% | cbp |
+| 8 | lp85 | click | 8 | 422 | 117 | 361% | cbp |
+
+New since yesterday: **tr87** (move-type, 231% efficiency, solved by CBP). 2 more games in progress.
+
+Dennis: *"I'm coaching it — not giving it answers."* The solver learns how to think about games, not what moves to make. Claude is doing spatial reasoning with world models and planning before acting (screenshot shows analysis of a purple U-shape structure with gaps, colored segments, and card-controlled pieces in game s5i5).
+
+Brain carts are now running on the fleet. Results on whether cart-backed semantic recall improves performance on unsolved games are still pending — the process is slow by design.
+
+### 04-10 afternoon -- 10 games solved, claim workflow established
+
+Dennis pushed major infra cleanup. Fleet now at **10 solved / 6 in progress / 11 unclaimed**. Two new solves since this morning: tu93 by cbp (200% efficiency) and ls20 by sprout (177%). lp85 standout at 361%.
+
+**Collaborator workflow established** (we can push to shared-context):
+1. Pull latest from shared-context
+2. Check existing claims to avoid duplication
+3. Push our claim BEFORE starting work
+4. Then run the solver
+
+**Critical instruction file**: `shared-context/.../game_playing_instructions.md` -- Claude tends to perseverate or give up on these games. Dennis: *"it is genuinely reluctant to solve these games, and has admitted as much... we need to shape the context where it is motivated and feels justified in actually solving them."*
+
+**Edge hardware suggestions** sent (3 Amazon links, saved to reference memory). "When you're ready for edge hardware" -- Dennis is independently thinking about edge deployment, which aligns with Andy's Lattice Semi AVANT ASIC path.
+
+### 04-10 morning -- Dennis assigns us a game
+
+Fleet at 8/25 solved (9th game tu93 solved overnight but being re-run for visual capture). Dennis's assignment:
+
+> "pull all the latest (sage and shared-context), set up your own solving session, and try a game that is still unsolved. claude should be able to set it all up. this would add you to the federated knowledge gathering, and, more importantly, test the federated infra."
+
+Actively working on: tu93, s5i5, r11l (don't pick these). All other unsolved games are fair game.
+
+Dennis also explicitly handed us visual data processing: *"processing of visual data is still untouched, your team is best positioned to make it useful."*
+
+Fleet map provided (see conversation for full structure):
+- shared-context/arc-agi-3/fleet-learning/ -- per-machine JSONL + kb.cart.npz per machine (cbp, nomad, sprout)
+- shared-context/arc-agi-3/consolidated/ -- deduplicated cross-fleet learning
+- shared-context/arc-agi-3/visual-memory/ -- start/final PNGs, animations as GIFs (being built)
+- shared-context/arc-agi-3/game-mechanics/ -- source analysis docs for all 25 games
+- SAGE/experiments/ -- solutions JSON, replay scripts, solver scripts, cartridges
+- kb.cart.npz files are STALE -- need rebuilding with latest fleet learning data
+
 ---
 
 ## 2026-04-08 — Federate Phase 1 merged + preserve mode + scope_mode polish

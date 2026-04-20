@@ -76,6 +76,37 @@ def read_file(path: str) -> str:
         d = docx.Document(path)
         return "\n".join(p.text for p in d.paragraphs)
 
+    elif ext == ".json":
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        # Expect list of objects with 'text' or 'content' field
+        if isinstance(data, list):
+            passages = []
+            for item in data:
+                if isinstance(item, dict):
+                    text = item.get("text") or item.get("content", "")
+                    if text:
+                        passages.append(str(text))
+                elif isinstance(item, str):
+                    passages.append(item)
+            return "\n\n---PASSAGE_BREAK---\n\n".join(passages)
+        return str(data)
+
+    elif ext == ".jsonl":
+        passages = []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    text = obj.get("text") or obj.get("content", str(obj))
+                    passages.append(str(text))
+                except json.JSONDecodeError:
+                    passages.append(line)  # treat as plain text
+        return "\n\n---PASSAGE_BREAK---\n\n".join(passages)
+
     else:
         print(f"  Skipping unsupported file: {path}")
         return ""
@@ -86,7 +117,7 @@ def read_folder(folder: str, recursive: bool = False) -> list[tuple[str, str]]:
 
     Returns list of (filename, text) tuples.
     """
-    supported = {".txt", ".md", ".pdf", ".docx"}
+    supported = {".txt", ".md", ".pdf", ".docx", ".json", ".jsonl"}
     results = []
 
     if recursive:
@@ -113,11 +144,20 @@ def read_folder(folder: str, recursive: bool = False) -> list[tuple[str, str]]:
 def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]:
     """Split text into overlapping word-based chunks.
 
+    If the text contains ---PASSAGE_BREAK--- sentinels (from JSON/JSONL
+    ingestion), split on those instead of by word count. This preserves
+    pre-chunked passages from structured data sources.
+
     Args:
         text: Input text
         chunk_size: Target words per chunk
         overlap: Words of overlap between chunks
     """
+    # Pre-chunked input from JSON/JSONL — respect passage boundaries
+    if "---PASSAGE_BREAK---" in text:
+        passages = [p.strip() for p in text.split("---PASSAGE_BREAK---")]
+        return [p for p in passages if p]
+
     words = text.split()
     if len(words) <= chunk_size:
         return [text.strip()]
@@ -294,17 +334,32 @@ def embed_texts(texts: list[str], batch_size: int = 32,
                                   show_progress_bar=True, convert_to_numpy=True)
         return embeddings.astype(np.float32)
 
-    # Large corpus: process in macro-batches with cooldown pauses
-    all_embeddings = []
+    # Large corpus: process in macro-batches with cooldown pauses.
+    # CHUNK-FLUSH: write each batch to a temp file and clear RAM to prevent
+    # the deceleration bug (163/sec → 6/sec from growing numpy arrays).
+    import tempfile, glob
+
     n = len(prefixed)
     t0 = time.time()
+    flush_dir = tempfile.mkdtemp(prefix="cartridge_embed_")
+    shard_paths = []
 
     for start in range(0, n, cooldown_every):
         end = min(start + cooldown_every, n)
         batch = prefixed[start:end]
         embs = model.encode(batch, batch_size=batch_size,
                             show_progress_bar=False, convert_to_numpy=True)
-        all_embeddings.append(embs)
+
+        # Flush to disk immediately — don't accumulate in RAM
+        shard_path = os.path.join(flush_dir, f"shard_{start:08d}.npy")
+        np.save(shard_path, embs.astype(np.float32))
+        shard_paths.append(shard_path)
+        del embs  # free CPU memory
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # force PyTorch to release GPU memory blocks
+        import gc
+        gc.collect()  # force garbage collection
 
         elapsed = time.time() - t0
         rate = end / elapsed if elapsed > 0 else 0
@@ -316,7 +371,17 @@ def embed_texts(texts: list[str], batch_size: int = 32,
             print(f"  Cooling down {cooldown_secs}s...")
             time.sleep(cooldown_secs)
 
-    return np.vstack(all_embeddings).astype(np.float32)
+    # Reassemble from shards
+    print(f"  Reassembling {len(shard_paths)} shards ...")
+    all_embeddings = [np.load(p) for p in shard_paths]
+    result = np.vstack(all_embeddings).astype(np.float32)
+
+    # Cleanup temp files
+    for p in shard_paths:
+        os.remove(p)
+    os.rmdir(flush_dir)
+
+    return result
 
 
 # ============================================================
@@ -507,6 +572,7 @@ Examples:
     parser.add_argument("--chunk-size", type=int, default=300, help="Words per chunk for long documents (default: 300)")
     parser.add_argument("--overlap", type=int, default=50, help="Word overlap between chunks (default: 50)")
     parser.add_argument("--no-chunk", action="store_true", help="Don't chunk — one entry per file")
+    parser.add_argument("--no-prefix", action="store_true", help="Don't prepend filename to passages (cleaner embeddings for conversational data)")
     parser.add_argument("--recursive", action="store_true", help="Recurse into subdirectories")
     parser.add_argument("--train", action="store_true", help="Train lattice + capture signatures (requires GPU)")
     parser.add_argument("--train-frames", type=int, default=5, help="Training settle frames (default: 5)")
@@ -548,12 +614,17 @@ Examples:
     doc_map = []  # (filename, chunk_index, total_chunks) per entry
     for filename, text in docs:
         if args.no_chunk:
-            entries.append(f"{filename}\n{text}")
+            if args.no_prefix:
+                entries.append(text)
+            else:
+                entries.append(f"{filename}\n{text}")
             doc_map.append((filename, 0, 1))
         else:
             chunks = chunk_text(text, chunk_size=args.chunk_size, overlap=args.overlap)
             for i, chunk in enumerate(chunks):
-                if len(chunks) > 1:
+                if args.no_prefix:
+                    entries.append(chunk)
+                elif len(chunks) > 1:
                     entries.append(f"{filename} (part {i+1}/{len(chunks)})\n{chunk}")
                 else:
                     entries.append(f"{filename}\n{chunk}")
