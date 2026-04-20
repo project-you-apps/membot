@@ -578,6 +578,65 @@ def load_npz_cartridge(path: str) -> dict:
         log.info(f"[HIPPO] No hippocampus key in NPZ. Keys present: {list(data.keys())}")
         result["hippocampus"] = None
 
+    # Load per-pattern structured metadata (federate-v1+ format; used by
+    # fleet-learning carts where each pattern carries a JSON dict of
+    # game/machine/event/confidence/support_count/beat_dummy_pp/etc.).
+    # Parsed eagerly so the filter API can query fields without re-parsing.
+    #
+    # Storage variants seen in the wild:
+    #   - 1-d object array of dicts (federate-v1 CBP/Nomad/etc.)
+    #   - 0-d object array wrapping a Python list of dicts
+    #   - 0-d object array wrapping a JSON-encoded STRING (heartbeat cart)
+    #   - 0-d object array wrapping None (meta field reserved but empty)
+    # Also tolerate each element being either a dict or a JSON string.
+    if "per_pattern_meta" in data:
+        raw_meta = data["per_pattern_meta"]
+        # Unwrap 0-d scalar
+        if hasattr(raw_meta, "ndim") and raw_meta.ndim == 0:
+            raw_meta = raw_meta.item()
+        # Decode JSON-string-encoded lists
+        if isinstance(raw_meta, (str, bytes)):
+            try:
+                raw_meta = json.loads(raw_meta)
+            except Exception as e:
+                log.warning(f"[META] per_pattern_meta is a string but not valid JSON: {e}")
+                raw_meta = None
+        if raw_meta is None:
+            result["per_pattern_meta"] = None
+        elif isinstance(raw_meta, dict):
+            # Single dict for the whole cart — unusual but tolerate by broadcasting
+            log.info(f"[META] per_pattern_meta is a single dict; not broadcasting (treating as absent)")
+            result["per_pattern_meta"] = None
+        else:
+            try:
+                iterable_meta = list(raw_meta)
+            except TypeError:
+                log.warning(f"[META] per_pattern_meta not iterable after unwrap: type={type(raw_meta).__name__}")
+                result["per_pattern_meta"] = None
+                return result
+            parsed = []
+            for entry in iterable_meta:
+                if isinstance(entry, dict):
+                    parsed.append(entry)
+                elif isinstance(entry, (str, bytes)):
+                    try:
+                        obj = json.loads(entry)
+                        parsed.append(obj if isinstance(obj, dict) else {})
+                    except Exception:
+                        parsed.append({})
+                else:
+                    parsed.append({})
+            result["per_pattern_meta"] = parsed
+            # Find first non-empty dict for log sample
+            sample_keys = []
+            for p in parsed:
+                if p:
+                    sample_keys = list(p.keys())
+                    break
+            log.info(f"[META] Loaded per_pattern_meta: {len(parsed)} entries, sample keys={sample_keys}")
+    else:
+        result["per_pattern_meta"] = None
+
     return result
 
 
@@ -844,6 +903,207 @@ async def rest_search(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "results": results, "elapsed_ms": round(elapsed_ms)}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/search error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+# ---------------------------------------------------------------------------
+# Filter API (shipped 2026-04-19 for Dennis's Phase 4 sprint + general use)
+# ---------------------------------------------------------------------------
+# Returns indices + text + tags + meta for patterns matching a filter spec.
+# Filter spec supports:
+#   tags_all: ["ns:val", ...]  AND semantics across tags
+#   tags_any: ["ns:val", ...]  OR semantics within a namespace
+#   meta:     {field: value}   exact-match predicates on per_pattern_meta fields
+#   quality:  {predicate: N}   support_count_min / beat_dummy_pp_min /
+#                              uplift_over_weights_only_min — read from
+#                              per_pattern_meta fields of matching name
+#   limit:    int              max results (default 500, cap 10000)
+#
+# See forum/canonical-tags.md for the tag namespace vocabulary.
+
+def _extract_tags_from_text(text: str) -> list[str]:
+    """Extract canonical + free-form tags from a passage's bracketed prefix.
+
+    Supports both 'memory_store'-style `[tag1,tag2] content` and federate-v1
+    `[machine/player game L0 event @timestamp]` headers (the latter becomes
+    a single tag we then split on whitespace/slash for canonical matches).
+    """
+    if not text or not text.startswith("["):
+        return []
+    end = text.find("]")
+    if end < 0 or end > 200:  # defensive: real tag blocks are short
+        return []
+    raw = text[1:end]
+    pieces = [p.strip() for p in raw.replace("/", " ").replace(",", " ").split()]
+    return [p for p in pieces if p]
+
+
+def _match_tag(tag_entry: str, filter_tag: str) -> bool:
+    """Match a single filter tag against a single entry tag.
+
+    Handles namespace:value canonical form (colon-separated) plus plain
+    free-form tags. Case-sensitive on both sides (canonical values are
+    lowercase by convention).
+    """
+    # Exact match
+    if tag_entry == filter_tag:
+        return True
+    # Namespace prefix match: filter "game:" matches entry "game:ft09"
+    if filter_tag.endswith(":") and tag_entry.startswith(filter_tag):
+        return True
+    return False
+
+
+def _apply_filter(state: dict, spec: dict) -> list[int]:
+    """Apply a filter spec to the mounted cart, return matching indices.
+
+    Missing state or empty cart returns [].
+    """
+    if not state or not state.get("texts"):
+        return []
+
+    texts = state["texts"]
+    meta_list = state.get("per_pattern_meta") or [{}] * len(texts)
+    n = len(texts)
+
+    tags_all = spec.get("tags_all") or []
+    tags_any = spec.get("tags_any") or []
+    meta_filter = spec.get("meta") or {}
+    quality = spec.get("quality") or {}
+
+    out = []
+    for i in range(n):
+        text = texts[i] if i < len(texts) else ""
+        meta = meta_list[i] if i < len(meta_list) else {}
+
+        # tags_all: every filter tag must match some entry tag
+        if tags_all:
+            entry_tags = _extract_tags_from_text(text)
+            # Also expose meta fields as pseudo-tags (game:ft09 from meta.game=ft09)
+            for k, v in meta.items():
+                if isinstance(v, (str, int)) and v != "":
+                    entry_tags.append(f"{k}:{v}")
+            ok = all(any(_match_tag(et, ft) for et in entry_tags) for ft in tags_all)
+            if not ok:
+                continue
+
+        # tags_any: at least one filter tag must match some entry tag
+        if tags_any:
+            entry_tags = _extract_tags_from_text(text)
+            for k, v in meta.items():
+                if isinstance(v, (str, int)) and v != "":
+                    entry_tags.append(f"{k}:{v}")
+            ok = any(any(_match_tag(et, ft) for et in entry_tags) for ft in tags_any)
+            if not ok:
+                continue
+
+        # meta exact-match predicates
+        if meta_filter:
+            ok = True
+            for field, expected in meta_filter.items():
+                if meta.get(field) != expected:
+                    ok = False
+                    break
+            if not ok:
+                continue
+
+        # quality predicates (router PRD names; absent field = pass, not fail,
+        # so carts that don't yet track these don't get zero-filtered)
+        if quality:
+            ok = True
+            sc_min = quality.get("support_count_min")
+            if sc_min is not None and meta.get("support_count") is not None:
+                if meta.get("support_count", 0) < sc_min:
+                    ok = False
+            bd_min = quality.get("beat_dummy_pp_min")
+            if ok and bd_min is not None and meta.get("beat_dummy_pp") is not None:
+                if meta.get("beat_dummy_pp", 0.0) < bd_min:
+                    ok = False
+            uw_min = quality.get("uplift_over_weights_only_min")
+            if ok and uw_min is not None and meta.get("uplift_over_weights_only") is not None:
+                if meta.get("uplift_over_weights_only", 0.0) < uw_min:
+                    ok = False
+            if not ok:
+                continue
+
+        out.append(i)
+
+    return out
+
+
+@mcp.custom_route("/api/filter", methods=["POST", "OPTIONS"])
+async def rest_filter(request: Request) -> JSONResponse:
+    """Filter cart entries by tags, metadata predicates, and/or quality gates.
+
+    Returns matching entries (index + text + tags + meta) with no similarity
+    ranking. Complement to /api/search: search ranks by relevance, filter
+    enumerates by structural match.
+
+    Request body:
+        {
+          "tags_all": ["game:ft09", "machine:cbp"],  // AND within tags_all
+          "tags_any": ["game:ft09", "game:lf52"],     // OR within tags_any
+          "meta":    {"event": "level_solved"},       // exact-match on meta fields
+          "quality": {"support_count_min": 5, "beat_dummy_pp_min": 10.0},
+          "limit":    500,
+          "session_id": ""
+        }
+
+    Response:
+        {"status": "ok", "count": N, "results": [{index, text, tags, meta}, ...]}
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        data = await request.json()
+        _log_rest(request, "FILTER", f"spec={list(data.keys())}")
+        session_id = _resolve_session_id(data.get("session_id", ""))
+        state = _get_session(session_id)
+
+        if state["cartridge_name"] is None:
+            return JSONResponse(
+                {"status": "ok", "count": 0, "results": [], "error": "No cartridge mounted"},
+                headers=_cors_headers(),
+            )
+
+        t0 = time.time()
+        indices = _apply_filter(state, data)
+
+        # Respect limit (default 500, cap 10000)
+        limit = min(int(data.get("limit", 500)), 10000)
+        indices = indices[:limit]
+
+        # Build response entries
+        texts = state["texts"]
+        meta_list = state.get("per_pattern_meta") or [{}] * len(texts)
+        out = []
+        for i in indices:
+            text = texts[i] if i < len(texts) else ""
+            tags = _extract_tags_from_text(text)
+            meta = meta_list[i] if i < len(meta_list) else {}
+            out.append({
+                "index": int(i),
+                "text": text if len(text) <= 1200 else text[:1200] + "...",
+                "full_text": text,
+                "tags": tags,
+                "meta": meta,
+            })
+
+        elapsed_ms = (time.time() - t0) * 1000
+        _log_activity(session_id, "filter", f"spec -> {len(out)} results", elapsed_ms)
+
+        return JSONResponse(
+            {
+                "status": "ok",
+                "count": len(out),
+                "total_scanned": len(texts),
+                "results": out,
+                "elapsed_ms": round(elapsed_ms),
+            },
+            headers=_cors_headers(),
+        )
+    except Exception as e:
+        log.error(f"REST /api/filter error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
 
 
@@ -1136,7 +1396,7 @@ async def depot_dashboard(request: Request) -> HTMLResponse:
     return HTMLResponse(_DEPOT_HTML)
 
 
-_DEPOT_HTML = """\
+_DEPOT_HTML = r"""\
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1936,6 +2196,7 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
         state["cartridge_path"] = cart["path"]
         state["signatures"] = None
         state["hippocampus"] = data.get("hippocampus")
+        state["per_pattern_meta"] = data.get("per_pattern_meta")
         state["modified"] = False
 
         # Sign-zero binary corpus for Hamming search
