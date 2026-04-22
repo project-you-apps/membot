@@ -873,12 +873,18 @@ async def rest_search(request: Request) -> JSONResponse:
         now_ts = time.time()
         hippo_meta = state.get("hippocampus_meta")  # list of parsed header dicts
         has_recency = RECENCY_HALF_LIFE > 0 and hippo_meta is not None
+        hippo = state.get("hippocampus")  # per-pattern structured meta: pattern_id, prev, next, flags
 
         boosted = []
         for i in candidate_idx:
             base_score = float(scores[i])
             if base_score < 0.05:
                 continue
+            # Skip tombstoned patterns (hippocampus flags bit 0x01 = TOMBSTONE)
+            if hippo and i < len(hippo):
+                flags = hippo[i].get("flags", 0) or 0
+                if flags & 0x01:
+                    continue
             text_lower = state["texts"][i].lower()
             hits = sum(1 for kw in keywords if kw in text_lower)
             boost = min(hits * 0.03, 0.12)
@@ -893,6 +899,29 @@ async def rest_search(request: Request) -> JSONResponse:
             boosted.append((i, final))
 
         boosted.sort(key=lambda x: x[1], reverse=True)
+
+        # Dedupe chunks that share a parent exchange. Long exchanges are chunked into
+        # multiple patterns at cart-build time; each chunk is indexed independently
+        # and all can match a query. Without dedup, top-k fills up with sibling chunks
+        # of a single source exchange and wastes slots. Strategy: parse the tag prefix
+        # for (url, turn); keep the highest-scoring chunk per source. Patterns without
+        # a parseable prefix fall through (no dedup key = can't collide).
+        seen_chunks = set()
+        deduped = []
+        dup_count = 0
+        for i, score in boosted:
+            text = state["texts"][i] if i < len(state["texts"]) else ""
+            key = _chunk_dedup_key(text)
+            if key is not None:
+                if key in seen_chunks:
+                    dup_count += 1
+                    continue
+                seen_chunks.add(key)
+            deduped.append((i, score))
+        if dup_count:
+            log.info(f"[search] dedup removed {dup_count} sibling chunks")
+        boosted = deduped
+
         elapsed_ms = (time.time() - t0) * 1000
 
         # Build structured results
@@ -901,9 +930,13 @@ async def rest_search(request: Request) -> JSONResponse:
             if final_score < 0.1:
                 continue
             text = state["texts"][i]
-            # Extract tags if text starts with [TAGS] prefix
+            # Extract tags if text starts with [TAGS] prefix.
+            # Limit bumped 80 -> 300 because Heartbeat tag prefixes include full URLs
+            # (e.g. [HEARTBEAT,CLAUDE,turn-119,url=claude.ai/chat/648d5988-...]) which
+            # routinely run ~99-150 chars; the old 80-char ceiling silently dropped
+            # the extraction for any URL-bearing cart.
             tags = ""
-            if text.startswith("[") and "]" in text[:80]:
+            if text.startswith("[") and "]" in text[:300]:
                 tag_end = text.index("]")
                 tags = text[1:tag_end]
                 text = text[tag_end + 1:].strip()
@@ -911,8 +944,7 @@ async def rest_search(request: Request) -> JSONResponse:
             if len(text) > 500:
                 text = text[:500] + "..."
             entry = {"text": text, "full_text": full_text, "score": round(final_score, 4), "tags": tags, "index": int(i)}
-            # Include hippocampus nav if available
-            hippo = state.get("hippocampus")
+            # Include hippocampus nav if available (hippo was hoisted earlier for tombstone check)
             if hippo and i < len(hippo):
                 meta = hippo[i]
                 log.info(f"[HIPPO-SEARCH] idx={i} pattern_id={meta['pattern_id']} prev_raw={meta['prev']} next_raw={meta['next']}")
@@ -987,6 +1019,60 @@ def _match_tag(tag_entry: str, filter_tag: str) -> bool:
     return False
 
 
+def _chunk_dedup_key(text: str):
+    """Extract (url, turn) from a tag-prefix for chunk-dedup.
+
+    Long exchanges split into multiple patterns at cart-build, all sharing the
+    same (url, turn) but differing by chunk index. Returning that composite key
+    lets the search result path dedupe siblings.
+
+    Handles two Heartbeat tag-prefix formats (mixed carts contain both):
+      v24-comma: [HEARTBEAT,CLAUDE,turn-119,url=claude.ai/chat/abc]
+      v25-pipe:  [Claude | Turn 119 | 2026-03-09T22:08:21.046Z | claude.ai/chat/abc]
+
+    Returns None if no prefix or the required tokens are absent (falls through
+    to no-dedup — safer than a false-positive collision).
+    """
+    if not text or not text.startswith("[") or "]" not in text[:300]:
+        return None
+    prefix = text[1:text.index("]")]
+    turn = None
+    url = None
+
+    # v24 comma format — extract turn-N and url=X tokens
+    if "," in prefix:
+        for tok in (t.strip() for t in prefix.split(",")):
+            if tok.startswith("turn-") and turn is None:
+                turn = tok
+            elif tok.startswith("url=") and url is None:
+                url = tok[4:]
+
+    # v25 pipe format — fallback if v24 parse didn't yield both
+    if (turn is None or url is None) and "|" in prefix:
+        tokens = [t.strip() for t in prefix.split("|")]
+        for tok in tokens:
+            # Match "Turn 119" (case-insensitive, whitespace-tolerant)
+            if turn is None:
+                low = tok.lower()
+                if low.startswith("turn "):
+                    parts = tok.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        turn = f"turn-{parts[1]}"
+        # URL token: trailing token that looks like a domain path
+        if url is None and tokens and "/" in tokens[-1] and "." in tokens[-1]:
+            url = tokens[-1]
+
+    if turn and url:
+        return (url, turn)
+    return None
+
+
+# Known filter-spec keys; anything else at top level is logged as a warning
+# so bad client shapes (e.g. `{"tags": {"any": [...]}}` — nested style) don't
+# silently no-op. Doesn't reject — filter still runs on recognized keys only.
+_FILTER_SPEC_KNOWN_KEYS = {"tags_all", "tags_any", "meta", "quality", "limit", "session_id"}
+
+
 def _apply_filter(state: dict, spec: dict) -> list[int]:
     """Apply a filter spec to the mounted cart, return matching indices.
 
@@ -994,6 +1080,17 @@ def _apply_filter(state: dict, spec: dict) -> list[int]:
     """
     if not state or not state.get("texts"):
         return []
+
+    # Warn on unknown top-level keys (likely a client mis-shape, e.g. nested
+    # `{"tags": {"any": [...]}}` when spec requires flat `{"tags_any": [...]}`).
+    if isinstance(spec, dict):
+        unknown = [k for k in spec.keys() if k not in _FILTER_SPEC_KNOWN_KEYS]
+        if unknown:
+            log.warning(
+                f"[filter] unknown spec keys ignored: {unknown}. "
+                f"Valid: {sorted(_FILTER_SPEC_KNOWN_KEYS)}. "
+                f"See shared-context/forum/filter-api-spec.md for flat shape."
+            )
 
     texts = state["texts"]
     meta_list = state.get("per_pattern_meta") or [{}] * len(texts)
