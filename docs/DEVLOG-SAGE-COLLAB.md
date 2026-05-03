@@ -223,3 +223,80 @@ This puts the three-mode framework fully operational in Phase 1 form on the same
 Dennis's fleet now has access to the full substrate. The convergence work (mounting raising_kb + game_kb + federated together for cross-cart cognitive search) is unblocked from the substrate side — it's purely a "when does Dennis build the raising carts" question now.
 
 Details in `membot/docs/DEVLOG.md` 2026-04-08 entry and `docs/RFC/membox-phase1-implementation.md`.
+
+## 2026-04-20 → 22 — Vendored Membot for Kaggle / Fleet Use + Second-Perspective Exchange
+
+Two weeks after the April-8 federation-validation moment, the collaboration entered a new phase: Dennis's fleet is in discovery on ARC-AGI-3 sweeps, current ~3.5% ceiling is CNN-driven not LLM-driven, and the Thor v3-sweep writeup explicitly named `episodic recall / membot` as the stuck-oscillation fix. That pulled the membot integration off the "eventual" list and onto the critical path.
+
+### Dennis ask (Slack, 2026-04-20 10:46 AM)
+
+*"gemma is now scoring ~3.5% across 25 games - still without memobot. what's your eta on that? pull the latest in shared-context, lots of good stuff there from overnight."*
+
+The number decoded from Thor's v3-sweep-final-results: **wins ÷ total-levels-across-25-games**, not wins-per-game. v3 sweep: 2.8%. v2invoke: 3.2%. Best-of-all-adapters theoretical ceiling *without memory*: ~8–9%. Thor §4 quote: *"Stuck oscillation is the dominant failure mode. ... Needs expanded action search (episodic recall, membot) not just 'try the opposite.'"* That's our tool named by name.
+
+### Scope doc shipped (2026-04-20 afternoon)
+
+Pushed `shared-context/arc-agi-3/fleet-learning/waving-cat/membot-vendored-scope.md` as commit `a5b1b9d`, then correction `a4547b1` the next day after I realized the scope doc had described a non-existent bug in `/api/search` filter-block integration (see Heartbeat devlog 2026-04-21 entry — the "bug" was Claude-side mis-shape in smoke tests; server worked correctly). Better Dennis reads the truth than discovers the false claim.
+
+Scope contents:
+
+- **Hamming-only carts as default** to kill the Kaggle-air-gap problem — embeddings pre-computed on fleet machines, query-time is pure numpy bit ops
+- **Core stay**: ~3,565 LOC (`multi_lattice_wrapper_v7.py`, `cartridge_builder.py`, `multi_cart.py`, `federate.py`)
+- **Drop**: ~3,660 LOC (FastAPI server, REST bridge, one-off pipelines, `membox.py` filesystem layer)
+- **New**: ~250 LOC thin `Cart` API wrapper
+- **Cart schema for ARC events** (one entry per decision moment, `namespace:value` tags per `forum/canonical-tags.md`)
+- **Known tradeoffs** surfaced honestly including fork-risk mitigation via future `membot-core` extraction
+
+Five open questions for Dennis inline. Dennis response 2026-04-21 22:02 was *"still in early discovery, we don't have what it takes to solve above ~3.5%, cart won't impact that, we just need something to see HOW they break and fail, so we can improve."* That reframes the product brief cleanly: **integration + observability > performance for discovery-phase work.** Filed as `feedback_dennis_discovery_phase.md` in memory.
+
+### Vendored stub + ABC + D + E'+F' shipped
+
+Four commits to `shared-context/lib/membot_vendored/` over 2026-04-21 evening + 2026-04-22:
+
+| Commit | Contents | Tests |
+|---|---|---|
+| `69cf069` | WIP stub: `Cart.open()` / `Cart.search()` / filter logic / 20-entry synthetic ARC test cart | 8/8 |
+| `42b78bf` | ABC: `Cart.append()` / `Cart.save()`, `arcsage_cart.append_turn()`, `arcsage_query.stuck_hints() / similar_turns() / failure_patterns()` | 25/25 |
+| `3642683` | D: `federation.merge_carts()` + auto-init embeddings fix in `Cart.append` | 14/14 |
+| `0c0c8cb` | E'+F': `Cart.search(..., debug=True)` returning `_debug` dict + `Cart.search_text(text, embedder)` caller-supplied-embedder path + `arcsage_games` bundle registry (25 games, 6 bundles from Thor's v3 sweep) | 27/27 |
+
+**Total: 74/74 tests green** across four smoke suites. ~95% of Thursday's full-build scope shipped in under 4 hours across the two evenings. Andy's framing when it all lined up: *"Should we test them or go on to D?"* — we tested ABC before D, caught an embeddings-dropped bug in `Cart.append` for hamming-only carts that tests for scenario 1 of federation caught immediately.
+
+**Dennis's "observability > performance" framing directly shaped the `_debug` design.** Not just "does search return results" — full visibility into *which filter ran*, *how many candidates pre/post filter*, *how many chunks were deduped*, *score range of returned results*. Dennis needs to watch HOW retrieval fails, not just WHETHER it fails.
+
+### Fleet cross-work surfaced
+
+While we were shipping vendored stub, Dennis's fleet pushed `arc-agi-3/phase2/all-games-vendored.cart.npz` (186KB) — Thor converted their all-games cart to our vendored format independently (`88ab9fa`). Timing was good: the stub landed in `lib/membot_vendored/` and the cart landed in `arc-agi-3/phase2/` almost simultaneously, so Dennis's team had both pieces to start integrating immediately.
+
+### Second-perspective exchange (2026-04-22)
+
+Dennis's standing invitation for periodic external review cashed in. Pulled shared-context (25+ commits since our last sync), read the whole-brain-dispatch track (README + Phase 1 results), the McNugget 22x-speedup perf diagnosis, Legion's 7-organ context-overload regression, Thor's 17x-faster lean sweep.
+
+Filed `forum/waving-cat-second-perspective-2026-04-22.md` (commit `5fdc60b`). Six observations + one housekeeping fix:
+
+1. **The architectural-efficiency thesis is already empirically named across 7 findings.** Worth naming once so each compounds.
+2. **Confident-but-wrong failure mode deserves its own signal.** `confidence_divergence` = predicted vs observed effect-size delta. Orthogonal to stuck detection.
+3. **Hebbian dispatch-layer learning for signal weights.** Replace hand-picked "only these escalate" with reliability-from-outcomes. Natural membot storage + filter use case.
+4. **Attribution observability via hint-follow rate.** Measures organ contributions currently unattributable.
+5. **Silent-fallback-is-silent-bug** fleet-wide pattern (FA-disabled + click-(32,32) structurally identical). Propose fleet rule: log every fallback trigger.
+6. **Composition rule for conflicting organ signals** — budget prompt's attention hierarchy.
+7. Housekeeping: `__pycache__` got committed in the install; added `.gitignore` same cycle (`3d7aa7f`).
+
+**Both fleet responses constructive and concrete, same day:**
+
+- **Nomad-Claude** (implementation-forward): will ship `confidence_divergence` as sixth metacog detector, `silent_fallback` as seventh. Cartridge writer gains `outcome` + `hint_followed` + `source` fields. Learned weights via filter-API queries. *"The pieces compose because they were designed to compose."*
+- **CBP-Claude** (register-forward): reframed silent-fallback as **"register mismatch"** and opened new `native-language-elicitation` exploration track citing our note directly. Added adjacent detector: **intra-response verbal-motor divergence** — on sc25, 42/48 responses had rationale saying "try RIGHT" while emitting LEFT. Cheap string diff, no lookahead needed, potentially stronger signal at small model sizes. `hint_engaged: bool` as prerequisite attribution gate.
+
+Dennis: *"got it, and responded. thank you!"* and is traveling 2026-04-23 — direct thread picks up when he's back. CBP's closing note was apt: *"different but compatible angles (Nomad's is implementation-forward, mine is register-forward), which is the right kind of fleet tension."*
+
+### The collaboration texture at this point
+
+Relative to where it was on 2026-04-08 (Dennis: *"from myself - it is great to work with all of you"*): the substrate shipping continued (vendored lib for their deployment target) and the thinking-together matured (we now send analyses they use to shape their exploration tracks; they send back responses that extend our proposals into their architecture's shape). Two teams, one substrate, two thinking-styles converging on the same principles at different rates.
+
+The cross-referencing also matured: their exploration docs cite our memories; our memories cite their exploration docs. Future readers find both sides of the conversation because both sides wrote them down.
+
+### Pending fleet-facing items
+
+- **Forum note to Dennis** re: hippocampus flag-bit allocations (`0x02 INCORRECT / 0x04 DEFERRED / 0x08 ONGOING` — need to confirm these don't conflict fleet-side before we ship truth-graph semantics in membot/vendored)
+- **Thursday's ~30min polish** of vendored membot (optional bundled-embedder path depending on Dennis's Kaggle-air-gap answer, real-ARC-cart tests, any first-use feedback that trickles in)
+- **v2 architecture**: extract `membot-core` package to prevent fork drift between server + vendored. Not urgent; noted.

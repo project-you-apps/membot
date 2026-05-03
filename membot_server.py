@@ -1947,6 +1947,8 @@ _APP_HTML = """\
   .brand-text h1 { font-size:22px; font-weight:700; color:var(--text-bright); letter-spacing:-0.5px; }
   .brand-text h1 span { color:var(--accent); }
   .brand-text p { font-size:12px; color:var(--text-dim); margin-top:-2px; }
+  .intro { font-size:13px; color:var(--text-dim); line-height:1.5; margin:-8px 0 18px; max-width:680px; }
+  .intro strong { color:var(--text); font-weight:600; }
   .theme-toggle { background:var(--surface); border:1px solid var(--border); color:var(--text-dim); width:36px; height:36px; border-radius:8px; cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center; transition:all 0.2s; flex-shrink:0; margin-left:auto; }
   .theme-toggle:hover { border-color:var(--border-hover); color:var(--text); }
   [data-theme="light"] .result-card, [data-theme="light"] .cart-chip { box-shadow:0 1px 3px rgba(0,0,0,0.08); }
@@ -2037,6 +2039,7 @@ _APP_HTML = """\
       <span id="statusText">Connecting...</span>
     </div>
   </div>
+  <p class="intro"><strong>Self-contained semantic search without the LLM.</strong> Click a cart to mount it, then search with plain English &mdash; no generation, no hallucinations.</p>
   <div class="cart-bar" id="cartBar"><div class="cart-chip"><div class="name" style="color:var(--text-dim)">Loading...</div></div></div>
   <div class="search-box">
     <span class="search-icon">&#x1F50D;</span>
@@ -2166,11 +2169,12 @@ async function doSearch(){
     }
     _lastResults=items||[];
     console.log('[HIPPO] Search results:', JSON.stringify(items?.map(r=>({idx:r.index,prev:r.prev_idx,next:r.next_idx}))));
+    const haystack=_memories?' of '+_memories.toLocaleString():'';
     if(!items||items.length===0){
       el.innerHTML='<div class="empty-state"><div class="icon">&#x1F914;</div><p>No results found</p></div>';
-      meta.textContent='0 results in '+elapsed+'ms'; return;
+      meta.textContent='0 results'+haystack+' in '+elapsed+'ms'; return;
     }
-    meta.textContent=items.length+' results in '+elapsed+'ms';
+    meta.textContent=items.length+haystack+' results in '+elapsed+'ms';
     el.innerHTML=items.map((item,i)=>{
       const text=esc(item.text||item.content||'');
       const score=item.score!=null?item.score.toFixed(4):'';

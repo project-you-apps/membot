@@ -81,6 +81,16 @@
   .brand-text h1 span { color: var(--accent); }
   .brand-text p { font-size: 12px; color: var(--text-dim); margin-top: -2px; }
 
+  /* ---- Intro tagline ---- */
+  .intro {
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin: -8px 0 18px;
+    max-width: 680px;
+  }
+  .intro strong { color: var(--text); font-weight: 600; }
+
   /* ---- Theme toggle ---- */
   .theme-toggle {
     background: var(--surface);
@@ -405,6 +415,12 @@
     </div>
   </div>
 
+  <!-- Intro -->
+  <p class="intro">
+    <strong>Self-contained semantic search without the LLM.</strong>
+    Click a cart to mount it, then search with plain English &mdash; no generation, no hallucinations.
+  </p>
+
   <!-- Cartridge Bar -->
   <div class="cart-bar" id="cartBar">
     <div class="cart-chip" onclick="listCarts()">
@@ -613,6 +629,8 @@ async function doSearch() {
     }
     _lastResults = items || [];
 
+    const haystack = _memories ? ` of ${_memories.toLocaleString()}` : '';
+
     if (!items || items.length === 0) {
       el.innerHTML = `
         <div class="empty-state">
@@ -620,11 +638,11 @@ async function doSearch() {
           <p>No results found</p>
           <div class="hint">Try a different query or broader terms</div>
         </div>`;
-      meta.textContent = `0 results in ${elapsed}ms`;
+      meta.textContent = `0 results${haystack} in ${elapsed}ms`;
       return;
     }
 
-    meta.textContent = `${items.length} results in ${elapsed}ms`;
+    meta.textContent = `${items.length}${haystack} results in ${elapsed}ms`;
 
     el.innerHTML = items.map((item, i) => {
       const text = esc(item.text || item.content || '');
