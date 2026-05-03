@@ -952,17 +952,17 @@ async def rest_search(request: Request) -> JSONResponse:
         elapsed_ms = (time.time() - t0) * 1000
 
         # Build structured results.
-        # For split carts, fetch full passages from SQLite for the top-K indices so
-        # full_text is the actual document body (~1500 chars for arxiv abstracts) and
-        # the modal can show real content. Tags are still extracted from the in-RAM
-        # snippet (which carries the [TAGS] prefix when a cart uses one). Card-display
-        # text is soft-truncated to a sentence boundary for clean visual.
-        # int() cast is load-bearing: sqlite3 binds numpy.int64 silently as no-match,
-        # so passing the raw numpy ints from boosted[] returns zero rows.
-        top_indices_for_sqlite = [int(i) for i, _ in boosted[:top_k]]
-        sqlite_full = {}
-        if state.get("is_split_cart") and state.get("sqlite_conn"):
-            sqlite_full = _sqlite_fetch_passages(state["sqlite_conn"], top_indices_for_sqlite)
+        # IMPORTANT: search returns the in-cart preview ONLY. The split-cart source
+        # database is consulted on user demand via /api/passage, not here — keeps the
+        # cart/source-DB distinction visible in the UX (every DB hit = a labeled user
+        # action) and keeps search fast (no per-result SQLite query). The client gets
+        # source_db so it knows the cart is split and can render the "load source"
+        # CTA on the modal.
+        is_split = bool(state.get("is_split_cart") and state.get("sqlite_conn"))
+        source_db_label = (
+            os.path.basename(state["sqlite_db_path"])
+            if is_split and state.get("sqlite_db_path") else None
+        )
 
         results = []
         for i, final_score in boosted[:top_k]:
@@ -972,24 +972,18 @@ async def rest_search(request: Request) -> JSONResponse:
             # Extract tags if text starts with [TAGS] prefix (limit 300 chars for
             # URL-bearing tag prefixes used by Heartbeat).
             tags = ""
-            ram_body = ram_text
-            if ram_body.startswith("[") and "]" in ram_body[:300]:
-                tag_end = ram_body.index("]")
-                tags = ram_body[1:tag_end]
-                ram_body = ram_body[tag_end + 1:].strip()
+            body = ram_text
+            if body.startswith("[") and "]" in body[:300]:
+                tag_end = body.index("]")
+                tags = body[1:tag_end]
+                body = body[tag_end + 1:].strip()
 
-            # full_text: SQLite full passage when available (split carts), else RAM body
-            sqlite_row = sqlite_full.get(i)
-            full_text = (sqlite_row.get("passage") if sqlite_row else None) or ram_body
-
-            text = _soft_truncate(full_text)
-            entry = {"text": text, "full_text": full_text, "score": round(final_score, 4), "tags": tags, "index": int(i)}
-            # Provenance hints for split carts (rendered as small footer in client).
-            if sqlite_row:
-                if sqlite_row.get("paper_id"):
-                    entry["paper_id"] = sqlite_row["paper_id"]
-                if state.get("sqlite_db_path"):
-                    entry["source_db"] = os.path.basename(state["sqlite_db_path"])
+            text = _soft_truncate(body)
+            entry = {"text": text, "full_text": body, "score": round(final_score, 4), "tags": tags, "index": int(i)}
+            # Provenance hint for split carts: client uses presence of source_db to
+            # decide whether to render the "load source" CTA on the modal.
+            if source_db_label:
+                entry["source_db"] = source_db_label
             # Include hippocampus nav if available (hippo was hoisted earlier for tombstone check)
             if hippo and i < len(hippo):
                 meta = hippo[i]
@@ -1410,7 +1404,26 @@ async def rest_passage(request: Request) -> JSONResponse:
         if idx < 0 or idx >= len(texts):
             return JSONResponse({"status": "error", "error": f"Index {idx} out of range"}, headers=_cors_headers())
 
-        entry = {"index": idx, "full_text": texts[idx]}
+        # For split carts, fetch full passage from the SQLite source database.
+        # This is the user-driven "load source" path: only hit on click, never as
+        # a side effect of search. Falls back to in-cart preview when SQLite is
+        # unavailable or the row isn't there.
+        full_text = texts[idx]
+        paper_id = None
+        source_db = None
+        if state.get("is_split_cart") and state.get("sqlite_conn"):
+            sqlite_row = _sqlite_fetch_passages(state["sqlite_conn"], [int(idx)]).get(int(idx))
+            if sqlite_row:
+                full_text = sqlite_row.get("passage") or full_text
+                paper_id = sqlite_row.get("paper_id")
+            if state.get("sqlite_db_path"):
+                source_db = os.path.basename(state["sqlite_db_path"])
+
+        entry = {"index": idx, "full_text": full_text}
+        if paper_id:
+            entry["paper_id"] = paper_id
+        if source_db:
+            entry["source_db"] = source_db
 
         hippo = state.get("hippocampus")
         if hippo and idx < len(hippo):
@@ -2021,6 +2034,11 @@ _APP_HTML = """\
   .result-text a, .passage-text a { color:var(--accent); text-decoration:none; border-bottom:1px dotted var(--accent); }
   .result-text a:hover, .passage-text a:hover { border-bottom-style:solid; }
   .passage-modal-source { padding:8px 20px; border-top:1px solid var(--border); font-size:11px; color:var(--text-dim); font-family:var(--mono); flex-shrink:0; }
+  .passage-modal-cta { padding:12px 20px; border-top:1px solid var(--border); text-align:center; flex-shrink:0; }
+  .modal-cta-btn { background:var(--accent); color:white; border:none; padding:10px 18px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600; font-family:var(--sans); transition:background 0.2s; }
+  .modal-cta-btn:hover { background:var(--accent-dim); }
+  .modal-cta-btn:disabled { opacity:0.6; cursor:wait; }
+  .modal-cta-loading { font-size:12px; color:var(--text-dim); font-style:italic; }
   .result-card { cursor:pointer; }
   .passage-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:900; display:flex; align-items:center; justify-content:center; opacity:0; transition:opacity 0.2s; pointer-events:none; }
   .passage-overlay.open { opacity:1; pointer-events:auto; }
@@ -2097,6 +2115,7 @@ _APP_HTML = """\
         <button class="modal-close" onclick="closePassage()" title="Close">&#x2715;</button>
       </div>
       <div class="passage-modal-body"><div class="passage-text" id="modalText"></div></div>
+      <div class="passage-modal-cta" id="modalCta" style="display:none"></div>
       <div class="passage-modal-source" id="modalSource" style="display:none"></div>
       <div class="passage-modal-footer">
         <button class="passage-nav-btn" id="btnPrev" title="Previous chunk (when metadata wired)">&#x25C0; Prev</button>
@@ -2240,13 +2259,25 @@ function _showPassage(p){
   $('#modalRank').textContent=p.rank?'#'+p.rank:'idx:'+p.index;
   $('#modalScore').textContent=p.score!=null?'score: '+p.score.toFixed(4):'';
   $('#modalText').innerHTML=highlight(linkify(esc(p.full_text)),_lastQuery);
-  const src=$('#modalSource');
+  // Provenance state machine: split-cart preview (source_db, no paper_id) shows the
+  // load CTA; loaded state (paper_id present) shows the source line; non-split shows
+  // neither.
+  const isSplit=!!p.source_db;
+  const isLoaded=!!p.paper_id;
+  const cta=$('#modalCta'),src=$('#modalSource');
+  if(cta){
+    if(isSplit&&!isLoaded){
+      cta.innerHTML='<button class="modal-cta-btn" onclick="loadSource()">&#x1F4C2; Load full document from '+esc(p.source_db)+' &rarr;</button>';
+      cta.style.display='block';
+    } else { cta.style.display='none'; cta.innerHTML=''; }
+  }
   if(src){
-    const bits=[];
-    if(p.source_db)bits.push('source: '+p.source_db);
-    if(p.paper_id)bits.push('id: '+p.paper_id);
-    src.textContent=bits.join(' · ');
-    src.style.display=bits.length?'block':'none';
+    if(isLoaded){
+      const bits=['source: '+p.source_db];
+      if(p.paper_id)bits.push('id: '+p.paper_id);
+      src.textContent=bits.join(' · ');
+      src.style.display='block';
+    } else { src.style.display='none'; }
   }
   const btnP=$('#btnPrev'),btnN=$('#btnNext');
   if(p.prev_idx!=null){btnP.className='passage-nav-btn enabled';btnP.onclick=()=>navigatePassage(p.prev_idx);}
@@ -2256,13 +2287,28 @@ function _showPassage(p){
   $('#passageOverlay').classList.add('open');
   document.addEventListener('keydown',_passageKeys);
 }
+async function loadSource(){
+  if(!_currentPassage)return;
+  const cta=$('#modalCta'),idx=_currentPassage.index;
+  if(cta)cta.innerHTML='<span class="modal-cta-loading">Loading from source database&hellip;</span>';
+  try{
+    const r=await fetch(BASE()+'/api/passage?idx='+idx);
+    const data=await r.json();
+    if(data.error){toast(data.error,'error');return;}
+    const p=data.passage;
+    _showPassage({index:p.index,full_text:p.full_text,prev_idx:p.prev_idx,next_idx:p.next_idx,score:_currentPassage.score,rank:_currentPassage.rank,source_db:p.source_db,paper_id:p.paper_id});
+  }catch(e){
+    toast('Source load failed: '+e.message,'error');
+    if(cta)cta.innerHTML='<button class="modal-cta-btn" onclick="loadSource()">Retry</button>';
+  }
+}
 async function navigatePassage(idx){
   try{
     const r=await fetch(BASE()+'/api/passage?idx='+idx);
     const data=await r.json();
     if(data.error){toast(data.error,'error');return;}
     const p=data.passage;
-    _showPassage({index:p.index,full_text:p.full_text,prev_idx:p.prev_idx,next_idx:p.next_idx,score:null,rank:null});
+    _showPassage({index:p.index,full_text:p.full_text,prev_idx:p.prev_idx,next_idx:p.next_idx,score:null,rank:null,source_db:p.source_db,paper_id:p.paper_id});
   }catch(e){toast('Navigation failed: '+e.message,'error');}
 }
 function closePassage(){

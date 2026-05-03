@@ -280,6 +280,21 @@
     font-size: 11px; color: var(--text-dim); font-family: var(--mono);
     flex-shrink: 0;
   }
+  .passage-modal-cta {
+    padding: 12px 20px; border-top: 1px solid var(--border);
+    text-align: center; flex-shrink: 0;
+  }
+  .modal-cta-btn {
+    background: var(--accent); color: white; border: none;
+    padding: 10px 18px; border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-weight: 600; font-family: var(--sans);
+    transition: background 0.2s;
+  }
+  .modal-cta-btn:hover { background: var(--accent-dim); }
+  .modal-cta-btn:disabled { opacity: 0.6; cursor: wait; }
+  .modal-cta-loading {
+    font-size: 12px; color: var(--text-dim); font-style: italic;
+  }
   .result-card { cursor: pointer; }
   .passage-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:900; display:flex; align-items:center; justify-content:center; opacity:0; transition:opacity 0.2s; pointer-events:none; }
   .passage-overlay.open { opacity:1; pointer-events:auto; }
@@ -474,7 +489,8 @@
         <button class="modal-close" onclick="closePassage()" title="Close">&#x2715;</button>
       </div>
       <div class="passage-modal-body"><div class="passage-text" id="modalText"></div></div>
-      <div class="passage-modal-source" id="modalSource"></div>
+      <div class="passage-modal-cta" id="modalCta" style="display:none"></div>
+      <div class="passage-modal-source" id="modalSource" style="display:none"></div>
       <div class="passage-modal-footer">
         <button class="passage-nav-btn" id="btnPrev" title="Previous chunk (when metadata wired)">&#x25C0; Prev</button>
         <button class="passage-nav-btn" id="btnNext" title="Next chunk (when metadata wired)">Next &#x25B6;</button>
@@ -716,14 +732,31 @@ function _showPassage(p) {
   $('#modalScore').textContent = p.score != null ? 'score: ' + p.score.toFixed(4) : '';
   $('#modalText').innerHTML = highlight(linkify(esc(p.full_text)), _lastQuery);
 
-  // Provenance source line under modal body
+  // State machine: split-cart preview (source_db, no paper_id) shows the load CTA;
+  // loaded state (paper_id present) shows the source line. Non-split carts (no
+  // source_db) show neither — modal body is the entire content.
+  const isSplit = !!p.source_db;
+  const isLoaded = !!p.paper_id;
+  const cta = $('#modalCta');
   const src = $('#modalSource');
+  if (cta) {
+    if (isSplit && !isLoaded) {
+      cta.innerHTML = '<button class="modal-cta-btn" onclick="loadSource()">&#x1F4C2; Load full document from ' + esc(p.source_db) + ' &rarr;</button>';
+      cta.style.display = 'block';
+    } else {
+      cta.style.display = 'none';
+      cta.innerHTML = '';
+    }
+  }
   if (src) {
-    const bits = [];
-    if (p.source_db) bits.push('source: ' + p.source_db);
-    if (p.paper_id)  bits.push('id: ' + p.paper_id);
-    src.textContent = bits.join(' · ');
-    src.style.display = bits.length ? 'block' : 'none';
+    if (isLoaded) {
+      const bits = ['source: ' + p.source_db];
+      if (p.paper_id) bits.push('id: ' + p.paper_id);
+      src.textContent = bits.join(' · ');
+      src.style.display = 'block';
+    } else {
+      src.style.display = 'none';
+    }
   }
 
   // Wire PREV/NEXT buttons
@@ -747,6 +780,32 @@ function _showPassage(p) {
   document.addEventListener('keydown', _passageKeys);
 }
 
+async function loadSource() {
+  if (!_currentPassage) return;
+  const cta = $('#modalCta');
+  const idx = _currentPassage.index;
+  if (cta) cta.innerHTML = '<span class="modal-cta-loading">Loading from source database&hellip;</span>';
+  try {
+    const r = await fetch(BASE() + '/api/passage?idx=' + idx);
+    const data = await r.json();
+    if (data.error) { toast(data.error, 'error'); return; }
+    const p = data.passage;
+    _showPassage({
+      index: p.index,
+      full_text: p.full_text,
+      prev_idx: p.prev_idx,
+      next_idx: p.next_idx,
+      score: _currentPassage.score,
+      rank: _currentPassage.rank,
+      source_db: p.source_db,
+      paper_id: p.paper_id,
+    });
+  } catch(e) {
+    toast('Source load failed: ' + e.message, 'error');
+    if (cta) cta.innerHTML = '<button class="modal-cta-btn" onclick="loadSource()">Retry</button>';
+  }
+}
+
 async function navigatePassage(idx) {
   try {
     const r = await fetch(BASE() + '/api/passage?idx=' + idx);
@@ -760,6 +819,8 @@ async function navigatePassage(idx) {
       next_idx: p.next_idx,
       score: null,
       rank: null,
+      source_db: p.source_db,
+      paper_id: p.paper_id,
     });
   } catch(e) {
     toast('Navigation failed: ' + e.message, 'error');
