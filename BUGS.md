@@ -11,6 +11,16 @@ Open bugs listed first. Add new entries at the top of "Open"; move to "Closed" w
 
 ## Open
 
+### C · Cart-mounting UX: highlight should move immediately + disable search during mount
+**Reported:** 2026-05-03 (Andy, post-provenance-shipping)
+**Affects:** all carts, demo polish.
+**Symptom:** When the user clicks a cart chip to mount it, the active highlight stays on the *previously* mounted cart until the mount completes. The search input remains enabled during mount, allowing queries against an in-flight state.
+**Desired behavior:**
+1. On click: immediately move the highlight to the clicked cart chip (and remove from prior). Optimistic UI.
+2. Disable the search input + Search button while mount is in progress.
+3. Re-enable on mount-complete (success or fail). On fail, revert highlight.
+**Fix scope:** purely client-side in `mountCart()` in both `_APP_HTML` (membot_server.py) and `membot_app.html`. Toggle a `.mounting` class, set `disabled` on the input + button, restore in the success/error branches. Existing `.cart-chip.mounting` opacity rule already exists; just need to wire the highlight + input disable.
+
 ### B-high · Gutenberg-classics chunking: PREV/NEXT passages discontinuous, possible tail truncation
 **Reported:** 2026-05-03 (Andy, during membot demo polish session)
 **Cart:** `gutenberg-classics.cart.npz`

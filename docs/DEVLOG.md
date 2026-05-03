@@ -1,5 +1,40 @@
 # Membot Devlog
 
+## 2026-05-03 — Provenance feature shipped on the public arxiv demo (RAG+)
+
+A morning-into-afternoon polish session on the public Membot demo at https://www.project-you.app/membot/app turned into a substantial product upgrade. Headline result: Membot now demonstrates **three-tier transparent provenance** as a first-class feature. Pitch line: *"Vector Plus is RAG+."*
+
+### What landed (in deploy order)
+
+1. **Demo header tagline + intro** — "Self-contained semantic search without the LLM. Click a cart to mount it, then search with plain English — no generation, no hallucinations." Plus haystack-size reframe in the result-meta strip ("8 of 2,400,000 results in 1497ms"). Commit `6e2c0ce`, drop-max-width follow-up `9f9a3b1`.
+2. **Hamming-popcount recovery** — discovered during the deploy that the chunked-popcount + lookup-table optimization was hot-patched on the droplet on 2026-05-02 and never committed back. Pulled it from the droplet backup, spliced into local, committed cleanly. Commit `63053c5`. New rule filed (see Discipline below).
+3. **Provenance wiring v1** — REST `/api/search` taught to fetch full passages from the SQLite sidecar via `_sqlite_fetch_passages` for split carts; new `_soft_truncate` helper for sentence-boundary card text. Returns `paper_id` + `source_db` per result. Commit `775020e`.
+4. **`numpy.int64` SQLite binding fix** — sqlite3 silently no-matches on `np.int64` indices. `[int(i) for i, _ in boosted[:top_k]]` cast at both REST and MCP search sites. The provenance wiring landed but returned empty until this fix. Commit `c543e08`.
+5. **Source-DB label fix** — `state.get("cartridge","")` was returning empty (real key is `cartridge_name`); now uses `os.path.basename(state["sqlite_db_path"])` so the label is the actual filename (e.g. `arxiv_2400k_text.db`). Commit `caa69f9`.
+6. **Two-step UX pivot** — Andy's reframe mid-session: rather than auto-fetch the source DB on search (hides the cart vs DB distinction), make every DB consultation a **labeled user click**. `/api/search` now returns the in-cart preview only + a `source_db` hint; `/api/passage` does the SQLite fetch on demand and returns the full passage + `paper_id`. Modal opens instantly with the preview, shows a CTA `📂 Load full passage from <db> →`, click → swap to full content + source line at bottom. Self-documenting architecture. Commit `279cc45`.
+7. **Copy fix + BUGS.md** — CTA reads "Load full **passage**" (was "document") to generalize across cart types. New `BUGS.md` in repo root with severity classes (A/B/C) and the first two open bugs filed (Gutenberg PREV/NEXT discontinuity, cart-mounting UX feedback). Commit `44adc8a`.
+
+### Architectural reframe (the real win)
+
+The split-cart pattern (NPZ index in RAM + SQLite on disk + external publisher URL) was originally a RAM-pressure workaround for the 2 GB droplet. Andy reframed it mid-session as a positioning win: **three honest tiers of provenance, all visible, all clickable.** Most vector-RAG demos show a chunk with no source visible — the demo now shows the chunk, the labeled DB it came from, the paper ID, and the publisher URL. The two-step UX pivot makes it self-documenting: every DB hit is a user action, not a hidden side effect.
+
+CC filed: `memory/concept-clusters/CC_provenance-as-feature_2026-05.md`. This is the version that goes in the next pitch deck.
+
+### Discipline rule filed
+
+Hot-patching the droplet without committing back to the local repo was the root cause of the Hamming regression scare. New feedback memory: `feedback_no_droplet_hot_patches.md`. Edit local → test → commit → push → scp → restart. If `git diff` doesn't show it, it doesn't exist. Andy: *"I need to get more tidy about this so we don't waste work in the future!"*
+
+### Known issues (filed in BUGS.md)
+
+- **B-high** — Gutenberg-classics PREV/NEXT chunks read as discontinuous, suspect cart-build chunker truncates tail of each chunk.
+- **C** — Cart-mounting UX: highlight should move on click (not on mount-complete), search input should disable during mount.
+
+### Pipeline metric for the day
+
+Seven membot commits, all deployed, all verified. The discipline pipeline (edit local → test → commit → push → scp → restart) ran cleanly on every push after the first hot-patch-recovery confusion. The follow-up "drop max-width" round took ~90 seconds end-to-end, validating that the discipline isn't slow once you're in the rhythm.
+
+---
+
 ## 2026-04-08 (afternoon) — Membox Phase 1 SHIPPED — All Three Modes Live
 
 The third mode of the three-mode framework is now operational. Membot is the first **neuromorphic database** with single-user, federated multi-machine, AND multiuser-shared modes all running on the same substrate.
