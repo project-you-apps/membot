@@ -988,7 +988,8 @@ async def rest_search(request: Request) -> JSONResponse:
             if sqlite_row:
                 if sqlite_row.get("paper_id"):
                     entry["paper_id"] = sqlite_row["paper_id"]
-                entry["source_db"] = state.get("cartridge", "") + "_text.db"
+                if state.get("sqlite_db_path"):
+                    entry["source_db"] = os.path.basename(state["sqlite_db_path"])
             # Include hippocampus nav if available (hippo was hoisted earlier for tombstone check)
             if hippo and i < len(hippo):
                 meta = hippo[i]
@@ -2421,10 +2422,12 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
                 try: state["sqlite_conn"].close()
                 except: pass
             state["sqlite_conn"] = sqlite3.connect(data["sqlite_db_path"])
+            state["sqlite_db_path"] = data["sqlite_db_path"]
             state["is_split_cart"] = True
             log.info(f"Split cart: SQLite connection opened to {data['sqlite_db_path']}")
         else:
             state["sqlite_conn"] = None
+            state["sqlite_db_path"] = None
             state["is_split_cart"] = data.get("is_split_cart", False)
 
         n = len(texts)
