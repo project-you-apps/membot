@@ -790,18 +790,29 @@ async def rest_search(request: Request) -> JSONResponse:
         # Embed query
         query_emb = embed_text(query, prefix="search_query")
 
-        # Helper: Hamming scores (handles packed and unpacked)
+        # Helper: Hamming scores (handles packed and unpacked).
+        # Uses popcount lookup + chunked XOR. Avoids both the 1.7 GB unpackbits
+        # 768-expansion AND the 220 MB full-matrix XOR allocation.
+        _POPCOUNT_TABLE_LOCAL = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
         def _ham_scores(q_emb, corpus_bin):
             is_packed = corpus_bin.shape[1] <= 96
+            n = len(corpus_bin)
+            n_bits = 768 if is_packed else corpus_bin.shape[1]
+            dist = np.empty(n, dtype=np.uint32)
+            BATCH = 100_000
             if is_packed:
                 q_packed = np.packbits((q_emb > 0).astype(np.uint8))
-                xor = np.bitwise_xor(q_packed, corpus_bin)
-                dist = np.unpackbits(xor, axis=1).sum(axis=1)
-                return 1.0 - dist.astype(np.float32) / 768
+                for start in range(0, n, BATCH):
+                    end = min(start + BATCH, n)
+                    xor = np.bitwise_xor(q_packed, corpus_bin[start:end])
+                    dist[start:end] = _POPCOUNT_TABLE_LOCAL[xor].sum(axis=1)
             else:
                 q_bin = (q_emb > 0).astype(np.uint8)
-                xor = np.bitwise_xor(q_bin, corpus_bin)
-                return 1.0 - xor.sum(axis=1).astype(np.float32) / corpus_bin.shape[1]
+                for start in range(0, n, BATCH):
+                    end = min(start + BATCH, n)
+                    xor = np.bitwise_xor(q_bin, corpus_bin[start:end])
+                    dist[start:end] = xor.sum(axis=1)
+            return 1.0 - dist.astype(np.float32) / n_bits
 
         if has_emb:
             # Cosine similarity
