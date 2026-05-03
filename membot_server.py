@@ -2267,7 +2267,7 @@ function _showPassage(p){
   const cta=$('#modalCta'),src=$('#modalSource');
   if(cta){
     if(isSplit&&!isLoaded){
-      cta.innerHTML='<button class="modal-cta-btn" onclick="loadSource()">&#x1F4C2; Load full document from '+esc(p.source_db)+' &rarr;</button>';
+      cta.innerHTML='<button class="modal-cta-btn" onclick="loadSource()">&#x1F4C2; Load full passage from '+esc(p.source_db)+' &rarr;</button>';
       cta.style.display='block';
     } else { cta.style.display='none'; cta.innerHTML=''; }
   }
