@@ -1947,7 +1947,7 @@ _APP_HTML = """\
   .brand-text h1 { font-size:22px; font-weight:700; color:var(--text-bright); letter-spacing:-0.5px; }
   .brand-text h1 span { color:var(--accent); }
   .brand-text p { font-size:12px; color:var(--text-dim); margin-top:-2px; }
-  .intro { font-size:13px; color:var(--text-dim); line-height:1.5; margin:-8px 0 18px; max-width:680px; }
+  .intro { font-size:13px; color:var(--text-dim); line-height:1.5; margin:-8px 0 18px; }
   .intro strong { color:var(--text); font-weight:600; }
   .theme-toggle { background:var(--surface); border:1px solid var(--border); color:var(--text-dim); width:36px; height:36px; border-radius:8px; cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center; transition:all 0.2s; flex-shrink:0; margin-left:auto; }
   .theme-toggle:hover { border-color:var(--border-hover); color:var(--text); }
