@@ -264,6 +264,22 @@
   .result-footer .tag {
     background: var(--surface-2); padding: 1px 6px; border-radius: 3px;
   }
+  .result-footer .prov {
+    margin-left: auto; font-size: 10px; opacity: 0.7;
+    font-style: italic;
+  }
+  .result-text a, .passage-text a {
+    color: var(--accent); text-decoration: none;
+    border-bottom: 1px dotted var(--accent);
+  }
+  .result-text a:hover, .passage-text a:hover {
+    text-decoration: none; border-bottom-style: solid;
+  }
+  .passage-modal-source {
+    padding: 8px 20px; border-top: 1px solid var(--border);
+    font-size: 11px; color: var(--text-dim); font-family: var(--mono);
+    flex-shrink: 0;
+  }
   .result-card { cursor: pointer; }
   .passage-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:900; display:flex; align-items:center; justify-content:center; opacity:0; transition:opacity 0.2s; pointer-events:none; }
   .passage-overlay.open { opacity:1; pointer-events:auto; }
@@ -458,6 +474,7 @@
         <button class="modal-close" onclick="closePassage()" title="Close">&#x2715;</button>
       </div>
       <div class="passage-modal-body"><div class="passage-text" id="modalText"></div></div>
+      <div class="passage-modal-source" id="modalSource"></div>
       <div class="passage-modal-footer">
         <button class="passage-nav-btn" id="btnPrev" title="Previous chunk (when metadata wired)">&#x25C0; Prev</button>
         <button class="passage-nav-btn" id="btnNext" title="Next chunk (when metadata wired)">Next &#x25B6;</button>
@@ -649,6 +666,11 @@ async function doSearch() {
       const tags = item.tags ? item.tags.split(',').map(t =>
         `<span class="tag">${esc(t.trim())}</span>`
       ).join('') : '';
+      // Provenance footer: source DB + paper_id when split-cart returns them.
+      const provBits = [];
+      if (item.source_db) provBits.push(esc(item.source_db));
+      if (item.paper_id)  provBits.push('id: ' + esc(item.paper_id));
+      const prov = provBits.length ? `<span class="prov">${provBits.join(' · ')}</span>` : '';
 
       return `
         <div class="result-card" data-idx="${i}">
@@ -656,8 +678,8 @@ async function doSearch() {
             <span class="result-rank">#${i + 1}</span>
             ${score ? `<span class="result-score">score: ${score}</span>` : ''}
           </div>
-          <div class="result-text">${highlight(text, query)}</div>
-          ${tags ? `<div class="result-footer">${tags}</div>` : ''}
+          <div class="result-text">${highlight(linkify(text), query)}</div>
+          ${(tags || prov) ? `<div class="result-footer">${tags}${prov}</div>` : ''}
         </div>`;
     }).join('');
 
@@ -683,6 +705,8 @@ function openPassage(resultIdx) {
     next_idx: item.next_idx,
     score: item.score,
     rank: resultIdx + 1,
+    paper_id: item.paper_id,
+    source_db: item.source_db,
   });
 }
 
@@ -690,7 +714,17 @@ function _showPassage(p) {
   _currentPassage = p;
   $('#modalRank').textContent = p.rank ? '#' + p.rank : 'idx:' + p.index;
   $('#modalScore').textContent = p.score != null ? 'score: ' + p.score.toFixed(4) : '';
-  $('#modalText').innerHTML = highlight(esc(p.full_text), _lastQuery);
+  $('#modalText').innerHTML = highlight(linkify(esc(p.full_text)), _lastQuery);
+
+  // Provenance source line under modal body
+  const src = $('#modalSource');
+  if (src) {
+    const bits = [];
+    if (p.source_db) bits.push('source: ' + p.source_db);
+    if (p.paper_id)  bits.push('id: ' + p.paper_id);
+    src.textContent = bits.join(' · ');
+    src.style.display = bits.length ? 'block' : 'none';
+  }
 
   // Wire PREV/NEXT buttons
   const btnP = $('#btnPrev'), btnN = $('#btnNext');
@@ -780,15 +814,26 @@ function esc(s) {
 }
 
 const _STOP = new Set(['the','and','are','was','were','for','that','this','with','from','not','but','has','had','have','does','did','will','can','its','who','what','how','why','about','tell','you','your','some','than','them','then','they','been','more','also','into','would','could','should','just','like','very','much','many','only','other','over','such','after','before','between','through','where','when','which','while','each','there','their','these','those','being','because','during','both','same','own','most','well','way','all','out','one','two','may']);
-function highlight(text, query) {
-  if (!query) return text;
+function highlight(html, query) {
+  if (!query) return html;
   const words = query.split(/\s+/).filter(w => w.length > 2 && !_STOP.has(w.toLowerCase()));
-  let result = text;
+  let result = html;
   for (const word of words) {
-    const re = new RegExp(`(${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    // Negative lookahead (?![^<]*>) prevents matches inside open tags / attribute
+    // values (e.g. inside href="https://arxiv.org"). Match in visible text only.
+    const re = new RegExp(`(${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})(?![^<]*>)`, 'gi');
     result = result.replace(re, '<mark>$1</mark>');
   }
   return result;
+}
+
+function linkify(escapedText) {
+  // Wrap http(s) URLs in clickable links. Input must already be HTML-escaped.
+  // Trailing punctuation (.,;:) is excluded from the link.
+  return escapedText.replace(
+    /(https?:\/\/[^\s<]+?)([.,;:!?)\]]?(?=\s|$|<))/g,
+    '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>$2'
+  );
 }
 
 function toast(msg, type = 'success') {

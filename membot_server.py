@@ -214,6 +214,22 @@ def _sqlite_fetch_passages(conn: sqlite3.Connection, indices: list) -> dict:
     return {r[0]: {"passage": r[1], "title": r[2], "paper_id": r[3]} for r in rows}
 
 
+def _soft_truncate(text: str, target_min: int = 250, hard_max: int = 550) -> str:
+    """Truncate at first sentence-end past target_min, falling back to last
+    word boundary, then hard cap. Preserves provenance-card aesthetic without
+    mid-word cuts."""
+    if len(text) <= hard_max:
+        return text
+    for marker in (". ", "? ", "! ", "\n"):
+        idx = text.find(marker, target_min)
+        if 0 < idx <= hard_max - len(marker):
+            return text[: idx + len(marker)].rstrip() + " …"
+    cut = text.rfind(" ", target_min, hard_max)
+    if cut > target_min:
+        return text[:cut].rstrip() + " …"
+    return text[:hard_max].rstrip() + " …"
+
+
 # --- Depot Activity Log (ring buffer) ---
 DEPOT_ACTIVITY_MAX = 200
 _depot_activity: collections.deque = collections.deque(maxlen=DEPOT_ACTIVITY_MAX)
@@ -935,26 +951,42 @@ async def rest_search(request: Request) -> JSONResponse:
 
         elapsed_ms = (time.time() - t0) * 1000
 
-        # Build structured results
+        # Build structured results.
+        # For split carts, fetch full passages from SQLite for the top-K indices so
+        # full_text is the actual document body (~1500 chars for arxiv abstracts) and
+        # the modal can show real content. Tags are still extracted from the in-RAM
+        # snippet (which carries the [TAGS] prefix when a cart uses one). Card-display
+        # text is soft-truncated to a sentence boundary for clean visual.
+        top_indices_for_sqlite = [i for i, _ in boosted[:top_k]]
+        sqlite_full = {}
+        if state.get("is_split_cart") and state.get("sqlite_conn"):
+            sqlite_full = _sqlite_fetch_passages(state["sqlite_conn"], top_indices_for_sqlite)
+
         results = []
         for i, final_score in boosted[:top_k]:
             if final_score < 0.1:
                 continue
-            text = state["texts"][i]
-            # Extract tags if text starts with [TAGS] prefix.
-            # Limit bumped 80 -> 300 because Heartbeat tag prefixes include full URLs
-            # (e.g. [HEARTBEAT,CLAUDE,turn-119,url=claude.ai/chat/648d5988-...]) which
-            # routinely run ~99-150 chars; the old 80-char ceiling silently dropped
-            # the extraction for any URL-bearing cart.
+            ram_text = state["texts"][i]
+            # Extract tags if text starts with [TAGS] prefix (limit 300 chars for
+            # URL-bearing tag prefixes used by Heartbeat).
             tags = ""
-            if text.startswith("[") and "]" in text[:300]:
-                tag_end = text.index("]")
-                tags = text[1:tag_end]
-                text = text[tag_end + 1:].strip()
-            full_text = text
-            if len(text) > 500:
-                text = text[:500] + "..."
+            ram_body = ram_text
+            if ram_body.startswith("[") and "]" in ram_body[:300]:
+                tag_end = ram_body.index("]")
+                tags = ram_body[1:tag_end]
+                ram_body = ram_body[tag_end + 1:].strip()
+
+            # full_text: SQLite full passage when available (split carts), else RAM body
+            sqlite_row = sqlite_full.get(i)
+            full_text = (sqlite_row.get("passage") if sqlite_row else None) or ram_body
+
+            text = _soft_truncate(full_text)
             entry = {"text": text, "full_text": full_text, "score": round(final_score, 4), "tags": tags, "index": int(i)}
+            # Provenance hints for split carts (rendered as small footer in client).
+            if sqlite_row:
+                if sqlite_row.get("paper_id"):
+                    entry["paper_id"] = sqlite_row["paper_id"]
+                entry["source_db"] = state.get("cartridge", "") + "_text.db"
             # Include hippocampus nav if available (hippo was hoisted earlier for tombstone check)
             if hippo and i < len(hippo):
                 meta = hippo[i]
@@ -1982,6 +2014,10 @@ _APP_HTML = """\
   .result-text mark { background:#eab30830; color:var(--amber); border-radius:2px; padding:0 2px; }
   .result-footer { margin-top:10px; padding-top:8px; border-top:1px solid var(--border); display:flex; gap:12px; font-size:11px; color:var(--text-dim); font-family:var(--mono); }
   .result-footer .tag { background:var(--surface-2); padding:1px 6px; border-radius:3px; }
+  .result-footer .prov { margin-left:auto; font-size:10px; opacity:0.7; font-style:italic; }
+  .result-text a, .passage-text a { color:var(--accent); text-decoration:none; border-bottom:1px dotted var(--accent); }
+  .result-text a:hover, .passage-text a:hover { border-bottom-style:solid; }
+  .passage-modal-source { padding:8px 20px; border-top:1px solid var(--border); font-size:11px; color:var(--text-dim); font-family:var(--mono); flex-shrink:0; }
   .result-card { cursor:pointer; }
   .passage-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:900; display:flex; align-items:center; justify-content:center; opacity:0; transition:opacity 0.2s; pointer-events:none; }
   .passage-overlay.open { opacity:1; pointer-events:auto; }
@@ -2058,6 +2094,7 @@ _APP_HTML = """\
         <button class="modal-close" onclick="closePassage()" title="Close">&#x2715;</button>
       </div>
       <div class="passage-modal-body"><div class="passage-text" id="modalText"></div></div>
+      <div class="passage-modal-source" id="modalSource" style="display:none"></div>
       <div class="passage-modal-footer">
         <button class="passage-nav-btn" id="btnPrev" title="Previous chunk (when metadata wired)">&#x25C0; Prev</button>
         <button class="passage-nav-btn" id="btnNext" title="Next chunk (when metadata wired)">Next &#x25B6;</button>
@@ -2179,7 +2216,11 @@ async function doSearch(){
       const text=esc(item.text||item.content||'');
       const score=item.score!=null?item.score.toFixed(4):'';
       const tags=item.tags?item.tags.split(',').map(t=>'<span class="tag">'+esc(t.trim())+'</span>').join(''):'';
-      return '<div class="result-card" data-idx="'+i+'"><div class="result-header"><span class="result-rank">#'+(i+1)+'</span>'+(score?'<span class="result-score">score: '+score+'</span>':'')+'</div><div class="result-text">'+highlight(text,query)+'</div>'+(tags?'<div class="result-footer">'+tags+'</div>':'')+'</div>';
+      const provBits=[];
+      if(item.source_db)provBits.push(esc(item.source_db));
+      if(item.paper_id)provBits.push('id: '+esc(item.paper_id));
+      const prov=provBits.length?'<span class="prov">'+provBits.join(' · ')+'</span>':'';
+      return '<div class="result-card" data-idx="'+i+'"><div class="result-header"><span class="result-rank">#'+(i+1)+'</span>'+(score?'<span class="result-score">score: '+score+'</span>':'')+'</div><div class="result-text">'+highlight(linkify(text),query)+'</div>'+((tags||prov)?'<div class="result-footer">'+tags+prov+'</div>':'')+'</div>';
     }).join('');
     el.querySelectorAll('.result-card').forEach(c=>c.addEventListener('click',()=>openPassage(parseInt(c.dataset.idx))));
   }catch(e){ loading.className='loading'; el.innerHTML='<div class="empty-state"><div class="icon">&#x26A0;</div><p>Search failed</p><div style="font-size:12px;margin-top:8px">'+esc(e.message)+'</div></div>'; }
@@ -2189,13 +2230,21 @@ function openPassage(resultIdx){
   if(resultIdx<0||resultIdx>=_lastResults.length)return;
   const item=_lastResults[resultIdx];
   console.log('[HIPPO] openPassage resultIdx='+resultIdx+' item.index='+item.index+' prev_idx='+item.prev_idx+' next_idx='+item.next_idx, item);
-  _showPassage({index:item.index,full_text:item.full_text||item.text||'',prev_idx:item.prev_idx,next_idx:item.next_idx,score:item.score,rank:resultIdx+1});
+  _showPassage({index:item.index,full_text:item.full_text||item.text||'',prev_idx:item.prev_idx,next_idx:item.next_idx,score:item.score,rank:resultIdx+1,paper_id:item.paper_id,source_db:item.source_db});
 }
 function _showPassage(p){
   _currentPassage=p;
   $('#modalRank').textContent=p.rank?'#'+p.rank:'idx:'+p.index;
   $('#modalScore').textContent=p.score!=null?'score: '+p.score.toFixed(4):'';
-  $('#modalText').innerHTML=highlight(esc(p.full_text),_lastQuery);
+  $('#modalText').innerHTML=highlight(linkify(esc(p.full_text)),_lastQuery);
+  const src=$('#modalSource');
+  if(src){
+    const bits=[];
+    if(p.source_db)bits.push('source: '+p.source_db);
+    if(p.paper_id)bits.push('id: '+p.paper_id);
+    src.textContent=bits.join(' · ');
+    src.style.display=bits.length?'block':'none';
+  }
   const btnP=$('#btnPrev'),btnN=$('#btnNext');
   if(p.prev_idx!=null){btnP.className='passage-nav-btn enabled';btnP.onclick=()=>navigatePassage(p.prev_idx);}
   else{btnP.className='passage-nav-btn';btnP.onclick=null;}
@@ -2236,12 +2285,18 @@ async function doStore(){
 }
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 const _STOP=new Set(['the','and','are','was','were','for','that','this','with','from','not','but','has','had','have','does','did','will','can','its','who','what','how','why','about','tell','you','your','some','than','them','then','they','been','more','also','into','would','could','should','just','like','very','much','many','only','other','over','such','after','before','between','through','where','when','which','while','each','there','their','these','those','being','because','during','both','same','own','most','well','way','all','out','one','two','may']);
-function highlight(text,query){
-  if(!query)return text;
+function highlight(html,query){
+  if(!query)return html;
   const words=query.split(/\\s+/).filter(w=>w.length>2&&!_STOP.has(w.toLowerCase()));
-  let r=text;
-  for(const w of words){const re=new RegExp('('+w.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')+')','gi');r=r.replace(re,'<mark>$1</mark>');}
+  let r=html;
+  // Negative lookahead (?![^<]*>) skips matches inside open tags / attribute values
+  // (e.g. inside href="https://arxiv.org") so URL hrefs don't break.
+  for(const w of words){const re=new RegExp('('+w.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')+')(?![^<]*>)','gi');r=r.replace(re,'<mark>$1</mark>');}
   return r;
+}
+function linkify(escapedText){
+  // Wrap http(s) URLs in clickable links. Input must already be HTML-escaped.
+  return escapedText.replace(/(https?:\\/\\/[^\\s<]+?)([.,;:!?)\\]]?(?=\\s|$|<))/g,'<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>$2');
 }
 function toast(msg,type='success'){
   const el=$('#toastEl');el.textContent=msg;el.className='toast '+type+' show';
