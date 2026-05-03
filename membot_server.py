@@ -957,7 +957,9 @@ async def rest_search(request: Request) -> JSONResponse:
         # the modal can show real content. Tags are still extracted from the in-RAM
         # snippet (which carries the [TAGS] prefix when a cart uses one). Card-display
         # text is soft-truncated to a sentence boundary for clean visual.
-        top_indices_for_sqlite = [i for i, _ in boosted[:top_k]]
+        # int() cast is load-bearing: sqlite3 binds numpy.int64 silently as no-match,
+        # so passing the raw numpy ints from boosted[] returns zero rows.
+        top_indices_for_sqlite = [int(i) for i, _ in boosted[:top_k]]
         sqlite_full = {}
         if state.get("is_split_cart") and state.get("sqlite_conn"):
             sqlite_full = _sqlite_fetch_passages(state["sqlite_conn"], top_indices_for_sqlite)
@@ -2593,8 +2595,9 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
         elapsed_ms = (time.time() - t0) * 1000
 
         # 5. Format results (include passage index + nav hints if hippocampus present)
-        # For split carts, fetch full passages from SQLite for display
-        top_indices = [i for i, _, _ in boosted[:top_k]]
+        # For split carts, fetch full passages from SQLite for display.
+        # int() cast is load-bearing: sqlite3 binds numpy.int64 silently as no-match.
+        top_indices = [int(i) for i, _, _ in boosted[:top_k]]
         full_texts = {}
         if state.get("is_split_cart") and state.get("sqlite_conn"):
             full_texts = _sqlite_fetch_passages(state["sqlite_conn"], top_indices)
