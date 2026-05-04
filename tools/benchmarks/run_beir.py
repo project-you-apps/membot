@@ -12,27 +12,34 @@ queries." See:
 USAGE
 -----
 
-Two-step flow because cart-build is expensive (embed once, query many):
+Recommended (no server, in-process — works on any platform without
+mount/route fights):
 
-    # 1. Build the BEIR cart (downloads dataset via HuggingFace, embeds, saves)
+    python tools/benchmarks/run_beir.py --dataset scifact --direct
+
+That builds the cart if it doesn't exist, then runs queries by loading
+the NPZ in-process and computing 70/30 cosine + sign-zero Hamming
+directly. Same math as membot_server.py's REST /api/search blended
+path, minus keyword rerank — pure binary+cosine baseline, the cleanest
+number to publish.
+
+Server-mediated flow (if you want to test the full membot pipeline
+including kw-rerank/dedup/tombstone-skip):
+
+    # 1. Build the BEIR cart
     python tools/benchmarks/run_beir.py --dataset scifact --build-only
 
-    # 2. Mount the cart on a running membot and run queries
-    #    (assumes you have a membot HTTP server running locally on :8000)
-    python -m membot --transport http --port 8000 --writable &
+    # 2. Start a membot HTTP server on a port that isn't already taken
+    #    (VPS dev backend is usually on :8000 — pick something else):
+    python membot_server.py --transport http --port 8001 --writable
 
-    # bash / unix-curl:
-    curl -X POST http://localhost:8000/api/mount \
-         -H 'Content-Type: application/json' \
-         -d '{"name":"beir-scifact"}'
+    # 3. Mount the cart (PowerShell-friendly form):
+    Invoke-RestMethod -Method POST -Uri http://localhost:8001/api/mount `
+        -ContentType 'application/json' -Body '{"name":"beir-scifact"}'
 
-    # PowerShell (call curl.exe to bypass the Invoke-WebRequest alias):
-    curl.exe -X POST http://localhost:8000/api/mount -H "Content-Type: application/json" -d '{\"name\":\"beir-scifact\"}'
-
-    # PowerShell native (often nicer):
-    Invoke-RestMethod -Method POST -Uri http://localhost:8000/api/mount -ContentType 'application/json' -Body '{"name":"beir-scifact"}'
-
-    python tools/benchmarks/run_beir.py --dataset scifact --skip-build
+    # 4. Run queries:
+    python tools/benchmarks/run_beir.py --dataset scifact --skip-build \
+           --server-url http://localhost:8001
 
     # Or do both in one go (script will tell you to mount the cart manually
     # in between, since it can't restart the server itself):
@@ -174,6 +181,96 @@ def build_cart_from_corpus(corpus: dict, cart_name: str, output_dir: str):
 
 
 # ---------------------------------------------------------------------------
+# Direct (in-process) search — no server needed
+# ---------------------------------------------------------------------------
+
+# Same math as the REST /api/search blended path in membot_server.py
+# (chunked Hamming popcount + 70/30 cosine blend), minus keyword rerank
+# and dedup. Pure binary+cosine baseline — the cleanest number for the
+# rebuttal to NodeMind's OOD claim.
+
+import numpy as np
+
+# Default 70/30 cosine/hamming split (membot's HAMMING_BLEND default)
+HAMMING_BLEND = 0.30
+
+
+def load_cart_for_direct(cart_path: str):
+    """Load a cart NPZ for in-process search. Returns dict with embeddings,
+    sign_bits (packed), and texts."""
+    data = np.load(cart_path, allow_pickle=True)
+    out = {
+        "embeddings": np.asarray(data["embeddings"], dtype=np.float32),
+        "texts": list(data["texts"]) if "texts" in data else [],
+    }
+    if "sign_bits" in data:
+        out["sign_bits"] = np.asarray(data["sign_bits"], dtype=np.uint8)
+    else:
+        # Compute sign-zero packed bits from embeddings as fallback
+        sb = (out["embeddings"] > 0).astype(np.uint8)
+        out["sign_bits"] = np.packbits(sb, axis=1).astype(np.uint8)
+    return out
+
+
+_POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+
+def _hamming_scores(query_emb: np.ndarray, sign_bits: np.ndarray) -> np.ndarray:
+    """Sign-zero Hamming similarity. Same chunked popcount as membot_server.py."""
+    is_packed = sign_bits.shape[1] <= 96
+    n = len(sign_bits)
+    n_bits = 768 if is_packed else sign_bits.shape[1]
+    dist = np.empty(n, dtype=np.uint32)
+    BATCH = 100_000
+    if is_packed:
+        q_packed = np.packbits((query_emb > 0).astype(np.uint8))
+        for s in range(0, n, BATCH):
+            e = min(s + BATCH, n)
+            xor = np.bitwise_xor(q_packed, sign_bits[s:e])
+            dist[s:e] = _POPCOUNT_TABLE[xor].sum(axis=1)
+    else:
+        q_bin = (query_emb > 0).astype(np.uint8)
+        for s in range(0, n, BATCH):
+            e = min(s + BATCH, n)
+            xor = np.bitwise_xor(q_bin, sign_bits[s:e])
+            dist[s:e] = xor.sum(axis=1)
+    return 1.0 - dist.astype(np.float32) / n_bits
+
+
+def search_direct(query_emb: np.ndarray, cart: dict, top_k: int):
+    """In-process 70/30 cosine + sign-zero Hamming blend. Returns list of
+    (doc_id, score) parsed from the cart's [BEIR,doc=<id>] tag prefix."""
+    embs = cart["embeddings"]
+    # Cosine
+    embs_norm = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9
+    q_norm = np.linalg.norm(query_emb) + 1e-9
+    cos = (embs / embs_norm) @ (query_emb / q_norm)
+    # Hamming
+    ham = _hamming_scores(query_emb, cart["sign_bits"])
+    # Blend
+    scores = (1.0 - HAMMING_BLEND) * cos + HAMMING_BLEND * ham
+    # Top-k
+    top_idx = np.argpartition(scores, -top_k)[-top_k:]
+    top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+    # Recover doc_ids from tag prefix
+    out = []
+    for i in top_idx:
+        text = cart["texts"][i]
+        doc_id = None
+        if isinstance(text, str) and text.startswith("[") and "]" in text[:300]:
+            tag_end = text.index("]")
+            tags = text[1:tag_end]
+            for tag in tags.split(","):
+                tag = tag.strip()
+                if tag.startswith("doc="):
+                    doc_id = tag[4:].strip()
+                    break
+        if doc_id is not None:
+            out.append((doc_id, float(scores[i])))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Query loop (HTTP — assumes membot server with cart mounted)
 # ---------------------------------------------------------------------------
 
@@ -289,6 +386,12 @@ def main():
         help="Optional path to write per-query results (q_id, retrieved doc_ids, scores) "
              "as JSONL for offline analysis.",
     )
+    p.add_argument(
+        "--direct",
+        action="store_true",
+        help="In-process search, no membot HTTP server needed. Loads the cart NPZ "
+             "and runs 70/30 cosine + sign-zero Hamming blend directly. Recommended.",
+    )
     args = p.parse_args()
 
     cart_name = f"beir-{args.dataset}"
@@ -312,29 +415,74 @@ def main():
         return
 
     # 3. Run queries
-    print(f"[query] Running {len(queries):,} queries against {args.server_url}...")
     results_per_query: dict[str, list[tuple[str, float]]] = {}
     log_f = open(args.log_jsonl, "w", encoding="utf-8") if args.log_jsonl else None
-    t0 = time.time()
     failures = 0
-    for i, (q_id, q_text) in enumerate(queries.items()):
-        if i and i % 100 == 0:
-            elapsed = time.time() - t0
-            print(f"[query]   {i:,}/{len(queries):,} ({elapsed:.1f}s, "
-                  f"{elapsed / i * 1000:.1f}ms/query)")
-        try:
-            results_per_query[q_id] = search_query(args.server_url, q_text, args.top_k)
-        except Exception as e:
-            failures += 1
-            if failures <= 5:
-                print(f"[query] WARN: query {q_id} failed: {e}")
-            results_per_query[q_id] = []
-        if log_f:
-            log_f.write(json.dumps({
-                "query_id": q_id,
-                "query": q_text,
-                "results": results_per_query[q_id],
-            }) + "\n")
+
+    if args.direct:
+        print(f"[query] Direct (in-process) search for {len(queries):,} queries...")
+        cart_path = Path(args.cart_dir) / f"{cart_name}.cart.npz"
+        if not cart_path.exists():
+            print(f"[query] ERROR: cart not found at {cart_path}. "
+                  f"Run with --build-only first (or remove --skip-build).")
+            return
+        print(f"[query] Loading cart from {cart_path}...")
+        cart = load_cart_for_direct(str(cart_path))
+        print(f"[query]   embeddings: {cart['embeddings'].shape}, "
+              f"sign_bits: {cart['sign_bits'].shape}, texts: {len(cart['texts']):,}")
+
+        # Lazy-import the same embedder cartridge_builder uses, so query
+        # embeddings come from the same model as the cart.
+        import cartridge_builder
+        embedder = cartridge_builder.get_embedder()
+
+        t0 = time.time()
+        for i, (q_id, q_text) in enumerate(queries.items()):
+            if i and i % 100 == 0:
+                elapsed = time.time() - t0
+                print(f"[query]   {i:,}/{len(queries):,} ({elapsed:.1f}s, "
+                      f"{elapsed / i * 1000:.1f}ms/query)")
+            try:
+                # Same prefix membot uses for query embeddings
+                q_emb = embedder.encode(
+                    [f"search_query: {q_text[:8000]}"],
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                )[0].astype(np.float32)
+                results_per_query[q_id] = search_direct(q_emb, cart, args.top_k)
+            except Exception as e:
+                failures += 1
+                if failures <= 5:
+                    print(f"[query] WARN: query {q_id} failed: {e}")
+                results_per_query[q_id] = []
+            if log_f:
+                log_f.write(json.dumps({
+                    "query_id": q_id,
+                    "query": q_text,
+                    "results": results_per_query[q_id],
+                }) + "\n")
+    else:
+        print(f"[query] Running {len(queries):,} queries against {args.server_url}...")
+        t0 = time.time()
+        for i, (q_id, q_text) in enumerate(queries.items()):
+            if i and i % 100 == 0:
+                elapsed = time.time() - t0
+                print(f"[query]   {i:,}/{len(queries):,} ({elapsed:.1f}s, "
+                      f"{elapsed / i * 1000:.1f}ms/query)")
+            try:
+                results_per_query[q_id] = search_query(args.server_url, q_text, args.top_k)
+            except Exception as e:
+                failures += 1
+                if failures <= 5:
+                    print(f"[query] WARN: query {q_id} failed: {e}")
+                results_per_query[q_id] = []
+            if log_f:
+                log_f.write(json.dumps({
+                    "query_id": q_id,
+                    "query": q_text,
+                    "results": results_per_query[q_id],
+                }) + "\n")
+
     if log_f:
         log_f.close()
 
@@ -343,7 +491,12 @@ def main():
           f"({elapsed / max(len(queries), 1) * 1000:.1f}ms/query, {failures} failures)")
 
     # 4. Score
-    print(f"\n=== {args.dataset} : sign-zero hamming + 70/30 cosine blend + kw rerank ===")
+    pipeline_label = (
+        "70/30 cosine + sign-zero Hamming (direct, no rerank)"
+        if args.direct
+        else "70/30 cosine + sign-zero Hamming + kw rerank (server)"
+    )
+    print(f"\n=== {args.dataset} : {pipeline_label} ===")
     print(f"  Queries scored: {len(results_per_query):,}  "
           f"Top-k: {args.top_k}  Failures: {failures}")
     print()
