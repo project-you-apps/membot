@@ -20,9 +20,18 @@ Two-step flow because cart-build is expensive (embed once, query many):
     # 2. Mount the cart on a running membot and run queries
     #    (assumes you have a membot HTTP server running locally on :8000)
     python -m membot --transport http --port 8000 --writable &
+
+    # bash / unix-curl:
     curl -X POST http://localhost:8000/api/mount \
          -H 'Content-Type: application/json' \
          -d '{"name":"beir-scifact"}'
+
+    # PowerShell (call curl.exe to bypass the Invoke-WebRequest alias):
+    curl.exe -X POST http://localhost:8000/api/mount -H "Content-Type: application/json" -d '{\"name\":\"beir-scifact\"}'
+
+    # PowerShell native (often nicer):
+    Invoke-RestMethod -Method POST -Uri http://localhost:8000/api/mount -ContentType 'application/json' -Body '{"name":"beir-scifact"}'
+
     python tools/benchmarks/run_beir.py --dataset scifact --skip-build
 
     # Or do both in one go (script will tell you to mount the cart manually
@@ -294,10 +303,12 @@ def main():
 
     if args.build_only:
         print(f"\n[done] Cart at {args.cart_dir}/{cart_name}.cart.npz")
-        print(f"[next] Mount it on the membot server, then re-run this script with --skip-build:")
-        print(f"  curl -X POST {args.server_url}/api/mount \\")
-        print(f"       -H 'Content-Type: application/json' \\")
-        print(f"       -d '{{\"name\":\"{cart_name}\"}}'")
+        print(f"[next] Mount it on the membot server, then re-run this script with --skip-build.")
+        print(f"  bash:        curl -X POST {args.server_url}/api/mount \\")
+        print(f"                    -H 'Content-Type: application/json' \\")
+        print(f"                    -d '{{\"name\":\"{cart_name}\"}}'")
+        print(f"  PowerShell:  Invoke-RestMethod -Method POST -Uri {args.server_url}/api/mount "
+              f"-ContentType 'application/json' -Body '{{\"name\":\"{cart_name}\"}}'")
         return
 
     # 3. Run queries
