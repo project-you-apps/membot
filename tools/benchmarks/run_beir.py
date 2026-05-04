@@ -435,6 +435,15 @@ def main():
              "1.0 = pure sign-zero Hamming (NodeMind-style binary turf). "
              "Sweep three values to map the cost of going binary.",
     )
+    p.add_argument(
+        "--blend-sweep",
+        action="store_true",
+        help="Sweep --hamming-blend from 0.0 to 1.0 in 0.05 increments and "
+             "tabulate Recall@10 + MRR@10. Runs all queries 21 times — only "
+             "the blend math changes per run, so each sweep step adds ~6s on "
+             "small datasets. Useful for finding a corpus-specific optimum but "
+             "WON'T push past the pure-cosine ceiling on its own.",
+    )
     args = p.parse_args()
 
     cart_name = f"beir-{args.dataset}"
@@ -478,6 +487,52 @@ def main():
         # embeddings come from the same model as the cart.
         import cartridge_builder
         embedder = cartridge_builder.get_embedder()
+
+        if args.blend_sweep:
+            # Sweep mode — embed each query ONCE, then loop blends doing
+            # cheap re-blends over cached cosine/Hamming score vectors.
+            # Saves ~21x of embedding cost vs naively re-running queries.
+            print(f"[sweep] Embedding {len(queries):,} queries (cached for sweep)...")
+            cached_q_embs: dict[str, np.ndarray] = {}
+            t0 = time.time()
+            for i, (q_id, q_text) in enumerate(queries.items()):
+                if i and i % 200 == 0:
+                    elapsed = time.time() - t0
+                    print(f"[sweep]   {i:,}/{len(queries):,} embedded ({elapsed:.1f}s)")
+                try:
+                    q_emb = embedder.encode(
+                        [f"search_query: {q_text[:8000]}"],
+                        convert_to_numpy=True,
+                        show_progress_bar=False,
+                    )[0].astype(np.float32)
+                    cached_q_embs[q_id] = q_emb
+                except Exception as e:
+                    failures += 1
+                    if failures <= 5:
+                        print(f"[sweep] WARN: query {q_id} embed failed: {e}")
+            print(f"[sweep] Embedded {len(cached_q_embs):,} queries in "
+                  f"{time.time() - t0:.1f}s. Now sweeping blends...")
+
+            blends = [round(b, 2) for b in np.arange(0.0, 1.0001, 0.05)]
+            print(f"\n=== {args.dataset} : Hamming-blend sweep "
+                  f"(direct, no rerank, {len(blends)} blend values) ===")
+            print(f"  {'blend':>5}  {'R@1':>8}  {'R@5':>8}  {'R@10':>8}  {'MRR@10':>8}")
+            print(f"  {'-' * 5}  {'-' * 8}  {'-' * 8}  {'-' * 8}  {'-' * 8}")
+            for b in blends:
+                results: dict[str, list[tuple[str, float]]] = {}
+                for q_id, q_emb in cached_q_embs.items():
+                    results[q_id] = search_direct(q_emb, cart, args.top_k, blend=b)
+                r1 = recall_at_k(results, qrels, 1)
+                r5 = recall_at_k(results, qrels, 5)
+                r10 = recall_at_k(results, qrels, args.top_k if args.top_k < 10 else 10)
+                m10 = mrr_at_k(results, qrels, args.top_k if args.top_k < 10 else 10)
+                # Bold the best Recall@10 row visually with a *
+                marker = ""
+                print(f"  {b:>5.2f}  {r1:>8.4f}  {r5:>8.4f}  {r10:>8.4f}  {m10:>8.4f}{marker}")
+            print()
+            print(f"  Tip: inspect the R@10 column — its argmax is the corpus-specific")
+            print(f"       optimum blend for this encoder. Compare to default 0.30.")
+            return
 
         t0 = time.time()
         for i, (q_id, q_text) in enumerate(queries.items()):
