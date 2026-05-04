@@ -191,8 +191,9 @@ def build_cart_from_corpus(corpus: dict, cart_name: str, output_dir: str):
 
 import numpy as np
 
-# Default 70/30 cosine/hamming split (membot's HAMMING_BLEND default)
-HAMMING_BLEND = 0.30
+# Default 70/30 cosine/hamming split (membot's HAMMING_BLEND default).
+# Override at runtime via search_direct(blend=...) or the --hamming-blend CLI flag.
+DEFAULT_HAMMING_BLEND = 0.30
 
 
 def load_cart_for_direct(cart_path: str):
@@ -263,9 +264,15 @@ def _hamming_scores(query_emb: np.ndarray, sign_bits: np.ndarray) -> np.ndarray:
     return 1.0 - dist.astype(np.float32) / n_bits
 
 
-def search_direct(query_emb: np.ndarray, cart: dict, top_k: int):
-    """In-process 70/30 cosine + sign-zero Hamming blend. Returns list of
-    (doc_id, score) parsed from the cart's [BEIR,doc=<id>] tag prefix."""
+def search_direct(query_emb: np.ndarray, cart: dict, top_k: int,
+                  blend: float = DEFAULT_HAMMING_BLEND):
+    """In-process cosine + sign-zero Hamming blend. Returns list of
+    (doc_id, score) parsed from the cart's [BEIR,doc=<id>] tag prefix.
+
+    blend=0.0  → pure cosine (float32 RAG baseline / upper bound)
+    blend=0.3  → membot's production split (default)
+    blend=1.0  → pure sign-zero Hamming (NodeMind-style binary turf)
+    """
     embs = cart["embeddings"]
     # Cosine
     embs_norm = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9
@@ -274,7 +281,7 @@ def search_direct(query_emb: np.ndarray, cart: dict, top_k: int):
     # Hamming
     ham = _hamming_scores(query_emb, cart["sign_bits"])
     # Blend
-    scores = (1.0 - HAMMING_BLEND) * cos + HAMMING_BLEND * ham
+    scores = (1.0 - blend) * cos + blend * ham
     # Top-k
     top_idx = np.argpartition(scores, -top_k)[-top_k:]
     top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
@@ -416,7 +423,17 @@ def main():
         "--direct",
         action="store_true",
         help="In-process search, no membot HTTP server needed. Loads the cart NPZ "
-             "and runs 70/30 cosine + sign-zero Hamming blend directly. Recommended.",
+             "and runs cosine + sign-zero Hamming blend directly. Recommended.",
+    )
+    p.add_argument(
+        "--hamming-blend",
+        type=float,
+        default=DEFAULT_HAMMING_BLEND,
+        help="Cosine/Hamming blend weight for --direct mode. "
+             "0.0 = pure cosine (float32 RAG baseline). "
+             "0.3 = membot production default. "
+             "1.0 = pure sign-zero Hamming (NodeMind-style binary turf). "
+             "Sweep three values to map the cost of going binary.",
     )
     args = p.parse_args()
 
@@ -475,7 +492,9 @@ def main():
                     convert_to_numpy=True,
                     show_progress_bar=False,
                 )[0].astype(np.float32)
-                results_per_query[q_id] = search_direct(q_emb, cart, args.top_k)
+                results_per_query[q_id] = search_direct(
+                    q_emb, cart, args.top_k, blend=args.hamming_blend
+                )
             except Exception as e:
                 failures += 1
                 if failures <= 5:
@@ -517,11 +536,13 @@ def main():
           f"({elapsed / max(len(queries), 1) * 1000:.1f}ms/query, {failures} failures)")
 
     # 4. Score
-    pipeline_label = (
-        "70/30 cosine + sign-zero Hamming (direct, no rerank)"
-        if args.direct
-        else "70/30 cosine + sign-zero Hamming + kw rerank (server)"
-    )
+    if args.direct:
+        b = args.hamming_blend
+        cos_pct = round((1.0 - b) * 100)
+        ham_pct = round(b * 100)
+        pipeline_label = f"{cos_pct}/{ham_pct} cosine/Hamming (direct, no rerank, blend={b})"
+    else:
+        pipeline_label = "cosine + Hamming + kw rerank (server)"
     print(f"\n=== {args.dataset} : {pipeline_label} ===")
     print(f"  Queries scored: {len(results_per_query):,}  "
           f"Top-k: {args.top_k}  Failures: {failures}")
