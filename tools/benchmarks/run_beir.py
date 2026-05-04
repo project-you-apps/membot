@@ -197,18 +197,44 @@ HAMMING_BLEND = 0.30
 
 def load_cart_for_direct(cart_path: str):
     """Load a cart NPZ for in-process search. Returns dict with embeddings,
-    sign_bits (packed), and texts."""
+    sign_bits (packed), and texts.
+
+    NPZ key convention (cartridge_builder.save_cartridge, mcp-v4 format):
+      - 'embeddings' : (N, dim) float32
+      - 'passages'   : (N,) object array of plain strings  ← preferred
+      - 'compressed_texts' : (N,) object array of zlib-compressed utf-8 bytes
+      - 'sign_bits'  : may or may not be present; cartridge_builder doesn't
+        save them — they're computed at mount time by membot_server.py
+    """
+    import zlib
+
     data = np.load(cart_path, allow_pickle=True)
-    out = {
-        "embeddings": np.asarray(data["embeddings"], dtype=np.float32),
-        "texts": list(data["texts"]) if "texts" in data else [],
-    }
+    out = {"embeddings": np.asarray(data["embeddings"], dtype=np.float32)}
+
+    # Texts: try plain 'passages' first, fall back to decompressing 'compressed_texts'
+    if "passages" in data:
+        out["texts"] = [str(t) for t in data["passages"]]
+    elif "compressed_texts" in data:
+        decompressed = []
+        for blob in data["compressed_texts"]:
+            try:
+                raw = bytes(blob.tobytes()) if hasattr(blob, "tobytes") else bytes(blob)
+                decompressed.append(zlib.decompress(raw).decode("utf-8"))
+            except Exception:
+                decompressed.append("")
+        out["texts"] = decompressed
+    elif "texts" in data:
+        out["texts"] = [str(t) for t in data["texts"]]
+    else:
+        out["texts"] = []
+
+    # Sign bits: present in some cart formats, computed on-the-fly otherwise
     if "sign_bits" in data:
         out["sign_bits"] = np.asarray(data["sign_bits"], dtype=np.uint8)
     else:
-        # Compute sign-zero packed bits from embeddings as fallback
         sb = (out["embeddings"] > 0).astype(np.uint8)
         out["sign_bits"] = np.packbits(sb, axis=1).astype(np.uint8)
+
     return out
 
 
@@ -502,18 +528,14 @@ def main():
     print()
     print(f"  {'Metric':<14}{'Value':>10}")
     print(f"  {'-' * 14}{'-' * 10:>10}")
-    for k in (1, 5, 10, args.top_k):
-        if k <= 0 or k > args.top_k:
-            continue
-        if k in (1, 5, 10) or k == args.top_k:
-            r = recall_at_k(results_per_query, qrels, k)
-            print(f"  Recall@{k:<7}{r:>10.4f}")
-    for k in (10, args.top_k):
-        if k <= 0 or k > args.top_k:
-            continue
-        if k == 10 or k == args.top_k:
-            m = mrr_at_k(results_per_query, qrels, k)
-            print(f"  MRR@{k:<10}{m:>10.4f}")
+    recall_ks = sorted({k for k in (1, 5, 10, args.top_k) if 0 < k <= args.top_k})
+    for k in recall_ks:
+        r = recall_at_k(results_per_query, qrels, k)
+        print(f"  Recall@{k:<7}{r:>10.4f}")
+    mrr_ks = sorted({k for k in (10, args.top_k) if 0 < k <= args.top_k})
+    for k in mrr_ks:
+        m = mrr_at_k(results_per_query, qrels, k)
+        print(f"  MRR@{k:<10}{m:>10.4f}")
 
 
 if __name__ == "__main__":
