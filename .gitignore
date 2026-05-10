@@ -29,13 +29,14 @@ gutenberg_cache/
 # Logs
 *.log
 
-# Internal docs — devlogs, planning, and pre-scope artifacts contain
-# strategic positioning, calibration quotes, and collaborator-specific
-# coordination that should not be in a public repo. Maintained in the
-# local-only outer project-you tree at docs/membot-internal/ instead.
-# Andy 2026-05-10.
+# Internal docs — strategic positioning, calibration quotes, and
+# pre-scope/planning artifacts. Maintained in the local-only outer
+# project-you tree at docs/membot-internal/ instead. Andy 2026-05-10.
+# DEVLOG-SAGE-COLLAB.md is *intentionally* public (collaborative
+# documentation with Dennis's SAGE fleet) — exception below.
 docs/DEVLOG.md
 docs/DEVLOG-*.md
+!docs/DEVLOG-SAGE-COLLAB.md
 docs/*-PRE-SCOPE.md
 docs/*-PLAN.md
 docs/*-SCOPE.md
