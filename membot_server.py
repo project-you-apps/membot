@@ -87,6 +87,12 @@ CARTRIDGE_DIRS = [
     os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "cartridges"),
     os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "self_contained_cart_test"),
 ]
+# Mempack storage: per-user writable carts at cartridges/users/<owner_id>/<name>.cart.npz.
+# Walked recursively by find_mempacks() (separate from find_cartridges which only does
+# top-level CARTRIDGE_DIRS). Andy 2026-05-12 — Block F revival as Mempack storage.
+MEMPACK_BASE_DIR = os.path.join(BASE_DIR, "cartridges", "users")
+# UUID format pattern for owner_id directory names (defense in depth — Supabase UUIDs).
+_UUID_RE = re.compile(r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$")
 HAMMING_BLEND = 0.3           # 70% cosine + 30% sign_zero Hamming (replaces physics L2)
 RECENCY_HALF_LIFE = 86400.0   # 24h — recency weight halves per day (0 = disabled)
 
@@ -120,8 +126,63 @@ def compute_fingerprint(embeddings: np.ndarray, n_texts: int) -> str:
     return h.hexdigest()[:16]
 
 
-def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int):
-    """Save integrity manifest alongside cartridge."""
+# Pattern 0 v2 permission helpers (Andy 2026-05-12).
+# Permission semantics from spec docs/RFC/pattern-0-v2-spec.md:
+#   r = read (search the cart)        bit 0 = 1
+#   w = write (add/edit patterns)     bit 1 = 2
+#   d = delete (tombstone patterns)   bit 2 = 4
+#   a = admin (manage perms/delete)   bit 3 = 8
+# Stored in the manifest as a readable string ("rw", "rwda", "" for none).
+_PERM_BITS = {"r": 1, "w": 2, "d": 4, "a": 8}
+
+
+def parse_perms(perm_str: str | None) -> int:
+    """Convert a permission string like 'rwd' into a bitmask. Empty/None = 0."""
+    if not perm_str:
+        return 0
+    mask = 0
+    for ch in perm_str.lower():
+        mask |= _PERM_BITS.get(ch, 0)
+    return mask
+
+
+def format_perms(mask: int) -> str:
+    """Convert a permission bitmask back into a string like 'rwd'."""
+    return "".join(ch for ch, bit in _PERM_BITS.items() if mask & bit)
+
+
+# Pattern 0 v2 cart-type marker (Andy 2026-05-12). Mempack-shaped carts have
+# cart_type="agent-memory" and reserve pattern index 1 ("Pattern I") for the
+# agent's behavioral instructions. Other types are treated as knowledge carts.
+CART_TYPE_KNOWLEDGE = "knowledge"
+CART_TYPE_AGENT_MEMORY = "agent-memory"
+PATTERN_I_IDX = 1  # The reserved slot for Pattern I in agent-memory carts
+
+
+def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
+                  briefing: str | None = None,
+                  owner_id: str | None = None,
+                  owner_perms: str | None = None,
+                  group_perms: str | None = None,
+                  world_perms: str | None = None,
+                  group_id: str | None = None,
+                  max_patterns: int | None = None,
+                  cart_type: str | None = None):
+    """Save integrity manifest alongside cartridge.
+
+    Pattern 0 v2 fields (Andy 2026-05-12) — see docs/RFC/pattern-0-v2-spec.md:
+      briefing      — UTF-8 text presented to agents on mount (Phase 1)
+      owner_id      — agent or user ID that owns this cart (Phase 2)
+      owner_perms   — string of {r,w,d,a} flags for the owner
+      group_perms   — flags for group members (if group_id set)
+      world_perms   — flags for everyone else
+      group_id      — team/org identifier; pairs with group_perms
+      max_patterns  — capacity limit (0 or omitted = unlimited)
+
+    All Pattern 0 v2 fields are optional and backward-compatible. Carts without
+    them mount with world_perms=r (treat legacy carts as publicly readable) so
+    existing flows keep working unchanged.
+    """
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     manifest = {
         "version": "mcp-v3",
@@ -129,10 +190,53 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int):
         "fingerprint": compute_fingerprint(embeddings, n_texts),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    # Optional Pattern 0 v2 fields — only emit when caller supplied them so legacy
+    # manifests stay minimal.
+    if briefing:
+        manifest["briefing"] = briefing
+    if owner_id is not None:
+        manifest["owner_id"] = owner_id
+    if owner_perms is not None:
+        manifest["owner_perms"] = owner_perms
+    if group_perms is not None:
+        manifest["group_perms"] = group_perms
+    if world_perms is not None:
+        manifest["world_perms"] = world_perms
+    if group_id is not None:
+        manifest["group_id"] = group_id
+    if max_patterns is not None:
+        manifest["max_patterns"] = int(max_patterns)
+    if cart_type is not None:
+        manifest["cart_type"] = cart_type
+
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
-    log.info(f"Manifest saved: {manifest['fingerprint']} ({n_texts} entries)")
+    extra = []
+    if briefing:
+        extra.append(f"briefing({len(briefing)})")
+    if owner_id is not None:
+        extra.append(f"owner={owner_id}")
+    extra_str = (" +" + " +".join(extra)) if extra else ""
+    log.info(f"Manifest saved: {manifest['fingerprint']} ({n_texts} entries){extra_str}")
     return manifest
+
+
+def load_manifest(cart_path: str) -> dict | None:
+    """Read the manifest sidecar for a cart and return as dict, or None if missing/malformed.
+
+    Used to extract Pattern 0 fields (briefing, eventually ownership, capabilities)
+    on cart mount. Does NOT verify integrity — that's verify_manifest's job. This
+    one is for reading metadata once integrity is established.
+    """
+    manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
+    if not os.path.exists(manifest_path):
+        return None
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning(f"manifest read error for {cart_path}: {e}")
+        return None
 
 
 def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int) -> tuple[bool, str]:
@@ -182,6 +286,15 @@ def _new_session() -> dict:
     return {
         "cartridge_name": None,
         "cartridge_path": None,
+        "briefing": None,         # Pattern 0 v2 Phase 1 — cart's agent-facing introduction
+        # Pattern 0 v2 Phase 2 — ownership/access control. Defaults preserve
+        # legacy behavior: no owner, world readable, no caps.
+        "owner_id": None,
+        "owner_perms": "rwda",
+        "group_perms": "",
+        "world_perms": "r",       # legacy carts treated as world-readable
+        "group_id": None,
+        "max_patterns": 0,        # 0 = unlimited
         "embeddings": None,       # (N, 768) float32
         "texts": [],              # list[str]
         "binary_corpus": None,    # (N, 768) uint8 — sign_zero encoding for Hamming search
@@ -394,6 +507,68 @@ def init_gpu():
 # ============================================================
 # CARTRIDGE I/O
 # ============================================================
+
+def find_mempacks(owner_id: str | None = None) -> list[dict]:
+    """Walk MEMPACK_BASE_DIR recursively for per-user .cart.npz Mempacks.
+
+    Separate from find_cartridges so the public catalog stays clean and per-user
+    discovery is opt-in. If owner_id is supplied, only return Mempacks under that
+    user's directory; otherwise return all (admin/debug use).
+
+    Returns the same shape as find_cartridges entries, plus owner_id pulled
+    from the directory layout. Each Mempack's manifest sidecar holds the
+    authoritative ownership block (Pattern 0 Phase 2).
+    """
+    results = []
+    if not os.path.isdir(MEMPACK_BASE_DIR):
+        return results
+    base_real = os.path.realpath(MEMPACK_BASE_DIR)
+
+    if owner_id is not None:
+        if not _UUID_RE.match(owner_id):
+            return results  # bad input -> empty, not error
+        user_dirs = [os.path.join(MEMPACK_BASE_DIR, owner_id)]
+    else:
+        user_dirs = [
+            os.path.join(MEMPACK_BASE_DIR, d)
+            for d in os.listdir(MEMPACK_BASE_DIR)
+            if _UUID_RE.match(d) and os.path.isdir(os.path.join(MEMPACK_BASE_DIR, d))
+        ]
+
+    for user_dir in user_dirs:
+        if not os.path.isdir(user_dir):
+            continue
+        # path-traversal defense: resolved user_dir must be under the resolved base
+        try:
+            user_real = os.path.realpath(user_dir)
+            if not (user_real == base_real or user_real.startswith(base_real + os.sep)):
+                log.warning(f"find_mempacks: rejected {user_dir} (escapes base)")
+                continue
+        except OSError:
+            continue
+
+        this_uid = os.path.basename(user_dir)
+        for f in os.listdir(user_dir):
+            if f.endswith("_signatures.npz") or f.endswith("_brain.npy") or f.endswith("_manifest.json"):
+                continue
+            if not (f.endswith(".cart.npz") or f.endswith(".pkl") or f.endswith(".npz")):
+                continue
+            name = f.replace(".cart.npz", "").replace(".pkl", "").replace(".npz", "")
+            path = os.path.join(user_dir, f)
+            try:
+                size_mb = os.path.getsize(path) / (1024 * 1024)
+            except OSError:
+                continue
+            results.append({
+                "name": name,
+                "path": path,
+                "owner_id": this_uid,
+                "format": "npz" if f.endswith(".npz") else "pkl",
+                "size_mb": round(size_mb, 1),
+                "has_manifest": os.path.exists(os.path.join(user_dir, f"{name}_manifest.json")),
+            })
+    return results
+
 
 def find_cartridges() -> list[dict]:
     """Scan cartridge directories for available .pkl and .npz cartridge files."""
@@ -1292,6 +1467,21 @@ async def rest_status(request: Request) -> JSONResponse:
         return JSONResponse({
             "status": "ok",
             "cartridge": state["cartridge_name"],
+            "briefing": state.get("briefing"),  # Pattern 0 v2 Phase 1
+            # Pattern 0 v2 Phase 2 — ownership block. owner_id None = legacy cart.
+            "owner_id": state.get("owner_id"),
+            "owner_perms": state.get("owner_perms"),
+            "group_perms": state.get("group_perms"),
+            "world_perms": state.get("world_perms"),
+            "group_id": state.get("group_id"),
+            "max_patterns": state.get("max_patterns"),
+            # Mempack — cart_type and Pattern I presence flag
+            "cart_type": state.get("cart_type"),
+            "has_pattern_i": (
+                state.get("cart_type") == CART_TYPE_AGENT_MEMORY
+                and state.get("texts") is not None
+                and len(state["texts"]) > PATTERN_I_IDX
+            ),
             "memories": n,
             "gpu": _gpu_state["available"],
             "hamming": state["binary_corpus"] is not None,
@@ -2448,6 +2638,30 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
         state["per_pattern_meta"] = data.get("per_pattern_meta")
         state["modified"] = False
 
+        # Pattern 0 v2 (Andy 2026-05-12): extract briefing + ownership block + cart
+        # type from manifest sidecar. Defaults preserve legacy behavior (world-
+        # readable, no owner, no caps, knowledge type). See pattern-0-v2-spec.md.
+        _manifest = load_manifest(cart["path"])
+        if _manifest:
+            state["briefing"] = _manifest.get("briefing")
+            state["owner_id"] = _manifest.get("owner_id")
+            state["owner_perms"] = _manifest.get("owner_perms", "rwda")
+            state["group_perms"] = _manifest.get("group_perms", "")
+            state["world_perms"] = _manifest.get("world_perms", "r")
+            state["group_id"] = _manifest.get("group_id")
+            state["max_patterns"] = int(_manifest.get("max_patterns", 0) or 0)
+            state["cart_type"] = _manifest.get("cart_type", CART_TYPE_KNOWLEDGE)
+        else:
+            # Legacy cart with no manifest at all — assume world-readable knowledge.
+            state["briefing"] = None
+            state["owner_id"] = None
+            state["owner_perms"] = "rwda"
+            state["group_perms"] = ""
+            state["world_perms"] = "r"
+            state["group_id"] = None
+            state["max_patterns"] = 0
+            state["cart_type"] = CART_TYPE_KNOWLEDGE
+
         # Sign-zero binary corpus for Hamming search
         # Priority: pre-computed sign_bits > computed from embeddings > None
         if "sign_bits" in data and data["sign_bits"] is not None:
@@ -2513,7 +2727,28 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
 
         state["mount_count"] = state.get("mount_count", 0) + 1
         _log_activity(session_id, "mount", cart['name'], elapsed_ms)
-        return f"Mounted '{cart['name']}': {n} memories, {dim}-dim, {data['format'].upper()}, integrity={verify_msg}{gpu_msg}{hippo_msg}. Session: {session_id}"
+        result = (
+            f"Mounted '{cart['name']}': {n} memories, {dim}-dim, "
+            f"{data['format'].upper()}, integrity={verify_msg}{gpu_msg}{hippo_msg}. "
+            f"Session: {session_id}"
+        )
+        # Pattern 0 v2 Phase 1: surface the cart's briefing to the agent on
+        # mount. Agents see the introduction immediately without needing a
+        # separate get_status call. None for legacy carts; no change to output.
+        if state.get("briefing"):
+            result += f"\n\n--- CART BRIEFING ---\n{state['briefing']}\n--- END BRIEFING ---"
+        # Pattern I (= Pattern 1) for Mempack-shaped carts: surface the agent's
+        # behavioral text on mount so it bootstraps from the cart it's standing
+        # in. Only fires for cart_type == agent-memory; ordinary knowledge carts
+        # don't have a reserved Pattern I.
+        if state.get("cart_type") == CART_TYPE_AGENT_MEMORY and len(texts) > PATTERN_I_IDX:
+            pattern_i_text = texts[PATTERN_I_IDX]
+            if pattern_i_text:
+                result += (
+                    f"\n\n--- PATTERN I (your behavior, idx={PATTERN_I_IDX}) ---\n"
+                    f"{pattern_i_text}\n--- END PATTERN I ---"
+                )
+        return result
 
     except PermissionError as e:
         log.error(f"Security block: {e}")
@@ -2702,6 +2937,44 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
     except Exception as e:
         log.error(f"Search error: {e}")
         return f"Search error: {e}"
+
+
+@mcp.tool()
+def mempack_read_pattern_i(session_id: str = "") -> str:
+    """Read Pattern I (agent behavior) from the currently mounted Mempack.
+
+    Pattern I is reserved at index 1 of any cart with cart_type='agent-memory'.
+    Returns the text content of that pattern, or an explanatory message if the
+    mounted cart isn't a Mempack or doesn't yet have Pattern I populated.
+
+    Use this when you first mount a Mempack to load your behavioral instructions
+    into context. Re-read periodically across long sessions to refresh.
+
+    Args:
+        session_id: Session identifier (uses default session if empty).
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+
+    if state["cartridge_name"] is None:
+        return "No cartridge mounted. Use mount_cartridge first."
+
+    if state.get("cart_type") != CART_TYPE_AGENT_MEMORY:
+        return (
+            f"This cart is type '{state.get('cart_type', 'knowledge')}', not a "
+            f"Mempack (cart_type='agent-memory'). Pattern I only exists in "
+            f"agent-memory carts."
+        )
+
+    texts = state.get("texts") or []
+    if len(texts) <= PATTERN_I_IDX:
+        return (
+            f"Mempack has no Pattern I yet — cart has {len(texts)} pattern(s), "
+            f"index {PATTERN_I_IDX} is empty. Use the upcoming "
+            f"mempack_update_pattern_i tool to populate it."
+        )
+
+    return texts[PATTERN_I_IDX]
 
 
 @mcp.tool()
@@ -3698,6 +3971,282 @@ def _setup_http_middleware(api_key: str | None):
         log.info("HTTP middleware: auth (Bearer token) + rate limiting enabled")
     else:
         log.info("HTTP middleware: rate limiting enabled (no auth — set MEMBOT_API_KEY to require)")
+
+
+# ============================================================
+# MEMPACK ENDPOINTS (Andy 2026-05-12)
+# ============================================================
+# Per-user writable carts. Pattern 0 in manifest sidecar, Pattern I at idx=1.
+# Storage: cartridges/users/<owner_id>/<name>.cart.npz
+# Discovery: find_mempacks(owner_id) walks MEMPACK_BASE_DIR recursively.
+# Auth model (MVP): existing write API key required; owner_id passed in body.
+# Long-term: verify Supabase JWT directly, derive owner_id from `sub` claim.
+
+_DEFAULT_PATTERN_I_TEMPLATE = """# Pattern I — Default Mempack Behavior
+
+You are an AI agent using a Mempack provisioned for {owner_id_short}.
+
+## Identity
+- Bound to user: {owner_id}
+- Created: {created_at}
+- Mempack version: 1.0
+
+## Behavior
+- Read this Pattern I first on every session to remind yourself who you are.
+- Store findings worth keeping into your Mempack via `memory_store`.
+- Update this Pattern I (re-write idx=1) as your behavior evolves over time.
+- Search your Mempack before falling back to external sources.
+
+## Specialization
+(none yet — accumulates with use)
+
+## Active threads
+(none yet — track in-flight investigations here so they survive across sessions)
+"""
+
+_DEFAULT_BRIEFING_TEMPLATE = (
+    "This is {owner_id_short}'s personal Mempack — a writable cart at "
+    "cartridges/users/{owner_id}/{name}.cart.npz. Pattern 0 (this manifest) holds "
+    "ownership/perms/cart-type metadata. Pattern I (idx=1) holds the agent's "
+    "behavioral instructions; read it first on every session. Patterns 2+ are "
+    "accumulated findings. Add new content via memory_store; update Pattern I "
+    "to reflect evolved behavior. cart_type='agent-memory'."
+)
+
+
+@mcp.custom_route("/api/mempack/create", methods=["POST", "OPTIONS"])
+async def rest_mempack_create(request: Request) -> JSONResponse:
+    """Provision a new Mempack for a user.
+
+    Body:
+        name        (str, required)  cart name (e.g. "primary")
+        owner_id    (str, required)  Supabase user UUID
+        briefing    (str, optional)  override default briefing template
+        pattern_i   (str, optional)  override default Pattern I template
+
+    Creates cartridges/users/<owner_id>/<name>.cart.npz with two starter
+    patterns: idx=0 = marker, idx=1 = Pattern I (behavioral text). Manifest
+    carries cart_type='agent-memory', owner_id, owner_perms='rwda', plus the
+    briefing.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    if _server_config.get("read_only"):
+        return JSONResponse(
+            {"status": "error", "error": "Server is read-only; cannot create Mempacks."},
+            status_code=403, headers=_cors_headers(),
+        )
+    try:
+        data = await request.json()
+        name = data.get("name", "")
+        owner_id = data.get("owner_id", "")
+
+        if not name:
+            return JSONResponse({"status": "error", "error": "name required"},
+                                status_code=400, headers=_cors_headers())
+        if not owner_id or not _UUID_RE.match(owner_id):
+            return JSONResponse({"status": "error", "error": "owner_id must be a UUID"},
+                                status_code=400, headers=_cors_headers())
+        try:
+            clean_name = sanitize_name(name)
+        except ValueError as e:
+            return JSONResponse({"status": "error", "error": str(e)},
+                                status_code=400, headers=_cors_headers())
+
+        user_dir = os.path.join(MEMPACK_BASE_DIR, owner_id)
+        os.makedirs(user_dir, exist_ok=True)
+        cart_path = os.path.join(user_dir, f"{clean_name}.cart.npz")
+
+        if os.path.exists(cart_path):
+            return JSONResponse(
+                {"status": "error", "error": f"Mempack '{clean_name}' already exists for this user."},
+                status_code=409, headers=_cors_headers(),
+            )
+
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        owner_id_short = owner_id[:8]
+
+        briefing = data.get("briefing") or _DEFAULT_BRIEFING_TEMPLATE.format(
+            owner_id=owner_id, owner_id_short=owner_id_short, name=clean_name,
+        )
+        pattern_i_text = data.get("pattern_i") or _DEFAULT_PATTERN_I_TEMPLATE.format(
+            owner_id=owner_id, owner_id_short=owner_id_short, created_at=created_at,
+        )
+        # idx=0 = short marker; the manifest carries the real Pattern 0 metadata.
+        idx0_marker = (
+            f"Mempack header — Pattern 0 manifest in {clean_name}_manifest.json sidecar. "
+            f"Pattern I (agent behavior) at idx=1. owner_id={owner_id}."
+        )
+
+        texts = [idx0_marker, pattern_i_text]
+        embeddings = np.stack([
+            embed_text(idx0_marker, prefix="search_document"),
+            embed_text(pattern_i_text, prefix="search_document"),
+        ]).astype(np.float32)
+
+        save_as_npz(cart_path, embeddings, texts)
+        save_manifest(
+            cart_path, embeddings, len(texts),
+            briefing=briefing,
+            owner_id=owner_id,
+            owner_perms="rwda",     # owner has full control over their Mempack
+            group_perms="",
+            world_perms="",         # private by default
+            cart_type=CART_TYPE_AGENT_MEMORY,
+        )
+
+        size_mb = os.path.getsize(cart_path) / (1024 * 1024)
+        log.info(f"Mempack created: {cart_path} ({size_mb:.2f} MB) owner={owner_id}")
+        return JSONResponse({
+            "status": "ok",
+            "name": clean_name,
+            "owner_id": owner_id,
+            "path": cart_path,
+            "size_mb": round(size_mb, 2),
+            "cart_type": CART_TYPE_AGENT_MEMORY,
+            "briefing": briefing,
+            "pattern_i": pattern_i_text,
+        }, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/mempack/create error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/mempacks", methods=["GET", "OPTIONS"])
+async def rest_mempacks_list(request: Request) -> JSONResponse:
+    """List Mempacks for a given owner_id (query param) or all (no param, admin use)."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        owner_id = request.query_params.get("owner_id", "") or None
+        if owner_id is not None and not _UUID_RE.match(owner_id):
+            return JSONResponse(
+                {"status": "error", "error": "owner_id must be a UUID"},
+                status_code=400, headers=_cors_headers(),
+            )
+        mempacks = find_mempacks(owner_id=owner_id)
+        return JSONResponse({
+            "status": "ok",
+            "count": len(mempacks),
+            "mempacks": mempacks,
+        }, headers=_cors_headers())
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/copy", methods=["POST", "OPTIONS"])
+async def rest_copy(request: Request) -> JSONResponse:
+    """Copy a passage from any mounted cart into the user's Mempack.
+
+    Body:
+        src_cart    (str, required)  source cart name (must be findable)
+        src_idx     (int, required)  passage index in src_cart
+        dst_path    (str, required)  destination Mempack absolute path
+                                     (typically cartridges/users/<uid>/<name>.cart.npz)
+        note        (str, optional)  free-text reason ("why I kept this")
+
+    Embeds the copied passage in the destination Mempack with provenance
+    metadata appended to the text body so future searches preserve attribution.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    if _server_config.get("read_only"):
+        return JSONResponse(
+            {"status": "error", "error": "Server is read-only; cannot copy."},
+            status_code=403, headers=_cors_headers(),
+        )
+    try:
+        data = await request.json()
+        src_cart_name = data.get("src_cart", "")
+        src_idx = int(data.get("src_idx", -1))
+        dst_path = data.get("dst_path", "")
+        note = data.get("note", "")
+
+        if not src_cart_name or src_idx < 0 or not dst_path:
+            return JSONResponse(
+                {"status": "error", "error": "src_cart + src_idx + dst_path all required"},
+                status_code=400, headers=_cors_headers(),
+            )
+
+        # Resolve src
+        carts = find_cartridges() + find_mempacks()
+        src_match = [c for c in carts if c["name"] == src_cart_name]
+        if not src_match:
+            return JSONResponse(
+                {"status": "error", "error": f"src_cart '{src_cart_name}' not found"},
+                status_code=404, headers=_cors_headers(),
+            )
+        src_path = src_match[0]["path"]
+        src_data = load_cartridge_safe(src_path)
+        src_texts = src_data["texts"]
+        if src_idx >= len(src_texts):
+            return JSONResponse(
+                {"status": "error", "error": f"src_idx {src_idx} out of range (cart has {len(src_texts)} patterns)"},
+                status_code=400, headers=_cors_headers(),
+            )
+        src_text = src_texts[src_idx]
+
+        # Resolve dst (must exist and be a Mempack — defense against arbitrary path writes)
+        dst_real = os.path.realpath(dst_path)
+        base_real = os.path.realpath(MEMPACK_BASE_DIR)
+        if not dst_real.startswith(base_real + os.sep):
+            return JSONResponse(
+                {"status": "error", "error": "dst_path must be under MEMPACK_BASE_DIR"},
+                status_code=403, headers=_cors_headers(),
+            )
+        if not os.path.exists(dst_path):
+            return JSONResponse(
+                {"status": "error", "error": f"dst Mempack not found at {dst_path}"},
+                status_code=404, headers=_cors_headers(),
+            )
+
+        # Load destination cart, append the new pattern with provenance, save back
+        dst_data = load_cartridge_safe(dst_path)
+        dst_texts = list(dst_data["texts"])
+        dst_embeddings = dst_data["embeddings"]
+
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        provenance_footer = (
+            f"\n\n---\n[provenance] from {src_cart_name}#{src_idx} on {timestamp}"
+            + (f" — {note}" if note else "")
+        )
+        new_text = src_text + provenance_footer
+        new_embedding = embed_text(new_text, prefix="search_document").astype(np.float32)
+
+        dst_texts.append(new_text)
+        new_embeddings = np.vstack([dst_embeddings, new_embedding[None, :]])
+
+        save_as_npz(dst_path, new_embeddings, dst_texts)
+
+        # Re-save manifest preserving Pattern 0 fields
+        dst_manifest = load_manifest(dst_path) or {}
+        save_manifest(
+            dst_path, new_embeddings, len(dst_texts),
+            briefing=dst_manifest.get("briefing"),
+            owner_id=dst_manifest.get("owner_id"),
+            owner_perms=dst_manifest.get("owner_perms"),
+            group_perms=dst_manifest.get("group_perms"),
+            world_perms=dst_manifest.get("world_perms"),
+            group_id=dst_manifest.get("group_id"),
+            max_patterns=dst_manifest.get("max_patterns"),
+            cart_type=dst_manifest.get("cart_type"),
+        )
+
+        log.info(f"Copy: {src_cart_name}#{src_idx} -> {dst_path} (now {len(dst_texts)} patterns)")
+        return JSONResponse({
+            "status": "ok",
+            "src_cart": src_cart_name,
+            "src_idx": src_idx,
+            "dst_path": dst_path,
+            "dst_new_idx": len(dst_texts) - 1,
+            "preview": new_text[:200],
+        }, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/copy error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
 
 
 # ============================================================

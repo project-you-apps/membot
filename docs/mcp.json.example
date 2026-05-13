@@ -1,0 +1,33 @@
+{
+  "_comment_1": "Membot MCP server config template. Drop the 'mcpServers' entry into your MCP-aware host's config (Claude Code: .mcp.json or ~/.claude/mcp.json; Cursor: ~/.cursor/mcp.json; Windsurf: ~/.codeium/windsurf/mcp_config.json).",
+  "_comment_2": "Read access (port 8000) requires no API key. Write access (port 8040) requires an X-API-Key header — talk to your operator.",
+
+  "mcpServers": {
+
+    "membot": {
+      "_comment": "Read-only Membot. List/mount/search the public hosted cartridges. No auth required.",
+      "type": "sse",
+      "url": "http://137.184.227.79:8000/sse"
+    },
+
+    "membot-write": {
+      "_comment": "Writable Membot. memory_store + memory_save endpoints. Replace <YOUR-API-KEY> with the key your operator gave you. Comment out this block if you don't need write access.",
+      "type": "sse",
+      "url": "http://137.184.227.79:8040/sse",
+      "headers": {
+        "X-API-Key": "<YOUR-API-KEY>"
+      }
+    }
+
+  },
+
+  "_post_setup_steps": [
+    "1. Restart your MCP-aware host so it picks up the new config.",
+    "2. Verify the tools are available — typically membot.list_cartridges, membot.mount_cartridge, membot.memory_search, membot.get_status.",
+    "3. Call membot.list_cartridges to confirm connectivity. If you see a list of carts (gutenberg-classics, neuroscience-and-AI-papers, etc.), you're connected.",
+    "4. Mount a cart: membot.mount_cartridge name='neuroscience-and-AI-papers'",
+    "5. Search it: membot.memory_search query='your query here' top_k=5",
+    "6. (Optional) If you have an API key, call membot-write.memory_store content='...' to test write access.",
+    "See AGENT_INSTRUCTIONS.md in this directory for the full agent-facing workflow."
+  ]
+}
