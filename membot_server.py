@@ -559,13 +559,21 @@ def find_mempacks(owner_id: str | None = None) -> list[dict]:
                 size_mb = os.path.getsize(path) / (1024 * 1024)
             except OSError:
                 continue
+            # save_manifest uses cart_path.rsplit(".", 1)[0] + "_manifest.json",
+            # which preserves the ".cart" middle-extension for .cart.npz files.
+            # Check both filename patterns for robustness.
+            manifest_candidates = [
+                os.path.join(user_dir, f"{name}.cart_manifest.json"),
+                os.path.join(user_dir, f"{name}_manifest.json"),
+            ]
+            has_manifest = any(os.path.exists(p) for p in manifest_candidates)
             results.append({
                 "name": name,
                 "path": path,
                 "owner_id": this_uid,
                 "format": "npz" if f.endswith(".npz") else "pkl",
                 "size_mb": round(size_mb, 1),
-                "has_manifest": os.path.exists(os.path.join(user_dir, f"{name}_manifest.json")),
+                "has_manifest": has_manifest,
             })
     return results
 
@@ -2606,6 +2614,20 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
 
     if not match:
         match = [c for c in carts if clean_name.lower() in c["name"].lower()]
+
+    # Mempack fallback (Andy 2026-05-12): if the standard catalog doesn't have
+    # this name, check user-segmented Mempacks. Exact-name match only here —
+    # substring matching against Mempacks risks cross-user collision.
+    if not match:
+        mempacks = find_mempacks()
+        mempack_match = [m for m in mempacks if m["name"] == clean_name]
+        if len(mempack_match) > 1:
+            owners = ", ".join(m.get("owner_id", "?")[:8] for m in mempack_match)
+            return (
+                f"Multiple Mempacks named '{clean_name}' across users ({owners}). "
+                f"Pass the cart's full path or specify owner_id to disambiguate."
+            )
+        match = mempack_match
 
     if not match:
         available = ", ".join(c["name"] for c in carts[:10])
