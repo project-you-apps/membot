@@ -508,74 +508,116 @@ def init_gpu():
 # CARTRIDGE I/O
 # ============================================================
 
+# Local cache for Mempack blobs fetched from Supabase Storage.
+# Files are downloaded on mount and overwritten on subsequent mounts.
+MEMPACK_CACHE_DIR = os.path.join("/tmp", "mempack_cache")
+os.makedirs(MEMPACK_CACHE_DIR, exist_ok=True)
+
+
+def _supabase_available() -> bool:
+    """Cheap check: is Supabase configured? Caches result to avoid repeated env hits."""
+    return bool(os.environ.get("SUPABASE_URL")) and bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
+
+
 def find_mempacks(owner_id: str | None = None) -> list[dict]:
-    """Walk MEMPACK_BASE_DIR recursively for per-user .cart.npz Mempacks.
+    """Return Mempacks for an owner from Supabase (cold-cut from filesystem 2026-05-13).
 
-    Separate from find_cartridges so the public catalog stays clean and per-user
-    discovery is opt-in. If owner_id is supplied, only return Mempacks under that
-    user's directory; otherwise return all (admin/debug use).
+    Mempacks now live as rows in `public.mempacks` + blobs in Supabase Storage
+    (bucket: `mempacks`). The filesystem path under MEMPACK_BASE_DIR is no
+    longer authoritative; the function returns the local CACHE path where the
+    blob will be downloaded on mount.
 
-    Returns the same shape as find_cartridges entries, plus owner_id pulled
-    from the directory layout. Each Mempack's manifest sidecar holds the
-    authoritative ownership block (Pattern 0 Phase 2).
+    Args:
+        owner_id: Supabase user UUID. If None, returns all Mempacks (admin/debug).
+
+    Returns: list of dicts shaped to match the previous filesystem walker:
+      name, path (eventual local cache path under MEMPACK_CACHE_DIR), owner_id,
+      format, size_mb, has_manifest. Plus new fields: mempack_id, storage_status,
+      cart_type, pattern_count.
     """
+    if owner_id is not None and not _UUID_RE.match(owner_id):
+        return []  # bad input -> empty, not error
+
+    if not _supabase_available():
+        log.warning("find_mempacks: SUPABASE env vars missing; returning empty")
+        return []
+
+    try:
+        import supabase_storage as sbs
+    except ImportError as e:
+        log.error(f"find_mempacks: supabase_storage import failed: {e}")
+        return []
+
+    try:
+        if owner_id:
+            rows = sbs.list_mempacks(owner_id)
+        else:
+            # Admin/debug: list everyone's Mempacks
+            sb = sbs.get_client()
+            res = sb.table("mempacks").select("*").execute()
+            rows = res.data or []
+    except Exception as e:
+        log.error(f"find_mempacks: Supabase query failed: {e}")
+        return []
+
     results = []
-    if not os.path.isdir(MEMPACK_BASE_DIR):
-        return results
-    base_real = os.path.realpath(MEMPACK_BASE_DIR)
-
-    if owner_id is not None:
-        if not _UUID_RE.match(owner_id):
-            return results  # bad input -> empty, not error
-        user_dirs = [os.path.join(MEMPACK_BASE_DIR, owner_id)]
-    else:
-        user_dirs = [
-            os.path.join(MEMPACK_BASE_DIR, d)
-            for d in os.listdir(MEMPACK_BASE_DIR)
-            if _UUID_RE.match(d) and os.path.isdir(os.path.join(MEMPACK_BASE_DIR, d))
-        ]
-
-    for user_dir in user_dirs:
-        if not os.path.isdir(user_dir):
-            continue
-        # path-traversal defense: resolved user_dir must be under the resolved base
-        try:
-            user_real = os.path.realpath(user_dir)
-            if not (user_real == base_real or user_real.startswith(base_real + os.sep)):
-                log.warning(f"find_mempacks: rejected {user_dir} (escapes base)")
-                continue
-        except OSError:
-            continue
-
-        this_uid = os.path.basename(user_dir)
-        for f in os.listdir(user_dir):
-            if f.endswith("_signatures.npz") or f.endswith("_brain.npy") or f.endswith("_manifest.json"):
-                continue
-            if not (f.endswith(".cart.npz") or f.endswith(".pkl") or f.endswith(".npz")):
-                continue
-            name = f.replace(".cart.npz", "").replace(".pkl", "").replace(".npz", "")
-            path = os.path.join(user_dir, f)
-            try:
-                size_mb = os.path.getsize(path) / (1024 * 1024)
-            except OSError:
-                continue
-            # save_manifest uses cart_path.rsplit(".", 1)[0] + "_manifest.json",
-            # which preserves the ".cart" middle-extension for .cart.npz files.
-            # Check both filename patterns for robustness.
-            manifest_candidates = [
-                os.path.join(user_dir, f"{name}.cart_manifest.json"),
-                os.path.join(user_dir, f"{name}_manifest.json"),
-            ]
-            has_manifest = any(os.path.exists(p) for p in manifest_candidates)
-            results.append({
-                "name": name,
-                "path": path,
-                "owner_id": this_uid,
-                "format": "npz" if f.endswith(".npz") else "pkl",
-                "size_mb": round(size_mb, 1),
-                "has_manifest": has_manifest,
-            })
+    for row in rows:
+        mempack_id = row["id"]
+        size_bytes = row.get("size_bytes") or 0
+        manifest = row.get("manifest") or {}
+        results.append({
+            "name":           row["name"],
+            "path":           os.path.join(MEMPACK_CACHE_DIR, f"{mempack_id}.cart.npz"),
+            "owner_id":       row["user_id"],
+            "format":         "npz",
+            "size_mb":        round(size_bytes / (1024 * 1024), 2),
+            "has_manifest":   bool(manifest),
+            "mempack_id":     mempack_id,
+            "storage_status": row.get("storage_status"),
+            "cart_type":      row.get("cart_type") or CART_TYPE_AGENT_MEMORY,
+            "pattern_count":  row.get("pattern_count", 0),
+            # Manifest fields surfaced for mount-time state population
+            "briefing":       row.get("briefing") or manifest.get("briefing"),
+            "owner_perms":    manifest.get("owner_perms", "rwda"),
+            "group_perms":    manifest.get("group_perms", ""),
+            "world_perms":    manifest.get("world_perms", ""),
+            "group_id":       manifest.get("group_id"),
+            "max_patterns":   int(manifest.get("max_patterns", 0) or 0),
+        })
     return results
+
+
+def _ensure_mempack_cached(mempack: dict) -> str:
+    """Download Mempack blob from Supabase Storage to local cache if not present.
+
+    Args:
+        mempack: dict from find_mempacks() with owner_id, name, mempack_id, path
+
+    Returns: local cache path (mempack["path"]).
+
+    Raises: RuntimeError if Supabase fetch fails.
+    """
+    import supabase_storage as sbs
+    cache_path = mempack["path"]
+
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        return cache_path
+
+    owner_id = mempack["owner_id"]
+    name = mempack["name"]
+    log.info(f"Fetching Mempack blob from Supabase: {owner_id}/{name}.cart.npz")
+    try:
+        blob_bytes = sbs.download_blob(owner_id, name)
+    except Exception as e:
+        raise RuntimeError(f"failed to fetch Mempack blob {owner_id}/{name}: {e}") from e
+
+    if not blob_bytes:
+        raise RuntimeError(f"empty blob returned for {owner_id}/{name}")
+
+    with open(cache_path, "wb") as f:
+        f.write(blob_bytes)
+    log.info(f"Mempack cached: {cache_path} ({len(blob_bytes)} bytes)")
+    return cache_path
 
 
 def find_cartridges() -> list[dict]:
@@ -774,7 +816,10 @@ def load_npz_cartridge(path: str) -> dict:
         else:
             log.warning("[HIPPO] No linked entries found in first 20 hippocampus records!")
     else:
-        log.info(f"[HIPPO] No hippocampus key in NPZ. Keys present: {list(data.keys())}")
+        # Expected for Supabase-backed Mempacks (H-block array lives in the
+        # mempack_patterns Postgres rows, not in the NPZ blob) and for legacy
+        # carts that pre-date the hippocampus array. Not an error condition.
+        log.debug(f"[HIPPO] No hippocampus array in NPZ (Mempack-style: H-blocks in Postgres). Keys: {list(data.keys())}")
         result["hippocampus"] = None
 
     # Load per-pattern structured metadata (federate-v1+ format; used by
@@ -863,8 +908,10 @@ def load_signatures(path: str) -> dict:
     return result
 
 
-# --- Hippocampus metadata struct (matches cartridge_builder.py) ---
-_HIPPO_FORMAT = '<I B B I I I I H I B 35s'
+# --- Hippocampus (H-block) metadata struct (matches cartridge_builder.py) ---
+# Canonical 12-field format with perms_byte at offset 29. Migrated from legacy
+# 11-field on 2026-05-13. See docs/PATTERN-ANATOMY.md §3 for spec.
+_HIPPO_FORMAT = '<I B B I I I I H I B B 34s'
 _HIPPO_SIZE = 64
 
 def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
@@ -875,7 +922,8 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
 
     Returns:
         List of dicts with: pattern_id, format_version, cartridge_type,
-        prev, next, sibling, source_hash, sequence_num, timestamp, flags
+        prev, next, sibling, source_hash, sequence_num, timestamp, flags,
+        perms_byte (canonical format only)
     """
     result = []
     for row in raw:
@@ -891,6 +939,7 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
             "sequence_num":   vals[7],
             "timestamp":      vals[8],
             "flags":          vals[9],
+            "perms_byte":     vals[10],
         })
     return result
 
@@ -2635,6 +2684,16 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
 
     cart = match[0]
 
+    # Mempack mount: fetch blob from Supabase Storage to local cache before
+    # the load infrastructure tries to read from disk. Detected by presence
+    # of `mempack_id` on the cart dict (find_mempacks adds this).
+    if cart.get("mempack_id"):
+        try:
+            _ensure_mempack_cached(cart)
+        except Exception as e:
+            log.error(f"mount_cartridge: Mempack fetch failed: {e}")
+            return f"Failed to fetch Mempack '{cart['name']}' from Supabase: {e}"
+
     try:
         t0 = time.time()
         data = load_cartridge_safe(cart["path"])
@@ -2645,11 +2704,16 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
         if len(texts) > MAX_ENTRIES:
             return f"Cartridge too large: {len(texts)} entries exceeds limit of {MAX_ENTRIES}."
 
-        # Verify integrity
-        ok, verify_msg = verify_manifest(cart["path"], embeddings, len(texts))
-        if not ok:
-            log.error(f"INTEGRITY CHECK FAILED for {cart['name']}: {verify_msg}")
-            return f"SECURITY: Cartridge '{cart['name']}' failed integrity check: {verify_msg}. Refusing to mount."
+        # Verify integrity — Mempacks skip the sidecar-based check since the
+        # Supabase row is the authoritative integrity source (no manifest file
+        # exists on disk for Supabase-backed Mempacks; cold-cut 2026-05-13).
+        if cart.get("mempack_id"):
+            verify_msg = "mempack (Supabase row authoritative)"
+        else:
+            ok, verify_msg = verify_manifest(cart["path"], embeddings, len(texts))
+            if not ok:
+                log.error(f"INTEGRITY CHECK FAILED for {cart['name']}: {verify_msg}")
+                return f"SECURITY: Cartridge '{cart['name']}' failed integrity check: {verify_msg}. Refusing to mount."
 
         state["embeddings"] = embeddings
         state["texts"] = texts
@@ -2661,28 +2725,45 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
         state["modified"] = False
 
         # Pattern 0 v2 (Andy 2026-05-12): extract briefing + ownership block + cart
-        # type from manifest sidecar. Defaults preserve legacy behavior (world-
-        # readable, no owner, no caps, knowledge type). See pattern-0-v2-spec.md.
-        _manifest = load_manifest(cart["path"])
-        if _manifest:
-            state["briefing"] = _manifest.get("briefing")
-            state["owner_id"] = _manifest.get("owner_id")
-            state["owner_perms"] = _manifest.get("owner_perms", "rwda")
-            state["group_perms"] = _manifest.get("group_perms", "")
-            state["world_perms"] = _manifest.get("world_perms", "r")
-            state["group_id"] = _manifest.get("group_id")
-            state["max_patterns"] = int(_manifest.get("max_patterns", 0) or 0)
-            state["cart_type"] = _manifest.get("cart_type", CART_TYPE_KNOWLEDGE)
+        # type. Two sources:
+        #   (a) Mempacks: the Supabase row carries briefing + ownership; populated
+        #       on the cart dict by find_mempacks. Manifest sidecar doesn't exist
+        #       on disk for Supabase-backed Mempacks (cold-cut 2026-05-13).
+        #   (b) Knowledge carts: manifest sidecar JSON next to the .cart.npz file.
+        # Defaults preserve legacy behavior (world-readable, no owner, no caps,
+        # knowledge type). See pattern-0-v2-spec.md.
+        if cart.get("mempack_id"):
+            # Mempack: Supabase row is authoritative; cart dict carries fields
+            state["briefing"]     = cart.get("briefing")
+            state["owner_id"]     = cart.get("owner_id")
+            state["owner_perms"]  = cart.get("owner_perms") or "rwda"
+            state["group_perms"]  = cart.get("group_perms") or ""
+            state["world_perms"]  = cart.get("world_perms") or ""
+            state["group_id"]     = cart.get("group_id")
+            state["max_patterns"] = int(cart.get("max_patterns", 0) or 0)
+            state["cart_type"]    = cart.get("cart_type") or CART_TYPE_AGENT_MEMORY
+            state["mempack_id"]   = cart.get("mempack_id")
         else:
-            # Legacy cart with no manifest at all — assume world-readable knowledge.
-            state["briefing"] = None
-            state["owner_id"] = None
-            state["owner_perms"] = "rwda"
-            state["group_perms"] = ""
-            state["world_perms"] = "r"
-            state["group_id"] = None
-            state["max_patterns"] = 0
-            state["cart_type"] = CART_TYPE_KNOWLEDGE
+            _manifest = load_manifest(cart["path"])
+            if _manifest:
+                state["briefing"]     = _manifest.get("briefing")
+                state["owner_id"]     = _manifest.get("owner_id")
+                state["owner_perms"]  = _manifest.get("owner_perms", "rwda")
+                state["group_perms"]  = _manifest.get("group_perms", "")
+                state["world_perms"]  = _manifest.get("world_perms", "r")
+                state["group_id"]     = _manifest.get("group_id")
+                state["max_patterns"] = int(_manifest.get("max_patterns", 0) or 0)
+                state["cart_type"]    = _manifest.get("cart_type", CART_TYPE_KNOWLEDGE)
+            else:
+                # Legacy cart with no manifest at all — assume world-readable knowledge.
+                state["briefing"]     = None
+                state["owner_id"]     = None
+                state["owner_perms"]  = "rwda"
+                state["group_perms"]  = ""
+                state["world_perms"]  = "r"
+                state["group_id"]     = None
+                state["max_patterns"] = 0
+                state["cart_type"]    = CART_TYPE_KNOWLEDGE
 
         # Sign-zero binary corpus for Hamming search
         # Priority: pre-computed sign_bits > computed from embeddings > None
@@ -4027,13 +4108,125 @@ You are an AI agent using a Mempack provisioned for {owner_id_short}.
 """
 
 _DEFAULT_BRIEFING_TEMPLATE = (
-    "This is {owner_id_short}'s personal Mempack — a writable cart at "
-    "cartridges/users/{owner_id}/{name}.cart.npz. Pattern 0 (this manifest) holds "
-    "ownership/perms/cart-type metadata. Pattern I (idx=1) holds the agent's "
-    "behavioral instructions; read it first on every session. Patterns 2+ are "
-    "accumulated findings. Add new content via memory_store; update Pattern I "
-    "to reflect evolved behavior. cart_type='agent-memory'."
+    "This is {owner_id_short}'s personal Mempack — a writable cart stored at "
+    "mempacks/{owner_id}/{name}.cart.npz in Supabase Storage, with metadata in "
+    "the mempacks Postgres table. Pattern 0 (this manifest) holds ownership / "
+    "perms / cart-type metadata. Pattern I (idx=1) holds the agent's behavioral "
+    "instructions; read it first on every session. Patterns 2+ are accumulated "
+    "findings. Add new content via memory_store; update Pattern I to reflect "
+    "evolved behavior. cart_type='agent-memory'."
 )
+
+
+def _build_starter_mempack_bytes(
+    owner_id: str,
+    name: str,
+    briefing: str | None = None,
+    pattern_i_text: str | None = None,
+) -> dict:
+    """Build the bytes + metadata needed to provision a fresh Mempack into Supabase.
+
+    Returns a dict with: blob_bytes, hippocampus_bytes, texts, briefing,
+    pattern_i_text, manifest. Suitable for passing to
+    supabase_storage.auto_provision_primary or to the migration script.
+    """
+    import io
+    import struct as _struct
+    from cartridge_builder import (
+        HIPPO_FORMAT, FLAG_PINNED, FLAG_PERISH_ARCHIVAL,
+        FORMAT_VERSION_CANONICAL, PERM_R, PERM_DEFAULT,
+    )
+
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    owner_id_short = owner_id[:8] if owner_id else "unknown"
+
+    briefing = briefing or _DEFAULT_BRIEFING_TEMPLATE.format(
+        owner_id=owner_id, owner_id_short=owner_id_short, name=name,
+    )
+    pattern_i_text = pattern_i_text or _DEFAULT_PATTERN_I_TEMPLATE.format(
+        owner_id=owner_id, owner_id_short=owner_id_short, created_at=created_at,
+    )
+
+    idx0_marker = (
+        f"Mempack header — Pattern 0 manifest in the mempacks row. "
+        f"Pattern I (agent behavior) at idx=1. owner_id={owner_id}."
+    )
+    texts = [idx0_marker, pattern_i_text]
+
+    # Embed both starter texts using the configured encoder
+    embeddings = np.stack([
+        embed_text(idx0_marker,    prefix="search_document"),
+        embed_text(pattern_i_text, prefix="search_document"),
+    ]).astype(np.float32)
+
+    # Compress texts the same way save_as_npz does, so the blob shape matches
+    # what mount expects to load.
+    compressed_texts = [
+        np.void(zlib.compress(t.encode("utf-8"), level=9)) for t in texts
+    ]
+
+    # Pack the NPZ to bytes in-memory (no filesystem touch)
+    buf = io.BytesIO()
+    np.savez_compressed(
+        buf,
+        embeddings=embeddings,
+        passages=np.array(texts, dtype=object),
+        compressed_texts=np.array(compressed_texts, dtype=object),
+        version="mcp-v3",
+    )
+    blob_bytes = buf.getvalue()
+
+    # Synthesize canonical H-blocks: pinned + archival on both starter patterns.
+    # idx=0 marker is read-only; idx=1 Pattern I is RW so agent can update it.
+    now_ts = int(time.time())
+    h0 = _struct.pack(
+        HIPPO_FORMAT,
+        0,                              # pattern_id (header)
+        FORMAT_VERSION_CANONICAL,
+        1,                              # cartridge_type = 1 = agent-memory
+        0, 1, 0,                        # parent, child=1, sibling
+        0,                              # source_hash (N/A for header)
+        0,                              # sequence_num
+        now_ts,
+        FLAG_PINNED | FLAG_PERISH_ARCHIVAL,
+        PERM_R,
+        b'\x00' * 34,
+    )
+    h1 = _struct.pack(
+        HIPPO_FORMAT,
+        1,                              # pattern_id
+        FORMAT_VERSION_CANONICAL,
+        1,                              # cartridge_type
+        0, 0, 0,                        # parent=0, child=0 (no further patterns yet), sibling
+        0, 1, now_ts,
+        FLAG_PINNED | FLAG_PERISH_ARCHIVAL,
+        PERM_DEFAULT,
+        b'\x00' * 34,
+    )
+    hippocampus_bytes = h0 + h1
+
+    manifest = {
+        "version":      "mcp-v3",
+        "cart_type":    CART_TYPE_AGENT_MEMORY,
+        "owner_id":     owner_id,
+        "name":         name,
+        "owner_perms":  "rwda",
+        "group_perms":  "",
+        "world_perms":  "",
+        "briefing":     briefing,
+        "max_patterns": 0,
+        "created_at":   created_at,
+        "format_version": FORMAT_VERSION_CANONICAL,
+    }
+
+    return {
+        "blob_bytes":       blob_bytes,
+        "hippocampus_bytes": hippocampus_bytes,
+        "texts":            texts,
+        "briefing":         briefing,
+        "pattern_i_text":   pattern_i_text,
+        "manifest":         manifest,
+    }
 
 
 @mcp.custom_route("/api/mempack/create", methods=["POST", "OPTIONS"])
@@ -4053,10 +4246,10 @@ async def rest_mempack_create(request: Request) -> JSONResponse:
     """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
-    if _server_config.get("read_only"):
+    if not _supabase_available():
         return JSONResponse(
-            {"status": "error", "error": "Server is read-only; cannot create Mempacks."},
-            status_code=403, headers=_cors_headers(),
+            {"status": "error", "error": "Mempack backend not configured (SUPABASE env vars missing)."},
+            status_code=503, headers=_cors_headers(),
         )
     try:
         data = await request.json()
@@ -4075,59 +4268,65 @@ async def rest_mempack_create(request: Request) -> JSONResponse:
             return JSONResponse({"status": "error", "error": str(e)},
                                 status_code=400, headers=_cors_headers())
 
-        user_dir = os.path.join(MEMPACK_BASE_DIR, owner_id)
-        os.makedirs(user_dir, exist_ok=True)
-        cart_path = os.path.join(user_dir, f"{clean_name}.cart.npz")
+        import supabase_storage as sbs
 
-        if os.path.exists(cart_path):
+        # Existence check — explicit 409 (auto-provision path uses different endpoint)
+        existing = sbs.get_mempack_by_name(owner_id, clean_name)
+        if existing:
             return JSONResponse(
-                {"status": "error", "error": f"Mempack '{clean_name}' already exists for this user."},
+                {"status": "error", "error": f"Mempack '{clean_name}' already exists for this user.",
+                 "mempack_id": existing["id"]},
                 status_code=409, headers=_cors_headers(),
             )
 
-        created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ")
-        owner_id_short = owner_id[:8]
-
-        briefing = data.get("briefing") or _DEFAULT_BRIEFING_TEMPLATE.format(
-            owner_id=owner_id, owner_id_short=owner_id_short, name=clean_name,
-        )
-        pattern_i_text = data.get("pattern_i") or _DEFAULT_PATTERN_I_TEMPLATE.format(
-            owner_id=owner_id, owner_id_short=owner_id_short, created_at=created_at,
-        )
-        # idx=0 = short marker; the manifest carries the real Pattern 0 metadata.
-        idx0_marker = (
-            f"Mempack header — Pattern 0 manifest in {clean_name}_manifest.json sidecar. "
-            f"Pattern I (agent behavior) at idx=1. owner_id={owner_id}."
-        )
-
-        texts = [idx0_marker, pattern_i_text]
-        embeddings = np.stack([
-            embed_text(idx0_marker, prefix="search_document"),
-            embed_text(pattern_i_text, prefix="search_document"),
-        ]).astype(np.float32)
-
-        save_as_npz(cart_path, embeddings, texts)
-        save_manifest(
-            cart_path, embeddings, len(texts),
-            briefing=briefing,
+        # Build starter bytes + metadata
+        starter = _build_starter_mempack_bytes(
             owner_id=owner_id,
-            owner_perms="rwda",     # owner has full control over their Mempack
-            group_perms="",
-            world_perms="",         # private by default
-            cart_type=CART_TYPE_AGENT_MEMORY,
+            name=clean_name,
+            briefing=data.get("briefing"),
+            pattern_i_text=data.get("pattern_i"),
         )
 
-        size_mb = os.path.getsize(cart_path) / (1024 * 1024)
-        log.info(f"Mempack created: {cart_path} ({size_mb:.2f} MB) owner={owner_id}")
+        # Atomic-ish provision: row(pending) -> blob upload -> pattern rows -> row(ready)
+        try:
+            row = sbs.insert_mempack(
+                owner_id=owner_id,
+                name=clean_name,
+                pattern_count=2,
+                size_bytes=len(starter["blob_bytes"]),
+                briefing=starter["briefing"],
+                pattern_i_text=starter["pattern_i_text"],
+                manifest=starter["manifest"],
+                cart_type=CART_TYPE_AGENT_MEMORY,
+                status="pending",
+            )
+            mempack_id = row["id"]
+
+            sbs.upload_blob(owner_id, clean_name, starter["blob_bytes"])
+            sbs.insert_pattern_rows(mempack_id, starter["hippocampus_bytes"], starter["texts"])
+            sbs.mark_mempack_ready(mempack_id)
+            sbs.log_provision(owner_id, mempack_id, "manual", "created")
+        except Exception as e:
+            log.error(f"REST /api/mempack/create provision flow failed: {e}")
+            try:
+                sbs.log_provision(owner_id, None, "manual", "failed", error=str(e))
+            except Exception:
+                pass
+            return JSONResponse({"status": "error", "error": f"provision failed: {e}"},
+                                status_code=500, headers=_cors_headers())
+
+        log.info(f"Mempack created via Supabase: mempack_id={mempack_id} owner={owner_id} name={clean_name}")
         return JSONResponse({
             "status": "ok",
             "name": clean_name,
             "owner_id": owner_id,
-            "path": cart_path,
-            "size_mb": round(size_mb, 2),
+            "mempack_id": mempack_id,
+            "storage_bucket": sbs.BUCKET,
+            "storage_path": sbs.storage_path(owner_id, clean_name),
+            "size_bytes": len(starter["blob_bytes"]),
             "cart_type": CART_TYPE_AGENT_MEMORY,
-            "briefing": briefing,
-            "pattern_i": pattern_i_text,
+            "briefing": starter["briefing"],
+            "pattern_i": starter["pattern_i_text"],
         }, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mempack/create error: {e}")
@@ -4137,20 +4336,62 @@ async def rest_mempack_create(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/mempacks", methods=["GET", "OPTIONS"])
 async def rest_mempacks_list(request: Request) -> JSONResponse:
-    """List Mempacks for a given owner_id (query param) or all (no param, admin use)."""
+    """List Mempacks for a given owner_id, with optional lazy auto-provision.
+
+    Query params:
+        owner_id        Supabase user UUID (required for auto-provision; if omitted,
+                        returns all Mempacks across users — admin/debug use).
+        auto_provision  "true" (default) | "false". When true AND owner_id is given
+                        AND the user has zero Mempacks, automatically create a
+                        starter 'primary' Mempack and return it. Idempotent.
+
+    Path C lazy-provision: this is the user-facing entry point for getting a
+    new user their first Mempack. No separate signup-trigger required.
+    """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
         owner_id = request.query_params.get("owner_id", "") or None
+        auto_provision_param = request.query_params.get("auto_provision", "true").lower()
+        auto_provision = auto_provision_param not in ("false", "0", "no", "off")
+
         if owner_id is not None and not _UUID_RE.match(owner_id):
             return JSONResponse(
                 {"status": "error", "error": "owner_id must be a UUID"},
                 status_code=400, headers=_cors_headers(),
             )
+
         mempacks = find_mempacks(owner_id=owner_id)
+
+        # Path C lazy-provision: empty list for a specific owner -> create primary
+        provisioned = False
+        if owner_id and not mempacks and auto_provision and _supabase_available():
+            try:
+                import supabase_storage as sbs
+                starter = _build_starter_mempack_bytes(owner_id=owner_id, name="primary")
+                sbs.auto_provision_primary(
+                    owner_id=owner_id,
+                    starter_blob_bytes=starter["blob_bytes"],
+                    starter_hippocampus=starter["hippocampus_bytes"],
+                    starter_texts=starter["texts"],
+                    pattern_count=2,
+                    briefing=starter["briefing"],
+                    pattern_i_text=starter["pattern_i_text"],
+                    manifest=starter["manifest"],
+                    trigger_source="lazy_list",
+                )
+                mempacks = find_mempacks(owner_id=owner_id)
+                provisioned = True
+                log.info(f"Path C lazy-provisioned primary Mempack for owner={owner_id}")
+            except Exception as e:
+                # Auto-provision failure is non-fatal; return the empty list.
+                # The audit log records the failure for reconciliation.
+                log.error(f"Path C lazy-provision failed for {owner_id}: {e}")
+
         return JSONResponse({
             "status": "ok",
             "count": len(mempacks),
+            "auto_provisioned": provisioned,
             "mempacks": mempacks,
         }, headers=_cors_headers())
     except Exception as e:

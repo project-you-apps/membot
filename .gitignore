@@ -11,10 +11,17 @@ cartridges/*.pkl
 cartridges/*.npz
 cartridges/*.npy
 cartridges/*.json
+cartridges/*.jsonl
 data/*.pkl
 data/*.npz
 data/*.npy
 data/*.json
+data/*.jsonl
+
+# Per-user Mempack storage path (cold-cut 2026-05-13: Mempacks now live in
+# Supabase, but the cartridges/users/<uuid>/ tree may still hold legacy
+# fixtures from before migration. Don't ship those publicly.)
+cartridges/users/
 
 # Exception: sample cartridge (small enough to include)
 !cartridges/attention-is-all-you-need.cart.npz
@@ -47,9 +54,17 @@ tests/*_test_results/
 tests/*_test_output/
 tests/tmp/
 tests/scratch/
+tests/*.txt
+tests/*_results.txt
+tests/*-retest*.txt
 test_*_results/
 test_*_output/
 federate_test_*/
+
+# Vision sub-tree dev artifacts (untracked test scratch)
+vision/test_carts/
+vision/test_grid_cartridge_results.txt
+vision/environment_files/
 
 # OS
 .DS_Store

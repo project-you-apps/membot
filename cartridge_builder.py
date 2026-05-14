@@ -184,15 +184,36 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]
 # source_hash(I) + sequence_num(H) + timestamp(I) + flags(B) + reserved(35s)
 import struct
 
-HIPPO_FORMAT = '<I B B I I I I H I B 35s'
+# H-block (NPZ-stored hippocampus) — one 64-byte struct per pattern in the
+# cart NPZ's `hippocampus` array. Distinct from the lattice-encoded H-row
+# (a 64-BIT physics-layer header on row 63). Full spec: docs/PATTERN-ANATOMY.md
+# §3 "The Hippocampus: H-row and H-block".
+#
+# CANONICAL FORMAT (12 fields, with perms_byte at offset 29). Mirrored from
+# vector-plus-studio-repo/api/cartridge_io.py. Migration from legacy 11-field
+# format completed 2026-05-13. Legacy unpacking lives in the one-shot migration
+# script tools/migrate_droplet_mempacks_to_supabase.py; new writes always use
+# canonical format. format_version (offset 4) discriminates if mixed carts
+# are ever encountered.
+HIPPO_FORMAT = '<I B B I I I I H I B B 34s'
 HIPPO_SIZE = 64  # struct.calcsize(HIPPO_FORMAT)
 
-# Flag bits
+# format_version values
+FORMAT_VERSION_LEGACY    = 1  # legacy 11-field carts, no perms_byte
+FORMAT_VERSION_CANONICAL = 2  # canonical 12-field carts with perms_byte
+
+# Flag bits (byte at offset 28)
 FLAG_TOMBSTONE  = 0x01
 FLAG_PINNED     = 0x02
 FLAG_HAS_PARENT = 0x04
 FLAG_HAS_CHILD  = 0x08
 FLAG_HAS_SIBLING = 0x10
+
+# Perms bits (byte at offset 29 — canonical format only)
+PERM_R = 0x01  # readable — included in search results
+PERM_W = 0x02  # writable — tombstoneable, restoreable, updateable in place
+PERM_X = 0x04  # reserved for future executable / lambda-passage feature
+PERM_DEFAULT = PERM_R | PERM_W  # 0x03 — read+write default for new patterns
 # Perishability: bits 5-6 encode decay class
 # 00 = volatile (algorithmic time decay, pruneable)
 # 01 = replaceable (superseded by newer version)
@@ -253,17 +274,18 @@ def build_metadata(entries: list[str], doc_map: list[tuple[str, int, int]],
 
         packed = struct.pack(
             HIPPO_FORMAT,
-            i + 1,          # pattern_id (1-based, 0 = header)
-            1,              # format_version
-            0,              # cartridge_type = knowledge
-            prev_ptr,       # parent_ptr (PREV)
-            next_ptr,       # child_ptr (NEXT)
-            0,              # sibling_ptr
-            src_hash,       # source_hash
-            chunk_idx,      # sequence_num (0-based chunk position)
-            now_ts,         # timestamp
-            flags,          # flags
-            b'\x00' * 35,   # reserved
+            i + 1,                       # pattern_id (1-based, 0 = header)
+            FORMAT_VERSION_CANONICAL,    # format_version
+            0,                           # cartridge_type = knowledge
+            prev_ptr,                    # parent_ptr (PREV)
+            next_ptr,                    # child_ptr (NEXT)
+            0,                           # sibling_ptr
+            src_hash,                    # source_hash
+            chunk_idx,                   # sequence_num (0-based chunk position)
+            now_ts,                      # timestamp
+            flags,                       # flags
+            PERM_DEFAULT,                # perms_byte (R+W default)
+            b'\x00' * 34,                # reserved
         )
         meta.append(packed)
 
@@ -274,17 +296,18 @@ def build_metadata(entries: list[str], doc_map: list[tuple[str, int, int]],
     # is a separate concern for GPU-trained cartridges.
     pattern0 = struct.pack(
         HIPPO_FORMAT,
-        0,              # pattern_id = 0 (header)
-        1,              # format_version
-        0,              # cartridge_type = knowledge
-        0,              # parent_ptr (none)
-        1 if n > 0 else 0,  # child_ptr → first real pattern
-        0,              # sibling_ptr
-        0,              # source_hash (N/A for header)
-        0,              # sequence_num
-        now_ts,         # timestamp
-        FLAG_PINNED,    # flags: pinned (never evict)
-        b'\x00' * 35,   # reserved
+        0,                           # pattern_id = 0 (header)
+        FORMAT_VERSION_CANONICAL,    # format_version
+        0,                           # cartridge_type = knowledge
+        0,                           # parent_ptr (none)
+        1 if n > 0 else 0,           # child_ptr → first real pattern
+        0,                           # sibling_ptr
+        0,                           # source_hash (N/A for header)
+        0,                           # sequence_num
+        now_ts,                      # timestamp
+        FLAG_PINNED,                 # flags: pinned (never evict)
+        PERM_R,                      # perms_byte (R only — header is system-managed)
+        b'\x00' * 34,                # reserved
     )
 
     return meta, pattern0
