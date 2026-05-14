@@ -214,6 +214,61 @@ mcporter call membot.memory_search query="your query" top_k=5
 
 See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working example.
 
+## What's New (May 2026)
+
+### Mempack — Per-Agent Writable Brain Cartridges
+
+A **Mempack** is a Membot cartridge an agent owns and writes to. Same lattice substrate as a knowledge cart, with three reserved slots that turn a static document into a living memory: a manifest at **Pattern 0**, behavioral instructions at **Pattern I** (idx=1), and accumulated learnings at **Pattern N+** (idx≥2). When the agent mounts its Mempack, the briefing and behavior load automatically. No prompt-stuffing, no per-session re-briefing. The cart bootstraps the agent.
+
+|Slot|Purpose|Default state|
+|---|---|---|
+|Pattern 0|Cart manifest: ownership, perms, cart_type, briefing|pinned + archival, read-only|
+|Pattern I (idx=1)|Agent's behavioral instructions, voice, persona, operating rules|pinned + archival, owner-writable|
+|Pattern N+ (idx≥2)|Accumulated findings, decisions, source links, search hits|volatile (decay-eligible), owner-writable|
+
+#### Two-Layer Persistence
+
+Mempacks split across Supabase rather than living on the Membot host's filesystem. Each user owns their data; the Membot droplet doesn't keep personal carts on disk.
+
+- **Postgres metadata** in `public.mempacks` (one row per cart) plus `public.mempack_patterns` (one row per pattern, with the 64-byte H-block exploded into native columns + 9 generated boolean/enum columns for SQL-side querying without unblobbing the cart).
+- **Binary blob** in Supabase Storage at `mempacks/<user_uuid>/<name>.cart.npz`. RLS scopes each user to their own folder; Membot uses a service-role key to read/write on the agent's behalf at mount time.
+
+Cross-Mempack search becomes a SQL JOIN over normalized H-block columns rather than fetch-all-blobs-then-filter. Free tier: 1 Mempack of 10 MB per user; Pro and Enterprise tiers tune via insert-trigger policy.
+
+#### MCP-Native Access
+
+A Mempack travels. Mount it from Claude Code today, Cursor tomorrow, a custom OpenClaw agent next week. The cart format is one file; the access protocol is MCP; provenance carries through every host.
+
+```python
+# Auto-provision on first list (Path C): empty roster -> starter primary
+GET /api/mempacks?owner_id=<supabase-uuid>
+# -> {"status": "ok", "count": 1, "auto_provisioned": true, "mempacks": [...]}
+
+# Read Pattern I via the MCP tool
+mempack_read_pattern_i(name="primary")
+# -> the agent's own behavioral instructions, fresh from Supabase
+
+# Mount and search like any cart
+mount_cartridge("primary")
+memory_search("attention mechanisms", top_k=5)
+```
+
+See [`docs/AGENT_INSTRUCTIONS.md`](docs/AGENT_INSTRUCTIONS.md) for the three access patterns (MCP / mcporter / REST) and [`docs/mcp.json.example`](docs/mcp.json.example) for a copy-paste MCP host config.
+
+#### Path C Lazy Auto-Provision
+
+The first time a user calls `GET /api/mempacks?owner_id=<uuid>` with no existing rows, Membot creates a starter `primary` Mempack: pinned + archival header, pinned + archival Pattern I with a default behavioral template, audit-log entry, status flipped to `ready` after the blob upload completes. Subsequent calls are idempotent. No signup-side trigger or service-key plumbing needed; the substrate primitive handles it directly.
+
+Set `auto_provision=false` on the query string to opt out (returns empty list without creating).
+
+#### Canonical 12-Field H-Block Format
+
+This release unifies the cart-format hippocampus on the canonical 12-field `HIPPO_FORMAT` (`<I B B I I I I H I B B 34s`, with `perms_byte` at offset 29). Legacy 11-field carts are still readable via the `format_version` discriminator at offset 4. New writes always emit canonical.
+
+The H-block (cart-format hippocampus, 64-byte struct per pattern) is distinct from the lattice-encoded H-row (64-bit physics-layer header on row 63). Two layers, two consumers: H-block for cart-format navigation + perms; H-row for F0 physics recall.
+
+---
+
 ## What's New (April 2026)
 
 ### Multi-Cart Query — One Membot, Many Mounted Carts
