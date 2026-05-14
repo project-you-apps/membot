@@ -350,10 +350,14 @@ def update_mempack_metadata(
     mempack_id: str,
     size_bytes: int | None = None,
     pattern_count: int | None = None,
+    pattern_i_text: str | None = None,
 ) -> dict:
-    """Update a Mempack row's size_bytes and/or pattern_count after a write.
+    """Update a Mempack row's metadata after a write.
     Always bumps updated_at to now() via the database default-on-update behavior
     (or explicit if the schema doesn't auto-update).
+
+    pattern_i_text: when Pattern I is rewritten, the denormalized copy on the
+    mempacks row needs to follow. Pass the new text; pass None to leave it alone.
     """
     sb = get_client()
     patch: dict = {}
@@ -361,12 +365,66 @@ def update_mempack_metadata(
         patch["size_bytes"] = size_bytes
     if pattern_count is not None:
         patch["pattern_count"] = pattern_count
+    if pattern_i_text is not None:
+        patch["pattern_i_text"] = pattern_i_text
     # Force updated_at refresh
     from datetime import datetime, timezone
     patch["updated_at"] = datetime.now(timezone.utc).isoformat()
     if not patch:
         return {}
     res = sb.table("mempacks").update(patch).eq("id", mempack_id).execute()
+    return res.data[0] if res.data else {}
+
+
+def update_pattern_row(
+    mempack_id: str,
+    pattern_idx: int,
+    h_block_bytes: bytes,
+    text: str,
+) -> dict:
+    """Update an existing pattern row in-place at (mempack_id, pattern_idx).
+
+    Used by Pattern-I rewrites and any future slot-specific overwrite (e.g.
+    Pattern J entry edits). Distinct from append_pattern_row which is the
+    write-new-row path used by memory_store.
+
+    Args:
+        mempack_id:    UUID of the parent Mempack
+        pattern_idx:   absolute 0-based slot to overwrite (must already exist)
+        h_block_bytes: replacement 64-byte canonical H-block
+        text:          replacement pattern body
+
+    Returns: the updated row dict, or {} if no row matched (caller should treat
+    that as an error and fall back to append).
+    """
+    if len(h_block_bytes) != HIPPO_SIZE:
+        raise ValueError(f"h_block_bytes must be {HIPPO_SIZE} bytes, got {len(h_block_bytes)}")
+
+    vals = struct.unpack(HIPPO_FORMAT, h_block_bytes)
+    patch = {
+        "pattern_id":     vals[0],
+        "format_version": vals[1],
+        "cartridge_type": vals[2],
+        "parent_ptr":     vals[3],
+        "child_ptr":      vals[4],
+        "sibling_ptr":    vals[5],
+        "source_hash":    vals[6],
+        "sequence_num":   vals[7],
+        "ts_unix":        vals[8],
+        "flags":          vals[9],
+        "perms_byte":     vals[10],
+        "text_preview":   (text or "")[:200],
+        "text_length":    len((text or "").encode("utf-8")),
+        "hippocampus_raw": "\\x" + h_block_bytes.hex(),
+    }
+    sb = get_client()
+    res = (
+        sb.table("mempack_patterns")
+        .update(patch)
+        .eq("mempack_id", mempack_id)
+        .eq("pattern_idx", pattern_idx)
+        .execute()
+    )
     return res.data[0] if res.data else {}
 
 

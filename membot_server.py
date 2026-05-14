@@ -678,6 +678,106 @@ def _mempack_persist_new_pattern(state: dict, new_text: str, new_emb: np.ndarray
     return f"persisted to Supabase (mempack_id={mempack_id[:8]}, {len(blob_bytes)} bytes)"
 
 
+def _mempack_persist_pattern_update(
+    state: dict, idx: int, new_text: str, new_emb: np.ndarray
+) -> str:
+    """Round-trip an IN-PLACE pattern update back to Supabase.
+
+    Mirror of _mempack_persist_new_pattern but for overwriting an existing
+    pattern at a known idx (e.g. Pattern I rewrite via mempack_update_pattern_i).
+    Repacks the full blob, uploads (upsert), updates the mempack_patterns row
+    at (mempack_id, pattern_idx), and refreshes the mempacks row metadata
+    (size_bytes, and pattern_i_text if idx==PATTERN_I_IDX).
+
+    Last-writer-wins for v1, same as the append path.
+
+    Returns: short status string for the calling MCP tool's result message.
+    """
+    import io
+    import struct as _struct
+    import supabase_storage as sbs
+    from cartridge_builder import (
+        HIPPO_FORMAT, FORMAT_VERSION_CANONICAL, PERM_DEFAULT,
+    )
+
+    mempack_id = state["mempack_id"]
+    owner_id = state["owner_id"]
+    name = state["cartridge_name"]
+    texts = state["texts"]
+    embeddings = state["embeddings"]
+
+    # 1. Re-pack the full cart blob with the updated pattern included
+    compressed_texts = [
+        np.void(zlib.compress(t.encode("utf-8"), level=9)) for t in texts
+    ]
+    buf = io.BytesIO()
+    np.savez_compressed(
+        buf,
+        embeddings=embeddings,
+        passages=np.array(texts, dtype=object),
+        compressed_texts=np.array(compressed_texts, dtype=object),
+        version="mcp-v3",
+    )
+    blob_bytes = buf.getvalue()
+
+    # 2. Upload to Supabase Storage (upsert overwrites previous blob)
+    sbs.upload_blob(owner_id, name, blob_bytes)
+
+    # 3. Synthesize an H-block for the updated slot. Pattern I gets PINNED
+    # treatment (non-volatile); Pattern N+ updates inherit defaults.
+    now_ts = int(time.time())
+    h_block = _struct.pack(
+        HIPPO_FORMAT,
+        idx + 1,                         # pattern_id (1-based)
+        FORMAT_VERSION_CANONICAL,
+        1,                               # cartridge_type = agent-memory
+        0, 0, 0,                         # parent/child/sibling ptrs
+        0,                               # source_hash (synthesized)
+        idx,                             # sequence_num
+        now_ts,
+        0,                               # flags
+        PERM_DEFAULT,                    # perms_byte: R+W
+        b'\x00' * 34,                    # reserved
+    )
+
+    # 4. Update (NOT append) the mempack_patterns row at the target idx
+    updated = sbs.update_pattern_row(
+        mempack_id=mempack_id,
+        pattern_idx=idx,
+        h_block_bytes=h_block,
+        text=new_text,
+    )
+    if not updated:
+        # The row didn't exist — fall back to append (e.g. Pattern I was
+        # missing on a cart provisioned before reserved-slot semantics).
+        sbs.append_pattern_row(
+            mempack_id=mempack_id,
+            pattern_idx=idx,
+            h_block_bytes=h_block,
+            text=new_text,
+        )
+
+    # 5. Update mempacks row: size_bytes always; pattern_i_text iff this is
+    # the Pattern I slot (denormalized for fast list/preview reads).
+    metadata_kwargs: dict = {
+        "mempack_id": mempack_id,
+        "size_bytes": len(blob_bytes),
+    }
+    if idx == PATTERN_I_IDX:
+        metadata_kwargs["pattern_i_text"] = new_text
+    sbs.update_mempack_metadata(**metadata_kwargs)
+
+    # 6. Refresh local cache so subsequent same-droplet mounts skip the round-trip
+    cache_path = os.path.join(MEMPACK_CACHE_DIR, f"{mempack_id}.cart.npz")
+    try:
+        with open(cache_path, "wb") as f:
+            f.write(blob_bytes)
+    except OSError as e:
+        log.warning(f"Mempack cache write failed (non-fatal): {e}")
+
+    return f"updated idx={idx} in Supabase (mempack_id={mempack_id[:8]}, {len(blob_bytes)} bytes)"
+
+
 def _ensure_mempack_cached(mempack: dict) -> str:
     """Download Mempack blob from Supabase Storage to local cache if not present.
 
@@ -3180,6 +3280,104 @@ def mempack_read_pattern_i(session_id: str = "") -> str:
         )
 
     return texts[PATTERN_I_IDX]
+
+
+@mcp.tool()
+def mempack_update_pattern_i(text: str, session_id: str = "") -> str:
+    """Overwrite Pattern I (your behavioral instructions) on the mounted Mempack.
+
+    Pattern I is your persistent self-description as an agent — persona, accumulated
+    self-knowledge, refined approach. Use this to self-rewrite: notes about how to
+    do your job better, what works, what to avoid, who you are across sessions.
+
+    The write round-trips to Supabase: blob is repacked, mempack_patterns row at
+    idx=1 is updated in-place, and the denormalized pattern_i_text on the mempacks
+    row is refreshed for fast preview/list reads.
+
+    Args:
+        text: New Pattern I content (max 10,000 chars).
+        session_id: Session identifier (uses default session if empty).
+    """
+    if len(text) > MAX_TEXT_LENGTH:
+        return f"Text too long ({len(text)} chars). Max is {MAX_TEXT_LENGTH}."
+
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+
+    if state["cartridge_name"] is None:
+        return "No cartridge mounted. Use mount_cartridge first."
+
+    if state.get("cart_type") != CART_TYPE_AGENT_MEMORY:
+        return (
+            f"This cart is type '{state.get('cart_type', 'knowledge')}', not a "
+            f"Mempack (cart_type='agent-memory'). Pattern I only exists in "
+            f"agent-memory carts."
+        )
+
+    if not state.get("mempack_id"):
+        return (
+            "Mounted cart is marked as agent-memory but has no mempack_id — "
+            "this is a Supabase-backed-only operation. Provision via "
+            "POST /api/mempack/create first."
+        )
+
+    if not _supabase_available():
+        return "Supabase env vars missing on this server; cannot persist Pattern I update."
+
+    log.info(f"mempack_update_pattern_i('{text[:60]}...', mempack_id={state['mempack_id'][:8]})")
+
+    try:
+        t0 = time.time()
+
+        # 1. Re-embed the new Pattern I text
+        emb = embed_text(text, prefix="search_document")
+
+        # 2. Update in-memory state at PATTERN_I_IDX, growing arrays if Pattern I
+        # didn't exist yet (cart had only the header at idx=0).
+        texts = state["texts"] or []
+        embeddings = state["embeddings"]
+        binary_corpus = state["binary_corpus"]
+
+        new_bin_row = (emb > 0).astype(np.uint8).reshape(1, -1)
+
+        if len(texts) > PATTERN_I_IDX:
+            # In-place overwrite
+            texts[PATTERN_I_IDX] = text
+            embeddings[PATTERN_I_IDX] = emb
+            binary_corpus[PATTERN_I_IDX] = new_bin_row.reshape(-1)
+        elif len(texts) == PATTERN_I_IDX:
+            # Append into the reserved slot (Pattern I was missing)
+            texts.append(text)
+            if embeddings is None or len(embeddings) == 0:
+                state["embeddings"] = emb.reshape(1, -1)
+            else:
+                state["embeddings"] = np.vstack([embeddings, emb.reshape(1, -1)])
+            if binary_corpus is None or len(binary_corpus) == 0:
+                state["binary_corpus"] = new_bin_row
+            else:
+                state["binary_corpus"] = np.vstack([binary_corpus, new_bin_row])
+        else:
+            # Cart has fewer than PATTERN_I_IDX patterns — shouldn't happen on a
+            # provisioned Mempack (header always at idx=0). Refuse rather than
+            # silently corrupt indexing.
+            return (
+                f"Mempack has only {len(texts)} pattern(s); cannot write Pattern I "
+                f"at idx={PATTERN_I_IDX}. Reprovision the cart."
+            )
+
+        state["modified"] = True
+
+        # 3. Persist to Supabase (update existing row or append if missing)
+        persist_msg = _mempack_persist_pattern_update(
+            state, PATTERN_I_IDX, text, emb
+        )
+
+        elapsed_ms = (time.time() - t0) * 1000
+        return f"Pattern I updated ({len(text)} chars) — {persist_msg} ({elapsed_ms:.0f}ms)"
+
+    except Exception as e:
+        log.error(f"mempack_update_pattern_i error: {e}")
+        return f"mempack_update_pattern_i error: {e}"
 
 
 @mcp.tool()
