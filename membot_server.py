@@ -587,6 +587,97 @@ def find_mempacks(owner_id: str | None = None) -> list[dict]:
     return results
 
 
+def _mempack_persist_new_pattern(state: dict, new_text: str, new_emb: np.ndarray) -> str:
+    """Round-trip a newly-stored pattern back to Supabase for a Mempack.
+
+    Called from memory_store when the mounted cart is a Supabase-backed Mempack
+    (detected via state.get("mempack_id")). Repacks the full cart blob with the
+    new pattern + uploads to Storage (overwrites) + inserts a new
+    mempack_patterns row + updates the mempacks row's size_bytes + pattern_count.
+
+    Returns: short status string for the memory_store result message.
+
+    Last-writer-wins for v1: concurrent writes from two agents to the same
+    Mempack will race on blob upload. Acceptable for v1; revisit with optimistic
+    locking via a row version column when concurrent agent flows show up.
+    """
+    import io
+    import struct as _struct
+    import supabase_storage as sbs
+    from cartridge_builder import (
+        HIPPO_FORMAT, FORMAT_VERSION_CANONICAL, PERM_DEFAULT,
+    )
+
+    mempack_id = state["mempack_id"]
+    owner_id = state["owner_id"]
+    name = state["cartridge_name"]
+    texts = state["texts"]
+    embeddings = state["embeddings"]
+    new_idx = len(texts) - 1  # 0-based absolute pattern_idx
+
+    # 1. Re-pack the blob with the new pattern included
+    compressed_texts = [
+        np.void(zlib.compress(t.encode("utf-8"), level=9)) for t in texts
+    ]
+    buf = io.BytesIO()
+    np.savez_compressed(
+        buf,
+        embeddings=embeddings,
+        passages=np.array(texts, dtype=object),
+        compressed_texts=np.array(compressed_texts, dtype=object),
+        version="mcp-v3",
+    )
+    blob_bytes = buf.getvalue()
+
+    # 2. Upload to Supabase Storage (upsert overwrites previous blob)
+    sbs.upload_blob(owner_id, name, blob_bytes)
+
+    # 3. Synthesize canonical 12-field H-block for the new pattern.
+    # Pattern N+ entries are volatile (decay-eligible) and writable by default.
+    # No linked-list ptrs in v1 — single-pattern append doesn't carry that
+    # info; future write path can layer in parent/child links.
+    now_ts = int(time.time())
+    h_block = _struct.pack(
+        HIPPO_FORMAT,
+        new_idx + 1,                     # pattern_id (1-based, 0 = header)
+        FORMAT_VERSION_CANONICAL,
+        1,                               # cartridge_type = agent-memory
+        0, 0, 0,                         # parent_ptr, child_ptr, sibling_ptr
+        0,                               # source_hash (synthesized, no source file)
+        new_idx,                         # sequence_num
+        now_ts,
+        0,                               # flags: volatile, not pinned (agent content)
+        PERM_DEFAULT,                    # perms_byte: R+W
+        b'\x00' * 34,                    # reserved
+    )
+
+    # 4. Insert the new pattern_patterns row at absolute pattern_idx
+    sbs.append_pattern_row(
+        mempack_id=mempack_id,
+        pattern_idx=new_idx,
+        h_block_bytes=h_block,
+        text=new_text,
+    )
+
+    # 5. Update the mempacks row's size_bytes + pattern_count
+    sbs.update_mempack_metadata(
+        mempack_id=mempack_id,
+        size_bytes=len(blob_bytes),
+        pattern_count=len(texts),
+    )
+
+    # 6. Update the local cache file so subsequent mounts in this same droplet
+    # session pick up the new state without a Supabase fetch round-trip.
+    cache_path = os.path.join(MEMPACK_CACHE_DIR, f"{mempack_id}.cart.npz")
+    try:
+        with open(cache_path, "wb") as f:
+            f.write(blob_bytes)
+    except OSError as e:
+        log.warning(f"Mempack cache write failed (non-fatal): {e}")
+
+    return f"persisted to Supabase (mempack_id={mempack_id[:8]}, {len(blob_bytes)} bytes)"
+
+
 def _ensure_mempack_cached(mempack: dict) -> str:
     """Download Mempack blob from Supabase Storage to local cache if not present.
 
@@ -1624,10 +1715,11 @@ async def rest_mount(request: Request) -> JSONResponse:
         data = await request.json()
         name = data.get("name", "")
         session_id = data.get("session_id", "")
+        owner_id = data.get("owner_id", "")
         if not name:
             return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_cors_headers())
         _call = getattr(mount_cartridge, 'fn', mount_cartridge)
-        result = _call(name=name, session_id=session_id)
+        result = _call(name=name, session_id=session_id, owner_id=owner_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mount error: {e}")
@@ -2640,7 +2732,7 @@ def list_cartridges() -> str:
 
 
 @mcp.tool()
-def mount_cartridge(name: str, session_id: str = "") -> str:
+def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
     """Mount a brain cartridge by name (or partial name).
     Loads embeddings and text into memory for searching.
     Verifies integrity against manifest if available.
@@ -2648,15 +2740,23 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
     Args:
         name: Cartridge name (exact or partial match)
         session_id: Session identifier (auto-assigned if empty). Each session has its own mounted cartridge.
+        owner_id: Supabase user UUID. When set, restricts Mempack lookup to that
+                  user's Mempacks only — disambiguates the case where multiple
+                  users have Mempacks with the same name (e.g. each user's "primary").
+                  Ignored for non-Mempack carts.
     """
     session_id = _resolve_session_id(session_id)
     state = _get_session(session_id)
-    log.info(f"mount_cartridge({name}, session={session_id})")
+    log.info(f"mount_cartridge({name}, session={session_id}, owner_id={owner_id[:8] if owner_id else 'none'})")
 
     try:
         clean_name = sanitize_name(name)
     except ValueError as e:
         return str(e)
+
+    # Validate owner_id format if provided (defense against bad input)
+    if owner_id and not _UUID_RE.match(owner_id):
+        return f"owner_id must be a UUID; got: {owner_id[:32]!r}"
 
     carts = find_cartridges()
     match = [c for c in carts if c["name"] == clean_name]
@@ -2666,15 +2766,17 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
 
     # Mempack fallback (Andy 2026-05-12): if the standard catalog doesn't have
     # this name, check user-segmented Mempacks. Exact-name match only here —
-    # substring matching against Mempacks risks cross-user collision.
+    # substring matching against Mempacks risks cross-user collision. When
+    # owner_id is provided, scope the search to that user only.
     if not match:
-        mempacks = find_mempacks()
+        mempack_owner = owner_id or None
+        mempacks = find_mempacks(owner_id=mempack_owner)
         mempack_match = [m for m in mempacks if m["name"] == clean_name]
         if len(mempack_match) > 1:
             owners = ", ".join(m.get("owner_id", "?")[:8] for m in mempack_match)
             return (
                 f"Multiple Mempacks named '{clean_name}' across users ({owners}). "
-                f"Pass the cart's full path or specify owner_id to disambiguate."
+                f"Pass owner_id to disambiguate."
             )
         match = mempack_match
 
@@ -3091,9 +3193,6 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
         tags: Optional metadata tags (prepended to stored text)
         session_id: Session identifier (uses default session if empty)
     """
-    if _server_config.get("read_only"):
-        return "Server is in read-only mode. memory_store is disabled."
-
     if len(content) > MAX_TEXT_LENGTH:
         return f"Text too long ({len(content)} chars). Max is {MAX_TEXT_LENGTH}."
 
@@ -3103,11 +3202,19 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     if state["cartridge_name"] is None:
         return "No cartridge mounted. Use mount_cartridge first."
 
+    # Read-only carve-out for Mempacks. The --read-only flag is about
+    # server-managed knowledge carts on droplet FS; Mempacks live in
+    # Supabase under the user's own row + bucket folder. Per-user writes
+    # to Mempacks should work even on the public read-only port.
+    is_mempack = bool(state.get("mempack_id"))
+    if _server_config.get("read_only") and not is_mempack:
+        return "Server is in read-only mode. memory_store is disabled for non-Mempack carts."
+
     n_current = len(state["texts"]) if state["texts"] else 0
     if n_current >= MAX_ENTRIES:
         return f"Cartridge full ({n_current}/{MAX_ENTRIES}). Save and start a new cartridge."
 
-    log.info(f"memory_store('{content[:60]}...')")
+    log.info(f"memory_store('{content[:60]}...', is_mempack={is_mempack})")
 
     try:
         t0 = time.time()
@@ -3146,10 +3253,22 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
                 gpu_msg = f" (lattice failed: {e})"
                 log.warning(f"Lattice imprint failed: {e}")
 
+        # 6. Mempack persistence: if this is a Supabase-backed Mempack, round-trip
+        # the new pattern back to Storage + mempack_patterns. Last-writer-wins
+        # for v1; concurrent writes from two agents to the same Mempack are
+        # rare enough to defer optimistic-locking to v1.2.
+        persist_msg = ""
+        if state.get("mempack_id") and _supabase_available():
+            try:
+                persist_msg = " + " + _mempack_persist_new_pattern(state, stored_text, emb)
+            except Exception as e:
+                persist_msg = f" (Mempack persistence FAILED: {e})"
+                log.error(f"Mempack persistence failed for {state.get('mempack_id')}: {e}")
+
         elapsed_ms = (time.time() - t0) * 1000
         n = len(state["texts"])
 
-        return f"Stored memory #{n}{gpu_msg} ({elapsed_ms:.0f}ms)"
+        return f"Stored memory #{n}{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)"
 
     except Exception as e:
         log.error(f"Store error: {e}")

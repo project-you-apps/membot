@@ -236,6 +236,7 @@ def insert_pattern_rows(
     mempack_id: str,
     hippocampus_bytes: bytes,
     texts: list[str],
+    start_idx: int = 0,
 ) -> int:
     """Explode an H-block byte array into rows of public.mempack_patterns.
 
@@ -243,6 +244,9 @@ def insert_pattern_rows(
         mempack_id:        UUID of the parent mempack row
         hippocampus_bytes: concatenated 64-byte H-blocks, N * HIPPO_SIZE bytes
         texts:             parallel list of N pattern bodies (for text_preview + text_length)
+        start_idx:         pattern_idx for the FIRST H-block in the bytes array.
+                           Default 0 (full-cart insert from scratch). Pass N when
+                           appending one new pattern at the tail of an N-pattern cart.
 
     Returns: number of pattern rows inserted.
 
@@ -261,7 +265,7 @@ def insert_pattern_rows(
         text = texts[i] if i < len(texts) else ""
         rows.append({
             "mempack_id":     mempack_id,
-            "pattern_idx":    i,
+            "pattern_idx":    start_idx + i,
             "pattern_id":     vals[0],
             "format_version": vals[1],
             "cartridge_type": vals[2],
@@ -293,6 +297,77 @@ def delete_pattern_rows_for(mempack_id: str) -> None:
     """Wipe all per-pattern rows for a mempack. Used before cart-update re-sync."""
     sb = get_client()
     sb.table("mempack_patterns").delete().eq("mempack_id", mempack_id).execute()
+
+
+def append_pattern_row(
+    mempack_id: str,
+    pattern_idx: int,
+    h_block_bytes: bytes,
+    text: str,
+) -> dict:
+    """Insert a single new pattern row at an absolute pattern_idx.
+
+    Used by the agent write path (memory_store on a Mempack) where each store
+    adds one pattern at a known absolute index. Distinct from insert_pattern_rows
+    which is for bulk-build flows where pattern_idx is batch-local.
+
+    Args:
+        mempack_id:    UUID of the parent Mempack
+        pattern_idx:   absolute 0-based position in the cart's arrays
+        h_block_bytes: the 64-byte canonical H-block for this pattern
+        text:          the pattern's full text body
+
+    Returns: the inserted row dict (with id, generated columns populated).
+    """
+    if len(h_block_bytes) != HIPPO_SIZE:
+        raise ValueError(f"h_block_bytes must be {HIPPO_SIZE} bytes, got {len(h_block_bytes)}")
+
+    vals = struct.unpack(HIPPO_FORMAT, h_block_bytes)
+    row = {
+        "mempack_id":     mempack_id,
+        "pattern_idx":    pattern_idx,
+        "pattern_id":     vals[0],
+        "format_version": vals[1],
+        "cartridge_type": vals[2],
+        "parent_ptr":     vals[3],
+        "child_ptr":      vals[4],
+        "sibling_ptr":    vals[5],
+        "source_hash":    vals[6],
+        "sequence_num":   vals[7],
+        "ts_unix":        vals[8],
+        "flags":          vals[9],
+        "perms_byte":     vals[10],
+        "text_preview":   (text or "")[:200],
+        "text_length":    len((text or "").encode("utf-8")),
+        "hippocampus_raw": "\\x" + h_block_bytes.hex(),
+    }
+    sb = get_client()
+    res = sb.table("mempack_patterns").insert(row).execute()
+    return res.data[0] if res.data else {}
+
+
+def update_mempack_metadata(
+    mempack_id: str,
+    size_bytes: int | None = None,
+    pattern_count: int | None = None,
+) -> dict:
+    """Update a Mempack row's size_bytes and/or pattern_count after a write.
+    Always bumps updated_at to now() via the database default-on-update behavior
+    (or explicit if the schema doesn't auto-update).
+    """
+    sb = get_client()
+    patch: dict = {}
+    if size_bytes is not None:
+        patch["size_bytes"] = size_bytes
+    if pattern_count is not None:
+        patch["pattern_count"] = pattern_count
+    # Force updated_at refresh
+    from datetime import datetime, timezone
+    patch["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if not patch:
+        return {}
+    res = sb.table("mempacks").update(patch).eq("id", mempack_id).execute()
+    return res.data[0] if res.data else {}
 
 
 # ---------------------------------------------------------------------------
