@@ -455,6 +455,132 @@ def log_provision(
 
 
 # ---------------------------------------------------------------------------
+# Activity log — per-event stream the dashboard polls.
+#
+# Schema lives in db/003_mempack_activity.sql. Service role bypasses RLS for
+# inserts; users read via the user-jwt-scoped GET endpoint.
+# ---------------------------------------------------------------------------
+
+def append_activity(
+    mempack_id: str,
+    event_type: str,
+    summary: str,
+    pattern_idx: Optional[int] = None,
+    metadata: Optional[dict] = None,
+    agent_label: Optional[str] = None,
+) -> None:
+    """Insert one row into public.mempack_activity.
+
+    Caller is responsible for honoring the per-Mempack
+    activity_logging_enabled flag if user opt-out should apply. This function
+    is the unconditional write path so we can still record provisioning /
+    administrative events even when user-facing logging is off.
+
+    event_type vocabulary (open):
+        'create'           — Mempack provisioned
+        'mount'            — agent mounted the cart
+        'imprint'          — new pattern appended (memory_store)
+        'pattern_update'   — existing pattern overwritten
+        'pattern_i_update' — Pattern I (idx=1) rewritten
+        'copy_in'          — passage copied into this Mempack from elsewhere
+        'copy_out'         — passage copied out of this Mempack
+    """
+    sb = get_client()
+    row: dict = {
+        "mempack_id": mempack_id,
+        "event_type": event_type,
+        "summary":    summary,
+    }
+    if pattern_idx is not None:
+        row["pattern_idx"] = pattern_idx
+    if metadata is not None:
+        row["metadata"] = metadata
+    if agent_label is not None:
+        row["agent_label"] = agent_label
+    sb.table("mempack_activity").insert(row).execute()
+
+
+def list_activity(
+    mempack_id: str,
+    since_ts: Optional[str] = None,
+    limit: int = 100,
+    event_types: Optional[list[str]] = None,
+) -> list[dict]:
+    """Return activity rows for a Mempack, newest first.
+
+    Args:
+        mempack_id:  UUID of the Mempack
+        since_ts:    ISO timestamp; if given, only events strictly newer than
+                     this are returned. Used by the dashboard for delta polling.
+        limit:       max rows (default 100)
+        event_types: optional list of event_type strings to filter to
+    """
+    sb = get_client()
+    q = (
+        sb.table("mempack_activity")
+        .select("*")
+        .eq("mempack_id", mempack_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if since_ts:
+        q = q.gt("created_at", since_ts)
+    if event_types:
+        q = q.in_("event_type", event_types)
+    res = q.execute()
+    return res.data or []
+
+
+def is_logging_enabled(mempack_id: str) -> bool:
+    """Read the per-Mempack activity_logging_enabled flag.
+
+    Default-true on missing row or query oddities — fail open. Disabling logs
+    is a deliberate user opt-out, so an unexpected None should not silently
+    suppress.
+    """
+    sb = get_client()
+    res = (
+        sb.table("mempacks")
+        .select("activity_logging_enabled")
+        .eq("id", mempack_id)
+        .maybe_single()
+        .execute()
+    )
+    if not res or not res.data:
+        return True
+    return bool(res.data.get("activity_logging_enabled", True))
+
+
+def set_logging_enabled(mempack_id: str, enabled: bool) -> dict:
+    """Toggle the per-Mempack activity_logging_enabled flag."""
+    sb = get_client()
+    res = (
+        sb.table("mempacks")
+        .update({"activity_logging_enabled": enabled})
+        .eq("id", mempack_id)
+        .execute()
+    )
+    return res.data[0] if res.data else {}
+
+
+# ---------------------------------------------------------------------------
+# Mempack lookups by id (companion to get_mempack_by_name)
+# ---------------------------------------------------------------------------
+
+def get_mempack_by_id(mempack_id: str) -> Optional[dict]:
+    """Return the mempack row by primary key, or None if not present."""
+    sb = get_client()
+    res = (
+        sb.table("mempacks")
+        .select("*")
+        .eq("id", mempack_id)
+        .maybe_single()
+        .execute()
+    )
+    return res.data if res else None
+
+
+# ---------------------------------------------------------------------------
 # Auth lookups (service role can read auth.users via the admin API)
 # ---------------------------------------------------------------------------
 
@@ -535,6 +661,21 @@ def auto_provision_primary(
         mark_mempack_ready(mempack_id)
 
         log_provision(owner_id, mempack_id, trigger_source, "created")
+        # Activity log: 'create' event so the dashboard's first feed entry is
+        # the Mempack's birthday. Unconditional — pre-dates any user toggle.
+        try:
+            append_activity(
+                mempack_id=mempack_id,
+                event_type="create",
+                summary=f"Mempack 'primary' provisioned ({trigger_source})",
+                metadata={
+                    "blob_bytes":    len(starter_blob_bytes),
+                    "pattern_count": pattern_count,
+                    "trigger":       trigger_source,
+                },
+            )
+        except Exception:
+            pass  # best-effort; mempack_provisions_log is the authoritative audit
         # Refetch with status='ready' set
         return get_mempack_by_name(owner_id, "primary") or row
     except Exception as e:

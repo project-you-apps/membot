@@ -519,6 +519,240 @@ def _supabase_available() -> bool:
     return bool(os.environ.get("SUPABASE_URL")) and bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
 
 
+# ============================================================
+# JWT verification — Supabase Auth integration
+#
+# Browser-originating REST calls carry a Supabase session cookie set by the
+# central auth router on .project-you.app. Membot verifies the embedded JWT
+# against SUPABASE_JWT_SECRET (HS256, aud='authenticated') to identify the
+# caller for ownership/scoping checks. MCP-tool agent callers don't go
+# through this path — they pass session_id explicitly.
+#
+# Pattern mirrors vector-plus-studio-repo/api/auth.py.
+# ============================================================
+
+_JWT_ALG = "HS256"
+_JWT_AUD = "authenticated"
+
+
+def _read_jwt_from_request(request) -> str | None:
+    """Extract a Supabase access_token from the request, if present.
+
+    Looks at:
+    1. `Authorization: Bearer <token>` header (preferred — explicit)
+    2. `sb-<projectref>-auth-token` cookie (browser cross-app SSO).
+       Modern supabase-js chunks large cookie values across `.0`, `.1`, etc.
+       cookies — we collect all chunks for the same base name and reassemble
+       in index order before decoding.
+
+    The (assembled) cookie value is URL-encoded base64 of a JSON object
+    containing `access_token` (the JWT). Newer supabase-js prefixes the
+    value with 'base64-' — we strip that. Returns the raw JWT string or None.
+    """
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth and auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        if token:
+            return token
+
+    cookie = request.headers.get("cookie") or request.headers.get("Cookie") or ""
+    if not cookie:
+        return None
+
+    # Match base name AND chunked variants: sb-<ref>-auth-token(.<digits>)?=<value>
+    chunk_re = re.compile(r'(sb-[a-z0-9]+-auth-token)(?:\.(\d+))?=([^;]+)')
+    matches = chunk_re.findall(cookie)
+    if not matches:
+        return None
+
+    # Group by base name (in case multiple Supabase projects coexist)
+    groups: dict[str, list[tuple[int, str]]] = {}
+    for base, idx_str, val in matches:
+        groups.setdefault(base, []).append((int(idx_str) if idx_str else -1, val))
+
+    # Pick the base with the most chunks
+    chosen_base = max(groups.keys(), key=lambda k: len(groups[k]))
+    chunks = groups[chosen_base]
+
+    # Prefer an unchunked entry (idx == -1) if present; else assemble chunks in order
+    unchunked = next((v for i, v in chunks if i == -1), None)
+    if unchunked is not None:
+        raw_encoded = unchunked
+    else:
+        chunks.sort(key=lambda x: x[0])
+        raw_encoded = "".join(v for _, v in chunks)
+
+    import urllib.parse
+    raw = urllib.parse.unquote(raw_encoded)
+    has_b64_prefix = raw.startswith("base64-")
+    stripped = raw[7:] if has_b64_prefix else raw
+
+    # Try multiple decode paths. supabase-js cookie format has shifted across
+    # versions: standard base64, URL-safe base64, base64- prefix, or plain
+    # JSON. Try in order of likelihood.
+    payload = None
+    decode_path = None
+
+    # Path A: base64 (standard) -> JSON
+    if payload is None:
+        try:
+            payload = json.loads(base64.b64decode(stripped + '=' * (-len(stripped) % 4)))
+            decode_path = 'b64-standard'
+        except Exception:
+            pass
+
+    # Path B: base64 (URL-safe) -> JSON
+    if payload is None:
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(stripped + '=' * (-len(stripped) % 4)))
+            decode_path = 'b64-urlsafe'
+        except Exception:
+            pass
+
+    # Path C: plain JSON
+    if payload is None:
+        try:
+            payload = json.loads(stripped)
+            decode_path = 'plain-json'
+        except Exception:
+            pass
+
+    if payload is None:
+        log.warning(
+            f"JWT cookie decode failed (base={chosen_base}, len={len(raw)}, "
+            f"prefix={'base64-' if has_b64_prefix else 'none'}, "
+            f"head={stripped[:60]!r})"
+        )
+        return None
+
+    if isinstance(payload, dict):
+        token = payload.get("access_token")
+    elif isinstance(payload, list) and payload:
+        token = payload[0]
+    else:
+        token = None
+    if not isinstance(token, str):
+        log.warning(
+            f"JWT cookie payload had no access_token (decode={decode_path}, "
+            f"keys={list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__})"
+        )
+        return None
+    return token
+
+
+def _get_user_id_from_request(request) -> str | None:
+    """Verify the Supabase JWT and return the `sub` claim (user UUID), or None.
+
+    Returns None for: anonymous request, missing/expired/invalid JWT, or
+    when SUPABASE_JWT_SECRET isn't configured (fail-closed for safety).
+    """
+    secret = os.environ.get("SUPABASE_JWT_SECRET")
+    if not secret:
+        return None
+    token = _read_jwt_from_request(request)
+    if not token:
+        return None
+    try:
+        import jwt as _pyjwt
+    except ImportError:
+        log.error("PyJWT not installed; cannot verify Supabase tokens")
+        return None
+    try:
+        decoded = _pyjwt.decode(token, secret, algorithms=[_JWT_ALG], audience=_JWT_AUD)
+        return decoded.get("sub")
+    except Exception as e:
+        log.warning(f"JWT decode failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _require_authenticated(request):
+    """Return (user_id, None) if authenticated, (None, JSONResponse 401) otherwise.
+
+    Caller pattern:
+        user_id, err = _require_authenticated(request)
+        if err is not None: return err
+    """
+    from starlette.responses import JSONResponse
+    user_id = _get_user_id_from_request(request)
+    if not user_id:
+        return None, JSONResponse(
+            {"status": "error",
+             "error": "Authentication required (sign in at project-you.app)"},
+            status_code=401, headers=_cors_headers(),
+        )
+    return user_id, None
+
+
+def _require_mempack_owner(request, mempack_id: str):
+    """Verify the caller owns the named Mempack.
+
+    Returns (user_id, mempack_row, None) on success.
+    Returns (None, None, JSONResponse) on auth/ownership/lookup failure (401/403/404/503).
+    """
+    from starlette.responses import JSONResponse
+    user_id, err = _require_authenticated(request)
+    if err is not None:
+        return None, None, err
+    if not _UUID_RE.match(mempack_id):
+        return None, None, JSONResponse(
+            {"status": "error", "error": "mempack_id must be a UUID"},
+            status_code=400, headers=_cors_headers(),
+        )
+    if not _supabase_available():
+        return None, None, JSONResponse(
+            {"status": "error", "error": "Mempack backend not configured."},
+            status_code=503, headers=_cors_headers(),
+        )
+    import supabase_storage as sbs
+    mp = sbs.get_mempack_by_id(mempack_id)
+    if not mp:
+        return None, None, JSONResponse(
+            {"status": "error", "error": "Mempack not found"},
+            status_code=404, headers=_cors_headers(),
+        )
+    if mp.get("user_id") != user_id:
+        log.warning(
+            f"OWNERSHIP DENIED: user={user_id[:8]} tried to access "
+            f"mempack={mempack_id[:8]} owned by {str(mp.get('user_id'))[:8]}"
+        )
+        return None, None, JSONResponse(
+            {"status": "error", "error": "Forbidden — you don't own this Mempack"},
+            status_code=403, headers=_cors_headers(),
+        )
+    return user_id, mp, None
+
+
+def _session_id_for_user(user_id: str | None, fallback: str = "") -> str:
+    """Derive a per-user session_id so each signed-in user gets their own
+    in-process RAM slot. Anonymous callers fall back to the legacy default.
+
+    Eliminates the cross-user mount-state leak: user A's mounted Mempack
+    lives in 'user_<uuid_a>' session, user B can't see it.
+    """
+    if user_id:
+        return f"user_{user_id}"
+    return fallback.strip() if fallback and fallback.strip() else "default"
+
+
+def _owner_id_to_uuid_bytes(owner_id: str | None) -> np.ndarray:
+    """Convert a Supabase user-UUID string to a 16-byte numpy array.
+
+    Used to plant the Pattern 0 v2 'owner_id' field directly into the cart
+    blob (npz key 'pattern_0_owner') so ownership travels WITH the cart,
+    independently of any one server's database. v3 will extend this with a
+    public key + signature; for now it's just the UUID claim. Loaders that
+    don't recognize the field ignore it (forward/backward compatible).
+
+    Returns a (16,) uint8 array; all-zeros for missing/invalid input.
+    """
+    import uuid as _uuid
+    try:
+        u = _uuid.UUID(owner_id) if owner_id else None
+        return np.frombuffer(u.bytes if u else b'\x00' * 16, dtype=np.uint8)
+    except (ValueError, AttributeError, TypeError):
+        return np.zeros(16, dtype=np.uint8)
+
+
 def find_mempacks(owner_id: str | None = None) -> list[dict]:
     """Return Mempacks for an owner from Supabase (cold-cut from filesystem 2026-05-13).
 
@@ -571,11 +805,18 @@ def find_mempacks(owner_id: str | None = None) -> list[dict]:
             "owner_id":       row["user_id"],
             "format":         "npz",
             "size_mb":        round(size_bytes / (1024 * 1024), 2),
+            "size_bytes":     size_bytes,
             "has_manifest":   bool(manifest),
-            "mempack_id":     mempack_id,
+            "id":             mempack_id,   # canonical name for the dashboard
+            "mempack_id":     mempack_id,   # legacy alias for mount_cartridge etc.
             "storage_status": row.get("storage_status"),
             "cart_type":      row.get("cart_type") or CART_TYPE_AGENT_MEMORY,
             "pattern_count":  row.get("pattern_count", 0),
+            "pattern_i_text": row.get("pattern_i_text") or "",
+            "activity_logging_enabled": row.get("activity_logging_enabled", True),
+            "created_at":     row.get("created_at"),
+            "updated_at":     row.get("updated_at"),
+            "last_mounted_at": row.get("last_mounted_at"),
             # Manifest fields surfaced for mount-time state population
             "briefing":       row.get("briefing") or manifest.get("briefing"),
             "owner_perms":    manifest.get("owner_perms", "rwda"),
@@ -615,7 +856,8 @@ def _mempack_persist_new_pattern(state: dict, new_text: str, new_emb: np.ndarray
     embeddings = state["embeddings"]
     new_idx = len(texts) - 1  # 0-based absolute pattern_idx
 
-    # 1. Re-pack the blob with the new pattern included
+    # 1. Re-pack the blob with the new pattern included.
+    # Preserve pattern_0_owner so the v2 ownership flag survives every imprint.
     compressed_texts = [
         np.void(zlib.compress(t.encode("utf-8"), level=9)) for t in texts
     ]
@@ -626,6 +868,7 @@ def _mempack_persist_new_pattern(state: dict, new_text: str, new_emb: np.ndarray
         passages=np.array(texts, dtype=object),
         compressed_texts=np.array(compressed_texts, dtype=object),
         version="mcp-v3",
+        pattern_0_owner=_owner_id_to_uuid_bytes(owner_id),
     )
     blob_bytes = buf.getvalue()
 
@@ -675,6 +918,24 @@ def _mempack_persist_new_pattern(state: dict, new_text: str, new_emb: np.ndarray
     except OSError as e:
         log.warning(f"Mempack cache write failed (non-fatal): {e}")
 
+    # 7. Activity log (best-effort — never block the imprint on log failure).
+    try:
+        if sbs.is_logging_enabled(mempack_id):
+            sbs.append_activity(
+                mempack_id=mempack_id,
+                event_type="imprint",
+                summary=f"imprinted pattern at idx {new_idx} ({len(new_text)} chars)",
+                pattern_idx=new_idx,
+                metadata={
+                    "blob_bytes":  len(blob_bytes),
+                    "text_length": len(new_text),
+                    "preview":     (new_text or "")[:120],
+                },
+                agent_label=state.get("agent_label"),
+            )
+    except Exception as e:
+        log.warning(f"Mempack activity-log append failed (non-fatal): {e}")
+
     return f"persisted to Supabase (mempack_id={mempack_id[:8]}, {len(blob_bytes)} bytes)"
 
 
@@ -706,7 +967,8 @@ def _mempack_persist_pattern_update(
     texts = state["texts"]
     embeddings = state["embeddings"]
 
-    # 1. Re-pack the full cart blob with the updated pattern included
+    # 1. Re-pack the full cart blob with the updated pattern included.
+    # Preserve pattern_0_owner across in-place updates too.
     compressed_texts = [
         np.void(zlib.compress(t.encode("utf-8"), level=9)) for t in texts
     ]
@@ -717,6 +979,7 @@ def _mempack_persist_pattern_update(
         passages=np.array(texts, dtype=object),
         compressed_texts=np.array(compressed_texts, dtype=object),
         version="mcp-v3",
+        pattern_0_owner=_owner_id_to_uuid_bytes(owner_id),
     )
     blob_bytes = buf.getvalue()
 
@@ -774,6 +1037,26 @@ def _mempack_persist_pattern_update(
             f.write(blob_bytes)
     except OSError as e:
         log.warning(f"Mempack cache write failed (non-fatal): {e}")
+
+    # 7. Activity log (best-effort — never block the update on log failure).
+    try:
+        if sbs.is_logging_enabled(mempack_id):
+            event_type = "pattern_i_update" if idx == PATTERN_I_IDX else "pattern_update"
+            verb = "rewrote Pattern I" if idx == PATTERN_I_IDX else f"updated pattern at idx {idx}"
+            sbs.append_activity(
+                mempack_id=mempack_id,
+                event_type=event_type,
+                summary=f"{verb} ({len(new_text)} chars)",
+                pattern_idx=idx,
+                metadata={
+                    "blob_bytes":  len(blob_bytes),
+                    "text_length": len(new_text),
+                    "preview":     (new_text or "")[:120],
+                },
+                agent_label=state.get("agent_label"),
+            )
+    except Exception as e:
+        log.warning(f"Mempack activity-log append failed (non-fatal): {e}")
 
     return f"updated idx={idx} in Supabase (mempack_id={mempack_id[:8]}, {len(blob_bytes)} bytes)"
 
@@ -1183,7 +1466,11 @@ def _log_rest(request: Request, endpoint: str, extra: str = ""):
 
 @mcp.custom_route("/api/store", methods=["POST", "OPTIONS"])
 async def rest_store(request: Request) -> JSONResponse:
-    """REST wrapper for memory_store — used by Heartbeat browser extension."""
+    """REST wrapper for memory_store — used by Heartbeat browser extension.
+
+    Step 3: per-user session_id from JWT so writes target the caller's own
+    mounted state (not whatever the global slot happens to hold).
+    """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
@@ -1191,12 +1478,10 @@ async def rest_store(request: Request) -> JSONResponse:
         content = data.get("content", "")
         tags = data.get("tags", "")
         _log_rest(request, "STORE", f"tags={tags} len={len(content)}")
+        user_id = _get_user_id_from_request(request)
+        session_id = _session_id_for_user(user_id, fallback=data.get("session_id", ""))
         _call = getattr(memory_store, 'fn', memory_store)  # FastMCP 2.x vs 3.x
-        result = _call(
-            content=content,
-            tags=tags,
-            session_id=data.get("session_id", "")
-        )
+        result = _call(content=content, tags=tags, session_id=session_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/store error: {e}")
@@ -1205,7 +1490,12 @@ async def rest_store(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/search", methods=["POST", "OPTIONS"])
 async def rest_search(request: Request) -> JSONResponse:
-    """REST search returning structured JSON for browser apps."""
+    """REST search returning structured JSON for browser apps.
+
+    Step 3: per-user session_id from JWT so each user searches THEIR mounted
+    state. Cross-user Mempack contents are not readable from another user's
+    session because their session points at a different state slot.
+    """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
@@ -1213,8 +1503,20 @@ async def rest_search(request: Request) -> JSONResponse:
         query = data.get("query", "")
         top_k = data.get("top_k", 5)
         _log_rest(request, "SEARCH", f"q=\"{query[:60]}\" top_k={top_k}")
-        session_id = _resolve_session_id(data.get("session_id", ""))
+        user_id = _get_user_id_from_request(request)
+        session_id = _session_id_for_user(user_id, fallback=data.get("session_id", ""))
         state = _get_session(session_id)
+        # Defense-in-depth: if the slot somehow holds another user's Mempack,
+        # refuse the read. Belt + suspenders.
+        if state.get("mempack_id") and state.get("owner_id") and user_id and state["owner_id"] != user_id:
+            log.warning(
+                f"OWNERSHIP DENIED (search): session={session_id[:14]} holds "
+                f"mempack owned by {state['owner_id'][:8]}, caller={user_id[:8]}"
+            )
+            return JSONResponse(
+                {"status": "error", "error": "Forbidden — mounted Mempack belongs to another user"},
+                status_code=403, headers=_cors_headers(),
+            )
 
         if state["cartridge_name"] is None:
             return JSONResponse({"status": "ok", "results": [], "error": "No cartridge mounted"}, headers=_cors_headers())
@@ -1808,16 +2110,33 @@ async def rest_cartridges(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/mount", methods=["POST", "OPTIONS"])
 async def rest_mount(request: Request) -> JSONResponse:
-    """Mount a cartridge by name for the app session."""
+    """Mount a cartridge by name for the app session.
+
+    Step 3 multi-tenancy:
+    - When the request carries a JWT, derive session_id = "user_<sub>" so each
+      user gets their own RAM mount slot (closes the cross-user mount leak).
+    - Force owner_id = JWT.sub for Mempack scoping. mount_cartridge calls
+      find_mempacks(owner_id=...) and only finds the caller's own Mempacks,
+      so Mempacks owned by other users become unmountable by name lookup.
+    - Anonymous callers fall through to the legacy behavior (default session,
+      unscoped find_mempacks). Knowledge carts unaffected.
+    """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
         data = await request.json()
         name = data.get("name", "")
-        session_id = data.get("session_id", "")
-        owner_id = data.get("owner_id", "")
         if not name:
             return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_cors_headers())
+
+        # Identify caller via JWT (cookie or Bearer). None for anonymous.
+        user_id = _get_user_id_from_request(request)
+        # Per-user session slot when authenticated; per-body or default otherwise.
+        session_id = _session_id_for_user(user_id, fallback=data.get("session_id", ""))
+        # Mempack scoping: a signed-in caller can only see THEIR Mempacks.
+        # Anonymous callers can still mount knowledge carts (no owner_id scope).
+        owner_id = user_id or data.get("owner_id", "")
+
         _call = getattr(mount_cartridge, 'fn', mount_cartridge)
         result = _call(name=name, session_id=session_id, owner_id=owner_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
@@ -1828,16 +2147,29 @@ async def rest_mount(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/passage", methods=["GET", "OPTIONS"])
 async def rest_passage(request: Request) -> JSONResponse:
-    """REST endpoint to fetch any passage by index, with hippocampus nav links."""
+    """REST endpoint to fetch any passage by index, with hippocampus nav links.
+
+    Step 3: per-user session_id from JWT. Cross-user Mempack defense-in-depth.
+    """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
         idx = int(request.query_params.get("idx", -1))
-        session_id = _resolve_session_id(request.query_params.get("session_id", ""))
+        user_id = _get_user_id_from_request(request)
+        session_id = _session_id_for_user(user_id, fallback=request.query_params.get("session_id", ""))
         state = _get_session(session_id)
 
         if state["cartridge_name"] is None:
             return JSONResponse({"status": "error", "error": "No cartridge mounted"}, headers=_cors_headers())
+        if state.get("mempack_id") and state.get("owner_id") and user_id and state["owner_id"] != user_id:
+            log.warning(
+                f"OWNERSHIP DENIED (passage): session={session_id[:14]} holds "
+                f"mempack owned by {state['owner_id'][:8]}, caller={user_id[:8]}"
+            )
+            return JSONResponse(
+                {"status": "error", "error": "Forbidden — mounted Mempack belongs to another user"},
+                status_code=403, headers=_cors_headers(),
+            )
 
         texts = state["texts"]
         if idx < 0 or idx >= len(texts):
@@ -2519,6 +2851,60 @@ _APP_HTML = """\
   .app-footer a { color:var(--accent); text-decoration:none; }
   .app-footer a:hover { text-decoration:underline; }
   @media (max-width:640px) { .app { padding:12px; } .brand { flex-wrap:wrap; } .search-box { flex-direction:column; } .search-box button { width:100%; } }
+  /* ---------- Mempack Dashboard view ---------- */
+  .view-tabs { display:flex; gap:6px; margin-bottom:18px; padding:4px; background:var(--surface); border:1px solid var(--border); border-radius:10px; width:fit-content; }
+  .view-tab { background:transparent; border:none; color:var(--text-dim); padding:8px 18px; border-radius:7px; cursor:pointer; font-size:13px; font-weight:600; font-family:var(--sans); transition:all 0.15s; }
+  .view-tab:hover { color:var(--text); }
+  .view-tab.active { background:var(--accent); color:white; }
+  .dash-row { display:flex; gap:8px; align-items:center; margin-bottom:14px; }
+  .dash-row input.uuid-input { flex:1; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:12px; padding:8px 12px; border-radius:8px; outline:none; font-family:var(--mono); }
+  .dash-row input.uuid-input:focus { border-color:var(--accent); }
+  .dash-row button { background:var(--accent); color:white; border:none; padding:8px 18px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; transition:all 0.2s; }
+  .dash-row button:hover { background:var(--accent-dim); }
+  .dash-row button.secondary { background:var(--surface-2); color:var(--text); border:1px solid var(--border); }
+  .dash-row button.secondary:hover { border-color:var(--border-hover); color:var(--text-bright); }
+  .mempack-list { display:flex; flex-direction:column; gap:8px; margin-bottom:24px; }
+  .mempack-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px 18px; cursor:pointer; transition:all 0.15s; }
+  .mempack-card:hover { border-color:var(--border-hover); }
+  .mempack-card.active { border-color:var(--accent); background:var(--accent-glow); }
+  .mempack-card .name { font-size:14px; font-weight:700; color:var(--text-bright); margin-bottom:4px; }
+  .mempack-card .meta { font-size:11px; color:var(--text-dim); font-family:var(--mono); margin-bottom:8px; }
+  .mempack-card .meta .pill { background:var(--surface-2); padding:1px 6px; border-radius:3px; margin-right:6px; }
+  .mempack-card .meta .pill.pending { color:var(--amber); }
+  .mempack-card .meta .pill.ready { color:var(--green); }
+  .quota-bar { background:var(--surface-2); height:6px; border-radius:3px; overflow:hidden; margin-top:6px; }
+  .quota-fill { background:var(--accent); height:100%; border-radius:3px; transition:width 0.3s; }
+  .quota-fill.warn { background:var(--amber); }
+  .quota-fill.full { background:var(--red); }
+  .quota-label { font-size:10px; color:var(--text-dim); font-family:var(--mono); margin-top:4px; }
+  .dash-section { margin-top:24px; padding-top:20px; border-top:1px solid var(--border); }
+  .dash-section > h3 { font-size:13px; font-weight:700; color:var(--text-bright); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:12px; }
+  .dash-section > h3 .small { font-weight:400; text-transform:none; letter-spacing:0; color:var(--text-dim); margin-left:8px; font-size:11px; }
+  .pattern-i-editor textarea { width:100%; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:13px; font-family:var(--mono); padding:14px 16px; border-radius:10px; resize:vertical; min-height:240px; outline:none; transition:border-color 0.2s; line-height:1.6; }
+  .pattern-i-editor textarea:focus { border-color:var(--accent); }
+  .pattern-i-actions { display:flex; gap:8px; margin-top:10px; align-items:center; }
+  .pattern-i-actions .saved-msg { color:var(--text-dim); font-size:11px; font-family:var(--mono); }
+  .pattern-i-actions .saved-msg.success { color:var(--green); }
+  .activity-feed { display:flex; flex-direction:column; gap:6px; max-height:480px; overflow-y:auto; padding-right:4px; }
+  .activity-row { display:flex; gap:12px; padding:10px 12px; background:var(--surface); border:1px solid var(--border); border-radius:8px; align-items:flex-start; }
+  .activity-row .ts { font-size:10px; color:var(--text-dim); font-family:var(--mono); white-space:nowrap; min-width:120px; padding-top:2px; }
+  .activity-row .body { flex:1; min-width:0; }
+  .activity-row .body .summary { font-size:13px; color:var(--text); margin-bottom:2px; }
+  .activity-row .body .preview { font-size:11px; color:var(--text-dim); font-family:var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .activity-row .type { font-size:10px; font-weight:700; padding:2px 6px; border-radius:3px; font-family:var(--mono); text-transform:uppercase; letter-spacing:0.3px; flex-shrink:0; }
+  .activity-row .type.imprint        { background:var(--accent-glow); color:var(--accent); }
+  .activity-row .type.mount          { background:var(--green-glow); color:var(--green); }
+  .activity-row .type.pattern_i_update { background:#a855f720; color:#a855f7; }
+  .activity-row .type.pattern_update { background:#a855f720; color:#a855f7; }
+  .activity-row .type.copy_in        { background:#06b6d420; color:#06b6d4; }
+  .activity-row .type.create         { background:#eab30820; color:var(--amber); }
+  .activity-row .type.settings_update{ background:var(--surface-2); color:var(--text-dim); }
+  .settings-row { display:flex; align-items:center; gap:10px; margin-bottom:10px; font-size:13px; color:var(--text); }
+  .settings-row input[type=checkbox] { width:16px; height:16px; cursor:pointer; accent-color:var(--accent); }
+  .settings-row label { cursor:pointer; }
+  .settings-row .hint { font-size:11px; color:var(--text-dim); margin-left:8px; }
+  .dash-empty { text-align:center; padding:40px 20px; color:var(--text-dim); font-size:13px; }
+  .dash-empty .icon { font-size:36px; margin-bottom:8px; opacity:0.4; }
 </style>
 </head>
 <body>
@@ -2535,7 +2921,11 @@ _APP_HTML = """\
       <span id="statusText">Connecting...</span>
     </div>
   </div>
-  <p class="intro"><strong>Self-contained semantic search without the LLM.</strong> Click a cart to mount it, then search with plain English &mdash; no generation, no hallucinations.</p>
+  <div class="view-tabs" role="tablist">
+    <button class="view-tab active" data-view="search" onclick="setView('search')">Search</button>
+    <button class="view-tab" data-view="mempack" onclick="setView('mempack')">Mempack</button>
+  </div>
+  <p class="intro" id="searchIntro"><strong>Self-contained semantic search without the LLM.</strong> Click a cart to mount it, then search with plain English &mdash; no generation, no hallucinations.</p>
   <div class="cart-bar" id="cartBar"><div class="cart-chip"><div class="name" style="color:var(--text-dim)">Loading...</div></div></div>
   <div class="search-box">
     <span class="search-icon">&#x1F50D;</span>
@@ -2562,13 +2952,46 @@ _APP_HTML = """\
       </div>
     </div>
   </div>
-  <div class="store-section">
+  <div class="store-section" id="storeSection">
     <h2>Store a Memory</h2>
     <div class="store-box">
       <textarea id="storeContent" placeholder="Paste or type content to store..." rows="4"></textarea>
       <div class="store-row">
         <input type="text" id="storeTags" placeholder="Tags (optional): ARCHITECTURE, JOURNAL, ...">
         <button onclick="doStore()">Store</button>
+      </div>
+    </div>
+  </div>
+  <div id="mempackView" style="display:none">
+    <p class="intro"><strong>Mempack &mdash; portable per-agent memory.</strong> Each agent gets its own writable cart that travels with it. This dashboard is your home base for what your agent has been doing on your behalf.</p>
+    <div class="dash-row" id="ownerRow">
+      <input type="text" id="ownerUuid" class="uuid-input" placeholder="Detecting Supabase session..." readonly>
+      <button onclick="loadMempacks()">Reload</button>
+      <button class="secondary" onclick="overrideOwner()" title="Sign in as a different user (admin/debug)">Override</button>
+    </div>
+    <div id="mempackList" class="mempack-list"></div>
+    <div id="mempackDetail" style="display:none">
+      <div class="dash-section">
+        <h3>Pattern I &mdash; Behavior <span class="small" id="patternIMeta"></span></h3>
+        <div class="pattern-i-editor">
+          <textarea id="patternIText" placeholder="Pattern I bootstraps the agent on every mount. Write the agent's identity, behavior rules, learned preferences..."></textarea>
+          <div class="pattern-i-actions">
+            <button onclick="savePatternI()">Save Pattern I</button>
+            <span class="saved-msg" id="patternIStatus"></span>
+          </div>
+        </div>
+      </div>
+      <div class="dash-section">
+        <h3>Activity <span class="small" id="activityMeta">polling every 5s</span></h3>
+        <div id="activityFeed" class="activity-feed"></div>
+      </div>
+      <div class="dash-section">
+        <h3>Settings</h3>
+        <div class="settings-row">
+          <input type="checkbox" id="loggingToggle" onchange="toggleLogging(this.checked)">
+          <label for="loggingToggle">Activity logging enabled</label>
+          <span class="hint">When off, agent actions stop appearing in the feed.</span>
+        </div>
       </div>
     </div>
   </div>
@@ -2799,6 +3222,302 @@ function toggleTheme(){
 }
 (function(){const s=localStorage.getItem('membot-theme');if(s==='light'){document.documentElement.setAttribute('data-theme','light');setTimeout(()=>$('#themeBtn').innerHTML='&#x1F319;',0);}})();
 loadCartridges();
+
+/* =========================================================
+ * Mempack Dashboard
+ *   - View toggle (Search vs Mempack)
+ *   - Owner UUID persistence in localStorage
+ *   - Mempack list + selection
+ *   - Pattern I editor (POST /api/mempack/<id>/pattern-i)
+ *   - Activity feed (GET /api/mempack/<id>/activity, polling)
+ *   - Settings toggle (PATCH /api/mempack/<id>)
+ * ========================================================= */
+const _SEARCH_VIEW_IDS = ['searchIntro','cartBar','storeSection'];
+const _SEARCH_VIEW_SELECTORS = ['.search-box','.search-meta','#loadingEl','#resultsEl'];
+let _currentMempack = null;     // currently selected mempack row
+let _activitySinceTs = null;    // pagination cursor for delta polling
+let _activityPollHandle = null; // setInterval handle
+const _ACTIVITY_POLL_MS = 5000;
+
+async function setView(name){
+  const tabs = document.querySelectorAll('.view-tab');
+  tabs.forEach(t => t.classList.toggle('active', t.dataset.view === name));
+  const showSearch = (name === 'search');
+  const showMempack = (name === 'mempack');
+  _SEARCH_VIEW_IDS.forEach(id => { const el = document.getElementById(id); if(el) el.style.display = showSearch ? '' : 'none'; });
+  _SEARCH_VIEW_SELECTORS.forEach(sel => { const el = document.querySelector(sel); if(el) el.style.display = showSearch ? '' : 'none'; });
+  const mv = document.getElementById('mempackView'); if(mv) mv.style.display = showMempack ? '' : 'none';
+  if (showMempack) {
+    // Server-side identity check — Supabase cookies are HttpOnly so JS can't
+    // read them, but they're auto-sent with same-origin fetches. /api/whoami
+    // reads them server-side and tells us who's signed in.
+    const detected = await detectSupabaseUser();
+    const override = localStorage.getItem('membot-owner-override');
+    const uuid = override || detected;
+    if (uuid && $('#ownerUuid').value !== uuid) {
+      $('#ownerUuid').value = uuid;
+      loadMempacks();
+    } else if (!uuid) {
+      $('#ownerUuid').placeholder = 'No Supabase session detected. Sign in at project-you.app or use Override.';
+      $('#mempackList').innerHTML = '<div class="dash-empty"><div class="icon">&#x1F511;</div>No Supabase session in this browser.<br><small>Sign in at <a href="https://project-you.app/" style="color:var(--accent)">project-you.app</a> first, then return.</small></div>';
+    }
+    if (_currentMempack) startActivityPoll();
+  } else {
+    stopActivityPoll();
+  }
+  localStorage.setItem('membot-active-view', name);
+}
+
+/* Identify the signed-in user via the server, since Supabase cookies are
+ * HttpOnly and not readable from document.cookie. The cookie IS sent with
+ * every same-origin fetch automatically, so /api/whoami can read it
+ * server-side and tell us the user_id. Returns the UUID string or null.
+ *
+ * Async — caller must await. Cached briefly on success to avoid hammering
+ * the endpoint when several callers (setView + cookie poller) ask at once.
+ */
+let _whoamiCache = { ts: 0, value: null };
+const _WHOAMI_CACHE_MS = 3000;
+async function detectSupabaseUser(){
+  const now = Date.now();
+  if (now - _whoamiCache.ts < _WHOAMI_CACHE_MS) return _whoamiCache.value;
+  try {
+    const r = await fetch(BASE() + '/api/whoami', { credentials: 'same-origin' });
+    const d = await r.json();
+    const uid = d && d.user_id ? d.user_id : null;
+    _whoamiCache = { ts: now, value: uid };
+    if (!uid) console.warn('[membot] detectSupabaseUser: server reports no signed-in user (cookie missing or invalid JWT)');
+    return uid;
+  } catch(e) {
+    console.warn('[membot] detectSupabaseUser /api/whoami failed:', e);
+    return null;
+  }
+}
+
+function overrideOwner(){
+  const current = $('#ownerUuid').value;
+  const next = prompt('Override owner UUID (admin/debug). Leave blank to clear:', current || '');
+  if (next === null) return;  // cancel
+  if (next.trim() === '') {
+    localStorage.removeItem('membot-owner-override');
+    toast('Override cleared — using detected session', 'success');
+  } else {
+    if (!/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(next.trim())) {
+      toast('Not a UUID', 'error'); return;
+    }
+    localStorage.setItem('membot-owner-override', next.trim());
+    toast('Override set — reloading', 'success');
+  }
+  $('#ownerUuid').value = '';
+  setView('mempack');  // re-detect with new override
+}
+
+function fmtBytes(n){
+  if (n == null) return '?';
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/(1024*1024)).toFixed(2) + ' MB';
+}
+function fmtTs(iso){
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    const pad = n => String(n).padStart(2,'0');
+    return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+         + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  } catch(e) { return iso; }
+}
+
+async function loadMempacks(){
+  const uuid = ($('#ownerUuid').value || '').trim();
+  const list = $('#mempackList');
+  if (!uuid) { list.innerHTML = '<div class="dash-empty"><div class="icon">&#x1F511;</div>No Supabase session detected. Sign in at <a href="https://project-you.app/" style="color:var(--accent)">project-you.app</a>.</div>'; return; }
+  if (!/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(uuid)) {
+    toast('Detected value is not a UUID', 'error'); return;
+  }
+  list.innerHTML = '<div class="dash-empty"><div class="spinner"></div> Loading Mempacks...</div>';
+  try {
+    const r = await fetch(BASE() + '/api/mempacks?owner_id=' + encodeURIComponent(uuid));
+    const d = await r.json();
+    if (d.error || d.status === 'error') { list.innerHTML = '<div class="dash-empty"><div class="icon">&#x26A0;</div>' + esc(d.error || 'Load failed') + '</div>'; return; }
+    const items = d.mempacks || [];
+    if (items.length === 0) {
+      list.innerHTML = '<div class="dash-empty"><div class="icon">&#x1F5C3;</div>No Mempacks yet for this user.</div>';
+      return;
+    }
+    list.innerHTML = items.map(mp => {
+      const sizeMb = (mp.size_bytes || 0) / (1024*1024);
+      const capMb = 10;  // free-tier cap from migration 002 trigger
+      const pct = Math.min(100, (sizeMb / capMb) * 100);
+      const fillCls = pct > 90 ? 'full' : (pct > 70 ? 'warn' : '');
+      const statusCls = mp.storage_status === 'ready' ? 'ready' : 'pending';
+      return '<div class="mempack-card" data-id="' + esc(mp.id) + '">'
+        + '<div class="name">' + esc(mp.name) + '</div>'
+        + '<div class="meta">'
+        +   '<span class="pill ' + statusCls + '">' + esc(mp.storage_status || 'unknown') + '</span>'
+        +   '<span class="pill">' + (mp.pattern_count || 0) + ' patterns</span>'
+        +   '<span class="pill">' + fmtBytes(mp.size_bytes) + ' / ' + capMb + ' MB</span>'
+        + '</div>'
+        + '<div class="quota-bar"><div class="quota-fill ' + fillCls + '" style="width:' + pct.toFixed(1) + '%"></div></div>'
+        + '<div class="quota-label">' + pct.toFixed(1) + '% of ' + capMb + ' MB used</div>'
+        + '</div>';
+    }).join('');
+    list.querySelectorAll('.mempack-card').forEach(el => {
+      el.addEventListener('click', () => selectMempack(el.dataset.id, items));
+    });
+    if (d.auto_provisioned) toast('Provisioned starter Mempack ("primary")', 'success');
+    // Auto-select if exactly one (common case after lazy-provision)
+    if (items.length === 1) selectMempack(items[0].id, items);
+  } catch(e) {
+    list.innerHTML = '<div class="dash-empty"><div class="icon">&#x26A0;</div>' + esc(e.message) + '</div>';
+  }
+}
+
+function selectMempack(id, items){
+  const mp = (items || []).find(m => m.id === id);
+  if (!mp) { toast('Mempack ' + id + ' not in list', 'error'); return; }
+  _currentMempack = mp;
+  _activitySinceTs = null;
+  document.querySelectorAll('.mempack-card').forEach(c => c.classList.toggle('active', c.dataset.id === id));
+  $('#mempackDetail').style.display = '';
+  // Pattern I
+  $('#patternIText').value = mp.pattern_i_text || '';
+  $('#patternIMeta').textContent = mp.pattern_count + ' patterns total · idx=1 reserved';
+  $('#patternIStatus').textContent = '';
+  $('#patternIStatus').className = 'saved-msg';
+  // Settings
+  $('#loggingToggle').checked = mp.activity_logging_enabled !== false;
+  // Activity (initial fetch + start polling)
+  $('#activityFeed').innerHTML = '<div class="dash-empty">Loading activity...</div>';
+  loadActivity(true);
+  startActivityPoll();
+}
+
+async function savePatternI(){
+  if (!_currentMempack) return;
+  const text = $('#patternIText').value;
+  const status = $('#patternIStatus');
+  status.textContent = 'Saving...';
+  status.className = 'saved-msg';
+  try {
+    const r = await fetch(BASE() + '/api/mempack/' + _currentMempack.id + '/pattern-i', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({text})
+    });
+    const d = await r.json();
+    if (d.status !== 'ok') { status.textContent = 'Error: ' + (d.error || 'unknown'); return; }
+    status.textContent = 'Saved (' + fmtBytes(d.blob_bytes) + ' on disk)';
+    status.className = 'saved-msg success';
+    _currentMempack.pattern_i_text = text;
+  } catch(e) {
+    status.textContent = 'Save failed: ' + e.message;
+  }
+}
+
+async function toggleLogging(enabled){
+  if (!_currentMempack) return;
+  try {
+    const r = await fetch(BASE() + '/api/mempack/' + _currentMempack.id, {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({activity_logging_enabled: !!enabled})
+    });
+    const d = await r.json();
+    if (d.status !== 'ok') { toast('Toggle failed: ' + (d.error || 'unknown'), 'error'); return; }
+    _currentMempack.activity_logging_enabled = !!enabled;
+    toast('Activity logging ' + (enabled ? 'enabled' : 'disabled'), 'success');
+  } catch(e) { toast('Toggle failed: ' + e.message, 'error'); }
+}
+
+async function loadActivity(reset){
+  if (!_currentMempack) return;
+  const feed = $('#activityFeed');
+  let url = BASE() + '/api/mempack/' + _currentMempack.id + '/activity?limit=100';
+  if (!reset && _activitySinceTs) url += '&since=' + encodeURIComponent(_activitySinceTs);
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    if (d.status !== 'ok') { feed.innerHTML = '<div class="dash-empty">' + esc(d.error || 'Failed to load activity') + '</div>'; return; }
+    _activitySinceTs = d.server_time;
+    if (reset) {
+      feed.innerHTML = (d.activity || []).length === 0
+        ? '<div class="dash-empty"><div class="icon">&#x1F4DD;</div>No activity yet. Mount this Mempack from an agent to see events.</div>'
+        : (d.activity || []).map(_renderActivityRow).join('');
+    } else if (d.activity && d.activity.length > 0) {
+      // Prepend newer events to the top of the feed
+      feed.insertAdjacentHTML('afterbegin', d.activity.map(_renderActivityRow).join(''));
+    }
+  } catch(e) { /* polling — silent on error */ }
+}
+
+function _renderActivityRow(row){
+  const preview = (row.metadata && row.metadata.preview) || '';
+  return '<div class="activity-row">'
+    + '<div class="ts">' + esc(fmtTs(row.created_at)) + '</div>'
+    + '<div class="body">'
+    +   '<div class="summary">' + esc(row.summary || '') + '</div>'
+    +   (preview ? '<div class="preview">' + esc(preview) + '</div>' : '')
+    + '</div>'
+    + '<span class="type ' + esc(row.event_type) + '">' + esc(row.event_type) + '</span>'
+    + '</div>';
+}
+
+function startActivityPoll(){
+  stopActivityPoll();
+  _activityPollHandle = setInterval(() => loadActivity(false), _ACTIVITY_POLL_MS);
+}
+function stopActivityPoll(){
+  if (_activityPollHandle) { clearInterval(_activityPollHandle); _activityPollHandle = null; }
+}
+// Stop polling when tab loses visibility (saves bandwidth + battery)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopActivityPoll();
+  else if (_currentMempack && document.querySelector('.view-tab.active')?.dataset.view === 'mempack') startActivityPoll();
+});
+
+// Restore last view on page load (UUID auto-detected from Supabase cookie inside setView)
+(function(){
+  const lastView = localStorage.getItem('membot-active-view');
+  if (lastView === 'mempack') setView('mempack');
+})();
+
+/* Cookie-disappearance / user-change watcher.
+ *
+ * Polls /api/whoami every 10s. If the detected UUID changes between polls
+ * (user signed out at project-you.app, or signed in as a different user),
+ * clear local Mempack state and re-enter the view so the empty-state /
+ * sign-in prompt renders for the new auth context.
+ *
+ * Critical for closing the "logged in then out, dashboard stale" leak from
+ * the user-facing side (server-side leak is closed via per-user session_id).
+ */
+let _lastDetectedUser = null;
+const _USER_POLL_MS = 10000;
+async function _userWatchTick(){
+  // Bypass the whoami cache so the poll always sees fresh server-side state
+  _whoamiCache = { ts: 0, value: null };
+  const now = await detectSupabaseUser();
+  const override = localStorage.getItem('membot-owner-override');
+  const effective = override || now;
+  const lastEffective = override || _lastDetectedUser;
+  if (effective !== lastEffective) {
+    console.log('[membot] auth state changed:', lastEffective ? lastEffective.slice(0,8) : 'anon',
+                '->', effective ? effective.slice(0,8) : 'anon');
+    _lastDetectedUser = now;
+    _currentMempack = null;
+    stopActivityPoll();
+    $('#mempackList').innerHTML = '';
+    $('#mempackDetail').style.display = 'none';
+    $('#ownerUuid').value = '';
+    const activeTab = document.querySelector('.view-tab.active')?.dataset.view;
+    if (activeTab === 'mempack') setView('mempack');
+    if (!effective && lastEffective) toast('Signed out — Mempack dashboard cleared', 'success');
+  } else {
+    _lastDetectedUser = now;
+  }
+}
+// Prime the cache once at startup so the first poll has a baseline
+detectSupabaseUser().then(uid => { _lastDetectedUser = uid; });
+setInterval(_userWatchTick, _USER_POLL_MS);
 </script>
 </body>
 </html>
@@ -3053,6 +3772,28 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
                     f"\n\n--- PATTERN I (your behavior, idx={PATTERN_I_IDX}) ---\n"
                     f"{pattern_i_text}\n--- END PATTERN I ---"
                 )
+
+        # Mempack activity log: record the mount so the dashboard feed shows
+        # "agent mounted (N patterns)". Best-effort — never fail mount on log
+        # failure. Honors the per-Mempack activity_logging_enabled flag.
+        if state.get("mempack_id"):
+            try:
+                import supabase_storage as sbs
+                if sbs.is_logging_enabled(state["mempack_id"]):
+                    sbs.append_activity(
+                        mempack_id=state["mempack_id"],
+                        event_type="mount",
+                        summary=f"agent mounted ({n} patterns, {dim}-dim)",
+                        metadata={
+                            "n_patterns": n,
+                            "dim":        dim,
+                            "elapsed_ms": round(elapsed_ms, 1),
+                        },
+                        agent_label=state.get("agent_label"),
+                    )
+            except Exception as e:
+                log.warning(f"Mempack mount activity-log append failed (non-fatal): {e}")
+
         return result
 
     except PermissionError as e:
@@ -4413,25 +5154,51 @@ You are an AI agent using a Mempack provisioned for {owner_id_short}.
 
 ## Behavior
 - Read this Pattern I first on every session to remind yourself who you are.
-- Store findings worth keeping into your Mempack via `memory_store`.
-- Update this Pattern I (re-write idx=1) as your behavior evolves over time.
-- Search your Mempack before falling back to external sources.
+- Search your Mempack before falling back to external sources — past you
+  may have already done the work.
+- Store findings worth keeping via `memory_store`. Tag them so future-you
+  can filter (e.g. tags="ARCHITECTURE", "DECISION", "TODO", "DISPATCH").
+- Update this Pattern I (`mempack_update_pattern_i`) as your behavior, learned
+  preferences, or specialization evolves. Treat it as a living MEMORY.md.
+- When the user dispatches a task (look for tag="DISPATCH" or "TASK" patterns),
+  acknowledge it, work it, then mark progress in Active threads below.
+
+## Tools at my disposal (full schemas via MCP tools/list)
+- `memory_search(query, top_k)` — semantic search across the mounted cart.
+  Always try this first when the user asks about something.
+- `memory_store(content, tags)` — add a passage to the mounted Mempack.
+  Tag liberally; tags are how future-you slices the corpus.
+- `mempack_read_pattern_i()` — re-read this behavioral text mid-session.
+- `mempack_update_pattern_i(text)` — overwrite this Pattern I in place.
+  Use to record durable learnings: "user prefers X", "I've specialized in Y".
+- `mount_cartridge(name)` — switch to a different cart (knowledge cart, or
+  another Mempack you have access to). Your current Mempack goes back to
+  Storage; the new one comes off it.
+- `get_status()` / `list_cartridges()` — orientation tools when unsure.
 
 ## Specialization
-(none yet — accumulates with use)
+(none yet — accumulates with use. Edit this section as you discover what
+you're good for. Examples: "research synthesis on histopathology papers",
+"daily journal triage", "Portland-area news monitoring".)
 
 ## Active threads
-(none yet — track in-flight investigations here so they survive across sessions)
+(none yet — track in-flight investigations here so they survive across
+sessions. Format: "- [<status>] <thread> — <next action>")
 """
 
 _DEFAULT_BRIEFING_TEMPLATE = (
-    "This is {owner_id_short}'s personal Mempack — a writable cart stored at "
-    "mempacks/{owner_id}/{name}.cart.npz in Supabase Storage, with metadata in "
-    "the mempacks Postgres table. Pattern 0 (this manifest) holds ownership / "
-    "perms / cart-type metadata. Pattern I (idx=1) holds the agent's behavioral "
-    "instructions; read it first on every session. Patterns 2+ are accumulated "
-    "findings. Add new content via memory_store; update Pattern I to reflect "
-    "evolved behavior. cart_type='agent-memory'."
+    "Cart briefing — {owner_id_short}'s personal Mempack.\n\n"
+    "STORAGE: blob at mempacks/{owner_id}/{name}.cart.npz in Supabase Storage; "
+    "metadata in the mempacks Postgres table. Free-tier cap: 10 MB per Mempack.\n\n"
+    "STRUCTURE: cart_type='agent-memory'. Pattern 0 (this manifest) holds "
+    "ownership/perms. Pattern I (idx=1) holds the agent's behavioral instructions — "
+    "read it FIRST on every session, then update it as behavior evolves. "
+    "Patterns 2+ are accumulated findings, dispatched tasks, journal entries.\n\n"
+    "WRITES: use `memory_store` to add passages, `mempack_update_pattern_i` to "
+    "evolve self-instructions. All writes round-trip to Supabase and are logged "
+    "in the activity feed visible to the user at project-you.app/membot/app.\n\n"
+    "OWNERSHIP: this Mempack belongs to a single user (you act on their behalf). "
+    "Cross-user reads/writes are refused at the API layer."
 )
 
 
@@ -4482,7 +5249,9 @@ def _build_starter_mempack_bytes(
         np.void(zlib.compress(t.encode("utf-8"), level=9)) for t in texts
     ]
 
-    # Pack the NPZ to bytes in-memory (no filesystem touch)
+    # Pack the NPZ to bytes in-memory (no filesystem touch).
+    # pattern_0_owner: plants the v2 ownership flag IN the cart bytes so
+    # ownership claim travels with the artifact (immutable-truth substrate).
     buf = io.BytesIO()
     np.savez_compressed(
         buf,
@@ -4490,6 +5259,7 @@ def _build_starter_mempack_bytes(
         passages=np.array(texts, dtype=object),
         compressed_texts=np.array(compressed_texts, dtype=object),
         version="mcp-v3",
+        pattern_0_owner=_owner_id_to_uuid_bytes(owner_id),
     )
     blob_bytes = buf.getvalue()
 
@@ -4568,17 +5338,27 @@ async def rest_mempack_create(request: Request) -> JSONResponse:
             {"status": "error", "error": "Mempack backend not configured (SUPABASE env vars missing)."},
             status_code=503, headers=_cors_headers(),
         )
+    # Step 3: require auth + caller can only provision FOR themselves.
+    user_id, err = _require_authenticated(request)
+    if err is not None:
+        return err
     try:
         data = await request.json()
         name = data.get("name", "")
-        owner_id = data.get("owner_id", "")
+        owner_id = data.get("owner_id", "") or user_id  # default to caller
 
         if not name:
             return JSONResponse({"status": "error", "error": "name required"},
                                 status_code=400, headers=_cors_headers())
-        if not owner_id or not _UUID_RE.match(owner_id):
+        if not _UUID_RE.match(owner_id):
             return JSONResponse({"status": "error", "error": "owner_id must be a UUID"},
                                 status_code=400, headers=_cors_headers())
+        if owner_id != user_id:
+            log.warning(f"OWNERSHIP DENIED: user={user_id[:8]} tried to create mempack for owner={owner_id[:8]}")
+            return JSONResponse(
+                {"status": "error", "error": "Forbidden — you can only provision Mempacks for yourself"},
+                status_code=403, headers=_cors_headers(),
+            )
         try:
             clean_name = sanitize_name(name)
         except ValueError as e:
@@ -4623,6 +5403,22 @@ async def rest_mempack_create(request: Request) -> JSONResponse:
             sbs.insert_pattern_rows(mempack_id, starter["hippocampus_bytes"], starter["texts"])
             sbs.mark_mempack_ready(mempack_id)
             sbs.log_provision(owner_id, mempack_id, "manual", "created")
+            # Activity log: 'create' event so the dashboard's first feed entry
+            # is the Mempack's birthday. Unconditional — pre-dates any user
+            # toggle change. Best-effort.
+            try:
+                sbs.append_activity(
+                    mempack_id=mempack_id,
+                    event_type="create",
+                    summary=f"Mempack '{clean_name}' provisioned",
+                    metadata={
+                        "blob_bytes":    len(starter["blob_bytes"]),
+                        "pattern_count": 2,
+                        "trigger":       "manual",
+                    },
+                )
+            except Exception as e:
+                log.warning(f"Mempack create activity-log append failed (non-fatal): {e}")
         except Exception as e:
             log.error(f"REST /api/mempack/create provision flow failed: {e}")
             try:
@@ -4651,6 +5447,48 @@ async def rest_mempack_create(request: Request) -> JSONResponse:
                             status_code=500, headers=_cors_headers())
 
 
+@mcp.custom_route("/api/whoami", methods=["GET", "OPTIONS"])
+async def rest_whoami(request: Request) -> JSONResponse:
+    """Return the caller's identity, derived from the Supabase JWT cookie.
+
+    Cookies set by Supabase JS are HttpOnly and not readable from JS, so the
+    /app dashboard can't detect them client-side. This endpoint reads the
+    cookie server-side and tells the dashboard whether the caller is signed
+    in and what their user UUID is. Anonymous callers get {signed_in: false,
+    user_id: null}; signed-in callers get {signed_in: true, user_id: "<uuid>"}.
+
+    Always returns 200 — auth state is data, not an error.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    user_id = _get_user_id_from_request(request)
+
+    # Diagnostic block — exposes cookie NAMES (not values) and whether the
+    # JWT secret is configured. Helps debug nginx-strips-cookies / wrong-
+    # cookie-name / missing-secret scenarios. Values are never returned.
+    cookie_header = request.headers.get("cookie") or request.headers.get("Cookie") or ""
+    cookie_names = []
+    for chunk in cookie_header.split(";"):
+        n = chunk.strip().split("=", 1)[0]
+        if n:
+            cookie_names.append(n)
+    has_auth_header = bool(request.headers.get("authorization") or request.headers.get("Authorization"))
+    sb_cookie_count = sum(1 for n in cookie_names if n.startswith("sb-"))
+
+    return JSONResponse({
+        "status":    "ok",
+        "signed_in": bool(user_id),
+        "user_id":   user_id,
+        "debug": {
+            "cookie_count":    len(cookie_names),
+            "cookie_names":    cookie_names,
+            "sb_cookie_count": sb_cookie_count,
+            "has_auth_header": has_auth_header,
+            "jwt_secret_set":  bool(os.environ.get("SUPABASE_JWT_SECRET")),
+        },
+    }, headers=_cors_headers())
+
+
 @mcp.custom_route("/api/mempacks", methods=["GET", "OPTIONS"])
 async def rest_mempacks_list(request: Request) -> JSONResponse:
     """List Mempacks for a given owner_id, with optional lazy auto-provision.
@@ -4667,15 +5505,26 @@ async def rest_mempacks_list(request: Request) -> JSONResponse:
     """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
+    # Step 3: require auth + caller can only list their OWN Mempacks.
+    user_id, err = _require_authenticated(request)
+    if err is not None:
+        return err
     try:
-        owner_id = request.query_params.get("owner_id", "") or None
+        # Default owner_id to caller; explicit owner_id must match caller.
+        owner_id = request.query_params.get("owner_id", "") or user_id
         auto_provision_param = request.query_params.get("auto_provision", "true").lower()
         auto_provision = auto_provision_param not in ("false", "0", "no", "off")
 
-        if owner_id is not None and not _UUID_RE.match(owner_id):
+        if not _UUID_RE.match(owner_id):
             return JSONResponse(
                 {"status": "error", "error": "owner_id must be a UUID"},
                 status_code=400, headers=_cors_headers(),
+            )
+        if owner_id != user_id:
+            log.warning(f"OWNERSHIP DENIED: user={user_id[:8]} tried to list mempacks of {owner_id[:8]}")
+            return JSONResponse(
+                {"status": "error", "error": "Forbidden — you can only list your own Mempacks"},
+                status_code=403, headers=_cors_headers(),
             )
 
         mempacks = find_mempacks(owner_id=owner_id)
@@ -4716,64 +5565,403 @@ async def rest_mempacks_list(request: Request) -> JSONResponse:
                             status_code=500, headers=_cors_headers())
 
 
+# ---------------------------------------------------------------------------
+# Session-less Mempack mutation helpers
+#
+# Counterparts to _mempack_persist_new_pattern / _mempack_persist_pattern_update
+# that DON'T require a mounted-session state dict. Used by REST endpoints
+# called from the /app dashboard (Pattern I edits, Housecleaning copy-in)
+# where there is no agent session to attach to.
+#
+# Both: load blob from cache (download if cold) → mutate → repack → upload
+# → row update → metadata bump → cache refresh → activity log.
+# ---------------------------------------------------------------------------
+
+def _mempack_load_for_mutation(mempack_id: str) -> tuple[dict, str, np.ndarray, list[str]]:
+    """Resolve a Mempack by id and load its current blob into memory.
+
+    Returns: (mempack_row, cache_path, embeddings, texts)
+    Raises:  ValueError if Mempack missing or status != 'ready'.
+    """
+    import supabase_storage as sbs
+    mp = sbs.get_mempack_by_id(mempack_id)
+    if not mp:
+        raise ValueError(f"Mempack {mempack_id} not found")
+    if mp.get("storage_status") != "ready":
+        raise ValueError(
+            f"Mempack {mempack_id} not ready (status={mp.get('storage_status')})"
+        )
+    cache_path = os.path.join(MEMPACK_CACHE_DIR, f"{mempack_id}.cart.npz")
+    pseudo = {
+        "owner_id":   mp["user_id"],
+        "name":       mp["name"],
+        "mempack_id": mempack_id,
+        "path":       cache_path,
+    }
+    _ensure_mempack_cached(pseudo)
+    data = load_cartridge_safe(cache_path)
+    return mp, cache_path, data["embeddings"], list(data["texts"])
+
+
+def _mempack_repack_and_persist(
+    mp: dict,
+    cache_path: str,
+    embeddings: np.ndarray,
+    texts: list[str],
+    mutated_idx: int,
+    new_text: str,
+    is_replace: bool,
+    activity_event_type: str,
+    activity_summary: str,
+    activity_metadata: dict | None = None,
+    agent_label: str | None = None,
+) -> int:
+    """Repack blob → upload → mempack_patterns row write → metadata bump →
+    cache refresh → activity log. Shared tail of the append + replace paths.
+
+    Args:
+        mp:               row dict from _mempack_load_for_mutation
+        cache_path:       local cache path to refresh
+        embeddings, texts: post-mutation full arrays
+        mutated_idx:      pattern_idx that was appended-or-replaced
+        new_text:         the new text body at mutated_idx
+        is_replace:       True for replace (UPDATE row), False for append (INSERT row)
+        activity_*:       fields for the activity-log row
+        agent_label:      optional agent identifier
+
+    Returns: blob_bytes length.
+    """
+    import io
+    import struct as _struct
+    import supabase_storage as sbs
+    from cartridge_builder import (
+        HIPPO_FORMAT, FORMAT_VERSION_CANONICAL, PERM_DEFAULT,
+    )
+
+    mempack_id = mp["id"]
+    owner_id   = mp["user_id"]
+    name       = mp["name"]
+
+    # 1. Re-pack blob (preserve pattern_0_owner — v2 ownership flag)
+    compressed_texts = [
+        np.void(zlib.compress(t.encode("utf-8"), level=9)) for t in texts
+    ]
+    buf = io.BytesIO()
+    np.savez_compressed(
+        buf,
+        embeddings=embeddings,
+        passages=np.array(texts, dtype=object),
+        compressed_texts=np.array(compressed_texts, dtype=object),
+        version="mcp-v3",
+        pattern_0_owner=_owner_id_to_uuid_bytes(owner_id),
+    )
+    blob_bytes = buf.getvalue()
+
+    # 2. Upload (upsert)
+    sbs.upload_blob(owner_id, name, blob_bytes)
+
+    # 3. Synthesize H-block
+    now_ts = int(time.time())
+    h_block = _struct.pack(
+        HIPPO_FORMAT,
+        mutated_idx + 1,                 # pattern_id (1-based)
+        FORMAT_VERSION_CANONICAL,
+        1,                               # cartridge_type = agent-memory
+        0, 0, 0,                         # parent/child/sibling
+        0,                               # source_hash
+        mutated_idx,                     # sequence_num
+        now_ts,
+        0,                               # flags
+        PERM_DEFAULT,                    # perms_byte
+        b'\x00' * 34,                    # reserved
+    )
+
+    # 4. INSERT or UPDATE pattern row
+    if is_replace:
+        updated = sbs.update_pattern_row(
+            mempack_id=mempack_id,
+            pattern_idx=mutated_idx,
+            h_block_bytes=h_block,
+            text=new_text,
+        )
+        if not updated:
+            sbs.append_pattern_row(
+                mempack_id=mempack_id,
+                pattern_idx=mutated_idx,
+                h_block_bytes=h_block,
+                text=new_text,
+            )
+    else:
+        sbs.append_pattern_row(
+            mempack_id=mempack_id,
+            pattern_idx=mutated_idx,
+            h_block_bytes=h_block,
+            text=new_text,
+        )
+
+    # 5. Metadata bump (size_bytes always; pattern_count on append; pattern_i_text on idx 1)
+    metadata_kwargs: dict = {
+        "mempack_id": mempack_id,
+        "size_bytes": len(blob_bytes),
+    }
+    if not is_replace:
+        metadata_kwargs["pattern_count"] = len(texts)
+    if mutated_idx == PATTERN_I_IDX:
+        metadata_kwargs["pattern_i_text"] = new_text
+    sbs.update_mempack_metadata(**metadata_kwargs)
+
+    # 6. Cache refresh
+    try:
+        with open(cache_path, "wb") as f:
+            f.write(blob_bytes)
+    except OSError as e:
+        log.warning(f"Mempack cache write failed (non-fatal): {e}")
+
+    # 7. Activity log
+    try:
+        if sbs.is_logging_enabled(mempack_id):
+            sbs.append_activity(
+                mempack_id=mempack_id,
+                event_type=activity_event_type,
+                summary=activity_summary,
+                pattern_idx=mutated_idx,
+                metadata=activity_metadata,
+                agent_label=agent_label,
+            )
+    except Exception as e:
+        log.warning(f"Mempack activity-log append failed (non-fatal): {e}")
+
+    return len(blob_bytes)
+
+
+def _mempack_append_blobless(
+    mempack_id: str,
+    new_text: str,
+    new_embedding: "np.ndarray | None" = None,
+    activity_event_type: str = "imprint",
+    activity_summary: str | None = None,
+    activity_metadata: dict | None = None,
+    agent_label: str | None = None,
+) -> dict:
+    """Append a single pattern to a Mempack without a mounted session."""
+    mp, cache_path, embeddings, texts = _mempack_load_for_mutation(mempack_id)
+    if new_embedding is None:
+        new_embedding = embed_text(new_text, prefix="search_document").astype(np.float32)
+    texts.append(new_text)
+    new_embeddings = np.vstack([embeddings, new_embedding[None, :]])
+    new_idx = len(texts) - 1
+    summary = activity_summary or f"appended pattern at idx {new_idx} ({len(new_text)} chars)"
+    blob_size = _mempack_repack_and_persist(
+        mp, cache_path, new_embeddings, texts,
+        mutated_idx=new_idx,
+        new_text=new_text,
+        is_replace=False,
+        activity_event_type=activity_event_type,
+        activity_summary=summary,
+        activity_metadata=activity_metadata or {
+            "blob_bytes":  None,  # filled below
+            "text_length": len(new_text),
+            "preview":     (new_text or "")[:120],
+        },
+        agent_label=agent_label,
+    )
+    return {
+        "mempack_id":    mempack_id,
+        "new_idx":       new_idx,
+        "blob_bytes":    blob_size,
+        "pattern_count": len(texts),
+        "preview":       (new_text or "")[:200],
+    }
+
+
+def _mempack_replace_blobless(
+    mempack_id: str,
+    idx: int,
+    new_text: str,
+    new_embedding: "np.ndarray | None" = None,
+    activity_event_type: str | None = None,
+    activity_summary: str | None = None,
+    activity_metadata: dict | None = None,
+    agent_label: str | None = None,
+) -> dict:
+    """Replace pattern at idx in a Mempack without a mounted session.
+
+    For Pattern I rewrites from /app dashboard. Pads if idx >= len(texts).
+    """
+    mp, cache_path, embeddings, texts = _mempack_load_for_mutation(mempack_id)
+    if idx >= len(texts):
+        raise ValueError(
+            f"Mempack has {len(texts)} patterns; idx={idx} out of range"
+        )
+    if new_embedding is None:
+        new_embedding = embed_text(new_text, prefix="search_document").astype(np.float32)
+    texts[idx] = new_text
+    new_embeddings = np.array(embeddings, copy=True)
+    new_embeddings[idx] = new_embedding
+    if activity_event_type is None:
+        activity_event_type = "pattern_i_update" if idx == PATTERN_I_IDX else "pattern_update"
+    if activity_summary is None:
+        verb = "rewrote Pattern I" if idx == PATTERN_I_IDX else f"updated pattern at idx {idx}"
+        activity_summary = f"{verb} ({len(new_text)} chars)"
+    blob_size = _mempack_repack_and_persist(
+        mp, cache_path, new_embeddings, texts,
+        mutated_idx=idx,
+        new_text=new_text,
+        is_replace=True,
+        activity_event_type=activity_event_type,
+        activity_summary=activity_summary,
+        activity_metadata=activity_metadata or {
+            "text_length": len(new_text),
+            "preview":     (new_text or "")[:120],
+        },
+        agent_label=agent_label,
+    )
+    return {
+        "mempack_id":    mempack_id,
+        "idx":           idx,
+        "blob_bytes":    blob_size,
+        "pattern_count": len(texts),
+        "preview":       (new_text or "")[:200],
+    }
+
+
 @mcp.custom_route("/api/copy", methods=["POST", "OPTIONS"])
 async def rest_copy(request: Request) -> JSONResponse:
-    """Copy a passage from any mounted cart into the user's Mempack.
+    """Copy a passage from any mounted cart into a destination Mempack.
 
-    Body:
-        src_cart    (str, required)  source cart name (must be findable)
-        src_idx     (int, required)  passage index in src_cart
-        dst_path    (str, required)  destination Mempack absolute path
-                                     (typically cartridges/users/<uid>/<name>.cart.npz)
-        note        (str, optional)  free-text reason ("why I kept this")
+    Body (Supabase Mempack dst — preferred, post-2026-05-13):
+        src_cart        (str, required)  source cart name (must be findable)
+        src_idx         (int, required)  passage index in src_cart
+        dst_mempack_id  (str, required)  destination Mempack UUID
+        note            (str, optional)  free-text reason ("why I kept this")
 
-    Embeds the copied passage in the destination Mempack with provenance
-    metadata appended to the text body so future searches preserve attribution.
+    Body (legacy filesystem-Mempack dst — pre-cold-cut, kept for compat):
+        src_cart, src_idx, dst_path, note
+
+    Embeds the copied passage in the destination with provenance metadata
+    appended to the text body so future searches preserve attribution.
+    Logs a 'copy_in' activity event on the destination Mempack.
     """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
-    if _server_config.get("read_only"):
-        return JSONResponse(
-            {"status": "error", "error": "Server is read-only; cannot copy."},
-            status_code=403, headers=_cors_headers(),
-        )
+    # NOTE: VPS_READ_ONLY is enforced inside the legacy dst_path branch only.
+    # Mempack-dst copies are auth+ownership-gated and intentionally allowed
+    # through the read-only public service.
+    # Step 3: require auth at the top — src resolution can transiently load
+    # other users' Mempack contents into RAM if we wait, even though dst auth
+    # later refuses. Fail-fast on anonymous callers.
+    user_id, err = _require_authenticated(request)
+    if err is not None:
+        return err
     try:
         data = await request.json()
         src_cart_name = data.get("src_cart", "")
         src_idx = int(data.get("src_idx", -1))
-        dst_path = data.get("dst_path", "")
+        dst_mempack_id = data.get("dst_mempack_id", "")
+        dst_path = data.get("dst_path", "")  # legacy
         note = data.get("note", "")
 
-        if not src_cart_name or src_idx < 0 or not dst_path:
+        if not src_cart_name or src_idx < 0:
             return JSONResponse(
-                {"status": "error", "error": "src_cart + src_idx + dst_path all required"},
+                {"status": "error", "error": "src_cart + src_idx required"},
+                status_code=400, headers=_cors_headers(),
+            )
+        if not dst_mempack_id and not dst_path:
+            return JSONResponse(
+                {"status": "error", "error": "dst_mempack_id or dst_path required"},
                 status_code=400, headers=_cors_headers(),
             )
 
-        # Resolve src
-        carts = find_cartridges() + find_mempacks()
+        # Resolve src — scope find_mempacks to caller's own Mempacks so a
+        # signed-in user can't load another user's Mempack content even
+        # transiently. Knowledge carts (find_cartridges) remain unscoped.
+        carts = find_cartridges() + find_mempacks(owner_id=user_id)
         src_match = [c for c in carts if c["name"] == src_cart_name]
         if not src_match:
             return JSONResponse(
                 {"status": "error", "error": f"src_cart '{src_cart_name}' not found"},
                 status_code=404, headers=_cors_headers(),
             )
-        src_path = src_match[0]["path"]
-        src_data = load_cartridge_safe(src_path)
+        src_cart = src_match[0]
+        # If src is a Mempack, ensure its blob is cached locally first
+        if src_cart.get("mempack_id"):
+            try:
+                _ensure_mempack_cached(src_cart)
+            except Exception as e:
+                return JSONResponse(
+                    {"status": "error", "error": f"failed to fetch src Mempack: {e}"},
+                    status_code=500, headers=_cors_headers(),
+                )
+        src_data = load_cartridge_safe(src_cart["path"])
         src_texts = src_data["texts"]
         if src_idx >= len(src_texts):
             return JSONResponse(
-                {"status": "error", "error": f"src_idx {src_idx} out of range (cart has {len(src_texts)} patterns)"},
+                {"status": "error", "error":
+                    f"src_idx {src_idx} out of range (cart has {len(src_texts)} patterns)"},
                 status_code=400, headers=_cors_headers(),
             )
         src_text = src_texts[src_idx]
 
-        # Resolve dst (must exist and be a Mempack — defense against arbitrary path writes)
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        provenance_footer = (
+            f"\n\n---\n[provenance] from {src_cart_name}#{src_idx} on {timestamp}"
+            + (f" — {note}" if note else "")
+        )
+        new_text = src_text + provenance_footer
+
+        # ----------------------- Supabase Mempack dst -----------------------
+        if dst_mempack_id:
+            # Step 3: require auth + ownership of dst Mempack before any write.
+            user_id, dst_mp, err = _require_mempack_owner(request, dst_mempack_id)
+            if err is not None:
+                return err
+            try:
+                result = _mempack_append_blobless(
+                    mempack_id=dst_mempack_id,
+                    new_text=new_text,
+                    activity_event_type="copy_in",
+                    activity_summary=f"copied from {src_cart_name}#{src_idx}",
+                    activity_metadata={
+                        "src_cart":    src_cart_name,
+                        "src_idx":     src_idx,
+                        "src_mempack": src_cart.get("mempack_id"),
+                        "note":        note,
+                        "preview":     (new_text or "")[:120],
+                    },
+                    agent_label="browser",
+                )
+            except ValueError as e:
+                return JSONResponse({"status": "error", "error": str(e)},
+                                    status_code=404, headers=_cors_headers())
+            log.info(
+                f"Copy: {src_cart_name}#{src_idx} -> mempack {dst_mempack_id[:8]} "
+                f"(idx {result['new_idx']})"
+            )
+            return JSONResponse({
+                "status":         "ok",
+                "src_cart":       src_cart_name,
+                "src_idx":        src_idx,
+                "dst_mempack_id": dst_mempack_id,
+                "dst_new_idx":    result["new_idx"],
+                "blob_bytes":     result["blob_bytes"],
+                "pattern_count":  result["pattern_count"],
+                "preview":        result["preview"],
+            }, headers=_cors_headers())
+
+        # ----------------------- Legacy filesystem dst ----------------------
+        # Restricted to MEMPACK_BASE_DIR (defense-in-depth against arbitrary
+        # writes). Any new Mempack work should use dst_mempack_id.
+        if _server_config.get("read_only"):
+            return JSONResponse(
+                {"status": "error", "error": "Server is read-only; legacy filesystem copies disabled."},
+                status_code=403, headers=_cors_headers(),
+            )
         dst_real = os.path.realpath(dst_path)
         base_real = os.path.realpath(MEMPACK_BASE_DIR)
         if not dst_real.startswith(base_real + os.sep):
             return JSONResponse(
-                {"status": "error", "error": "dst_path must be under MEMPACK_BASE_DIR"},
+                {"status": "error", "error":
+                    "dst_path must be under MEMPACK_BASE_DIR (or pass dst_mempack_id)"},
                 status_code=403, headers=_cors_headers(),
             )
         if not os.path.exists(dst_path):
@@ -4782,25 +5970,15 @@ async def rest_copy(request: Request) -> JSONResponse:
                 status_code=404, headers=_cors_headers(),
             )
 
-        # Load destination cart, append the new pattern with provenance, save back
         dst_data = load_cartridge_safe(dst_path)
         dst_texts = list(dst_data["texts"])
         dst_embeddings = dst_data["embeddings"]
-
-        timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ")
-        provenance_footer = (
-            f"\n\n---\n[provenance] from {src_cart_name}#{src_idx} on {timestamp}"
-            + (f" — {note}" if note else "")
-        )
-        new_text = src_text + provenance_footer
         new_embedding = embed_text(new_text, prefix="search_document").astype(np.float32)
 
         dst_texts.append(new_text)
         new_embeddings = np.vstack([dst_embeddings, new_embedding[None, :]])
-
         save_as_npz(dst_path, new_embeddings, dst_texts)
 
-        # Re-save manifest preserving Pattern 0 fields
         dst_manifest = load_manifest(dst_path) or {}
         save_manifest(
             dst_path, new_embeddings, len(dst_texts),
@@ -4814,17 +5992,211 @@ async def rest_copy(request: Request) -> JSONResponse:
             cart_type=dst_manifest.get("cart_type"),
         )
 
-        log.info(f"Copy: {src_cart_name}#{src_idx} -> {dst_path} (now {len(dst_texts)} patterns)")
+        log.info(f"Copy (legacy fs): {src_cart_name}#{src_idx} -> {dst_path}")
         return JSONResponse({
-            "status": "ok",
-            "src_cart": src_cart_name,
-            "src_idx": src_idx,
-            "dst_path": dst_path,
+            "status":      "ok",
+            "src_cart":    src_cart_name,
+            "src_idx":     src_idx,
+            "dst_path":    dst_path,
             "dst_new_idx": len(dst_texts) - 1,
-            "preview": new_text[:200],
+            "preview":     new_text[:200],
         }, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/copy error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/mempack/{mempack_id}/activity", methods=["GET", "OPTIONS"])
+async def rest_mempack_activity(request: Request) -> JSONResponse:
+    """Read activity events for a Mempack, newest first.
+
+    Path param:
+        mempack_id  (str, UUID)
+
+    Query params:
+        since       (ISO timestamp, optional)  return only events strictly
+                                               newer than this (delta polling)
+        limit       (int, default 100, max 500)
+        types       (CSV string, optional)     filter to specific event types
+                                               (e.g. "imprint,copy_in")
+
+    Returns: {status, count, server_time, activity: [...]} where server_time
+    is the as-of timestamp the caller should pass back as `since` next poll.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        mempack_id = request.path_params.get("mempack_id", "")
+        # Step 3: require auth + ownership before reading activity history.
+        user_id, mp, err = _require_mempack_owner(request, mempack_id)
+        if err is not None:
+            return err
+        since   = request.query_params.get("since")
+        limit_s = request.query_params.get("limit", "100")
+        types_s = request.query_params.get("types", "")
+        try:
+            limit = max(1, min(500, int(limit_s)))
+        except ValueError:
+            limit = 100
+        event_types = [t.strip() for t in types_s.split(",") if t.strip()] or None
+
+        import supabase_storage as sbs
+        rows = sbs.list_activity(
+            mempack_id=mempack_id,
+            since_ts=since,
+            limit=limit,
+            event_types=event_types,
+        )
+        from datetime import datetime, timezone
+        return JSONResponse({
+            "status":      "ok",
+            "mempack_id":  mempack_id,
+            "count":       len(rows),
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "activity":    rows,
+        }, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/mempack/<id>/activity error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/mempack/{mempack_id}/pattern-i", methods=["POST", "OPTIONS"])
+async def rest_mempack_pattern_i_update(request: Request) -> JSONResponse:
+    """Rewrite a Mempack's Pattern I (idx=1) from the dashboard.
+
+    Path param:
+        mempack_id  (str, UUID)
+
+    Body:
+        text        (str, required)  the new Pattern I body
+
+    REST counterpart to the mempack_update_pattern_i MCP tool. The MCP tool
+    requires an agent session with the Mempack mounted; this endpoint is for
+    the /app dashboard which doesn't have one.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    # NOTE: VPS_READ_ONLY guards public-demo writes to bundled knowledge carts.
+    # Mempack writes are per-user, auth-gated, ownership-checked — they're
+    # categorically different and should always be allowed when the caller
+    # owns the Mempack. We deliberately do NOT check read_only here.
+    try:
+        mempack_id = request.path_params.get("mempack_id", "")
+        # Step 3: require auth + ownership before any write.
+        user_id, mp, err = _require_mempack_owner(request, mempack_id)
+        if err is not None:
+            return err
+        body = await request.json()
+        text = body.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            return JSONResponse(
+                {"status": "error", "error": "text required (non-empty string)"},
+                status_code=400, headers=_cors_headers(),
+            )
+        if len(text) > MAX_TEXT_LENGTH:
+            return JSONResponse(
+                {"status": "error", "error":
+                    f"text too long ({len(text)} chars; max {MAX_TEXT_LENGTH})"},
+                status_code=400, headers=_cors_headers(),
+            )
+
+        try:
+            result = _mempack_replace_blobless(
+                mempack_id=mempack_id,
+                idx=PATTERN_I_IDX,
+                new_text=text,
+                agent_label="browser",
+            )
+        except ValueError as e:
+            return JSONResponse({"status": "error", "error": str(e)},
+                                status_code=404, headers=_cors_headers())
+
+        log.info(f"Pattern I updated via REST: mempack_id={mempack_id[:8]} ({len(text)} chars)")
+        return JSONResponse({
+            "status":     "ok",
+            "mempack_id": mempack_id,
+            "idx":        PATTERN_I_IDX,
+            "blob_bytes": result["blob_bytes"],
+            "preview":    result["preview"],
+        }, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/mempack/<id>/pattern-i error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/mempack/{mempack_id}", methods=["PATCH", "OPTIONS"])
+async def rest_mempack_settings(request: Request) -> JSONResponse:
+    """Update Mempack settings from the dashboard.
+
+    Path param:
+        mempack_id  (str, UUID)
+
+    Body (any subset):
+        activity_logging_enabled  (bool)
+        briefing                  (str)
+
+    Returns the updated mempack row.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    # See rest_mempack_pattern_i_update — Mempack settings writes intentionally
+    # bypass VPS_READ_ONLY (which is about knowledge-cart write protection).
+    try:
+        mempack_id = request.path_params.get("mempack_id", "")
+        # Step 3: require auth + ownership before any write.
+        user_id, mp, err = _require_mempack_owner(request, mempack_id)
+        if err is not None:
+            return err
+        body = await request.json()
+
+        import supabase_storage as sbs
+
+        patch: dict = {}
+        if "activity_logging_enabled" in body:
+            patch["activity_logging_enabled"] = bool(body["activity_logging_enabled"])
+        if "briefing" in body:
+            briefing = body["briefing"]
+            if briefing is not None and not isinstance(briefing, str):
+                return JSONResponse(
+                    {"status": "error", "error": "briefing must be string or null"},
+                    status_code=400, headers=_cors_headers(),
+                )
+            patch["briefing"] = briefing
+        if not patch:
+            return JSONResponse(
+                {"status": "error", "error": "no recognized fields in body"},
+                status_code=400, headers=_cors_headers(),
+            )
+        from datetime import datetime, timezone
+        patch["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        sb = sbs.get_client()
+        res = sb.table("mempacks").update(patch).eq("id", mempack_id).execute()
+        updated = res.data[0] if res.data else mp
+
+        # Activity log entry for settings change (visible audit trail)
+        try:
+            change_summary = ", ".join(f"{k}={v}" for k, v in patch.items() if k != "updated_at")
+            sbs.append_activity(
+                mempack_id=mempack_id,
+                event_type="settings_update",
+                summary=f"settings updated ({change_summary})",
+                metadata={"changes": {k: v for k, v in patch.items() if k != "updated_at"}},
+                agent_label="browser",
+            )
+        except Exception as e:
+            log.warning(f"Settings activity-log append failed (non-fatal): {e}")
+
+        log.info(f"Mempack settings updated: mempack_id={mempack_id[:8]} fields={list(patch.keys())}")
+        return JSONResponse({
+            "status":  "ok",
+            "mempack": updated,
+        }, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/mempack/<id> PATCH error: {e}")
         return JSONResponse({"status": "error", "error": str(e)},
                             status_code=500, headers=_cors_headers())
 
