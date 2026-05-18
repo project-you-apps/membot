@@ -3476,21 +3476,24 @@ function populateConnectPanel(mp){
   // NOT /sse. The 5/12 mcp.json.example is stale. Most modern MCP clients
   // (Claude Code, Cursor, Windsurf) accept either "streamableHttp" or "http"
   // as the type field; "sse" type pointing at /mcp will NOT connect.
+  // (We build snippets via array-join to keep this Python-templated JS safe.)
   const mcpUrl = (location.protocol === 'https:' ? 'https:' : 'http:') + '//' + location.host + '/membot/mcp';
-  const mcpSnippet =
-    '{\n' +
-    '  "mcpServers": {\n' +
-    '    "membot": {\n' +
-    '      "type": "streamableHttp",\n' +
-    '      "url": "' + mcpUrl + '"\n' +
-    '    }\n' +
-    '  }\n' +
-    '}';
-  const prompt =
-    'Mount the Mempack named "' + name + '" with owner_id ' + ownerId + ',\n' +
-    'then read Pattern I (mempack_read_pattern_i) and search for tag DISPATCH\n' +
-    '(memory_search query="DISPATCH" top_k=10). Acknowledge any dispatches you\n' +
-    'find back to me with a one-liner before starting work.';
+  const mcpSnippet = [
+    '{',
+    '  "mcpServers": {',
+    '    "membot": {',
+    '      "type": "streamableHttp",',
+    '      "url": "' + mcpUrl + '"',
+    '    }',
+    '  }',
+    '}'
+  ].join(String.fromCharCode(10));
+  const prompt = [
+    'Mount the Mempack named "' + name + '" with owner_id ' + ownerId + ',',
+    'then read Pattern I (mempack_read_pattern_i) and search for tag DISPATCH',
+    '(memory_search query="DISPATCH" top_k=10). Acknowledge any dispatches you',
+    'find back to me with a one-liner before starting work.'
+  ].join(String.fromCharCode(10));
   $('#connectMcpJson').textContent = mcpSnippet;
   $('#connectPrompt').textContent = prompt;
   // Reset copy status indicators
