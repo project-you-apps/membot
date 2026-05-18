@@ -2887,6 +2887,24 @@ _APP_HTML = """\
   .pattern-i-actions .saved-msg.success { color:var(--green); }
   .pattern-i-actions select { background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:12px; font-family:var(--mono); padding:6px 10px; border-radius:6px; outline:none; cursor:pointer; }
   .pattern-i-actions select:focus { border-color:var(--accent); }
+  .connect-panel { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .connect-panel > summary { cursor:pointer; list-style:none; outline:none; user-select:none; }
+  .connect-panel > summary::marker { display:none; }
+  .connect-panel > summary::before { content:'\25B8'; display:inline-block; margin-right:8px; color:var(--text-dim); transition:transform 0.15s; font-size:11px; }
+  .connect-panel[open] > summary::before { transform:rotate(90deg); }
+  .connect-body { margin-top:14px; padding-top:14px; border-top:1px solid var(--border); }
+  .connect-intro { font-size:13px; color:var(--text-dim); line-height:1.5; margin-bottom:14px; }
+  .connect-intro code { background:var(--surface-2); padding:1px 5px; border-radius:3px; font-size:12px; }
+  .connect-step { margin-top:14px; }
+  .connect-step-label { font-size:11px; font-weight:600; color:var(--text-bright); text-transform:uppercase; letter-spacing:0.4px; margin-bottom:6px; }
+  .connect-code { background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:10px 12px; font-family:var(--mono); font-size:12px; color:var(--text); line-height:1.5; overflow-x:auto; white-space:pre; margin:0 0 6px 0; }
+  .connect-copy { background:var(--surface-2); border:1px solid var(--border); color:var(--text-dim); font-size:11px; font-family:var(--mono); padding:4px 10px; border-radius:5px; cursor:pointer; }
+  .connect-copy:hover { color:var(--accent); border-color:var(--accent); }
+  .connect-copy-status { font-size:11px; color:var(--green); font-family:var(--mono); margin-left:8px; }
+  .connect-paths { margin-top:18px; padding-top:14px; border-top:1px dashed var(--border); }
+  .connect-paths ul { margin:6px 0 0 0; padding-left:18px; }
+  .connect-paths li { font-size:12px; color:var(--text-dim); line-height:1.7; }
+  .connect-paths li code { background:var(--surface-2); padding:1px 5px; border-radius:3px; font-size:11px; }
   .dispatch-editor textarea { width:100%; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:13px; font-family:var(--mono); padding:12px 14px; border-radius:10px; resize:vertical; min-height:96px; outline:none; transition:border-color 0.2s; line-height:1.5; }
   .dispatch-editor textarea:focus { border-color:var(--accent); }
   .dispatch-actions { display:flex; gap:8px; margin-top:8px; align-items:center; }
@@ -2979,6 +2997,35 @@ _APP_HTML = """\
     </div>
     <div id="mempackList" class="mempack-list"></div>
     <div id="mempackDetail" style="display:none">
+      <div class="dash-section">
+        <details class="connect-panel" id="connectPanel">
+          <summary><h3 style="display:inline-block; margin:0;">Connect an agent <span class="small">Mount this Mempack from Claude Desktop, Cursor, Claude Code, Windsurf, &hellip;</span></h3></summary>
+          <div class="connect-body">
+            <p class="connect-intro">Your dispatched tasks sit in this Mempack until an MCP-aware client mounts it. Drop the snippet below into your client's <code>mcp.json</code>, restart it, then ask the agent to mount your Mempack and check for dispatches.</p>
+            <div class="connect-step">
+              <div class="connect-step-label">1. Add this to your client's mcp.json</div>
+              <pre class="connect-code" id="connectMcpJson"></pre>
+              <button class="connect-copy" onclick="copyConnectSnippet('mcpJson')">Copy snippet</button>
+              <span class="connect-copy-status" id="connectMcpJsonStatus"></span>
+            </div>
+            <div class="connect-step">
+              <div class="connect-step-label">2. Restart your client, then prompt the agent</div>
+              <pre class="connect-code" id="connectPrompt"></pre>
+              <button class="connect-copy" onclick="copyConnectSnippet('prompt')">Copy prompt</button>
+              <span class="connect-copy-status" id="connectPromptStatus"></span>
+            </div>
+            <div class="connect-paths">
+              <div class="connect-step-label">Common config paths</div>
+              <ul>
+                <li><strong>Claude Desktop:</strong> <code>%APPDATA%\Claude\claude_desktop_config.json</code> (Win) / <code>~/Library/Application Support/Claude/claude_desktop_config.json</code> (Mac)</li>
+                <li><strong>Cursor:</strong> <code>~/.cursor/mcp.json</code></li>
+                <li><strong>Claude Code:</strong> <code>.mcp.json</code> (project) or <code>~/.claude/mcp.json</code> (global)</li>
+                <li><strong>Windsurf:</strong> <code>~/.codeium/windsurf/mcp_config.json</code></li>
+              </ul>
+            </div>
+          </div>
+        </details>
+      </div>
       <div class="dash-section">
         <h3>Dispatch <span class="small">Queue a task for your agent</span></h3>
         <div class="dispatch-editor">
@@ -3402,6 +3449,8 @@ function selectMempack(id, items){
   _activitySinceTs = null;
   document.querySelectorAll('.mempack-card').forEach(c => c.classList.toggle('active', c.dataset.id === id));
   $('#mempackDetail').style.display = '';
+  // Connect-an-agent snippets (owner_id + name baked in)
+  populateConnectPanel(mp);
   // Pattern I
   $('#patternIText').value = mp.pattern_i_text || '';
   $('#patternIMeta').textContent = mp.pattern_count + ' patterns total · idx=1 reserved';
@@ -3413,6 +3462,62 @@ function selectMempack(id, items){
   $('#activityFeed').innerHTML = '<div class="dash-empty">Loading activity...</div>';
   loadActivity(true);
   startActivityPoll();
+}
+
+/* Connect-an-agent panel — bakes the selected Mempack's name + owner_id into
+ * a ready-to-paste mcp.json snippet and a starter prompt. Owner_id is per-
+ * tool-call (mount_cartridge(name, owner_id)), not per-connection, so the
+ * snippet itself is just the SSE URL; the owner_id rides in the prompt.
+ */
+function populateConnectPanel(mp){
+  const ownerId = mp.owner_id || ($('#ownerUuid').value || '').trim() || '<your-uuid>';
+  const name = mp.name || 'primary';
+  const sseUrl = (location.protocol === 'https:' ? 'https:' : 'http:') + '//' + location.host + '/membot/sse';
+  const mcpSnippet =
+    '{\n' +
+    '  "mcpServers": {\n' +
+    '    "membot": {\n' +
+    '      "type": "sse",\n' +
+    '      "url": "' + sseUrl + '"\n' +
+    '    }\n' +
+    '  }\n' +
+    '}';
+  const prompt =
+    'Mount the Mempack named "' + name + '" with owner_id ' + ownerId + ',\n' +
+    'then read Pattern I (mempack_read_pattern_i) and search for tag DISPATCH\n' +
+    '(memory_search query="DISPATCH" top_k=10). Acknowledge any dispatches you\n' +
+    'find back to me with a one-liner before starting work.';
+  $('#connectMcpJson').textContent = mcpSnippet;
+  $('#connectPrompt').textContent = prompt;
+  // Reset copy status indicators
+  $('#connectMcpJsonStatus').textContent = '';
+  $('#connectPromptStatus').textContent = '';
+}
+
+async function copyConnectSnippet(which){
+  const sourceId = which === 'mcpJson' ? 'connectMcpJson' : 'connectPrompt';
+  const statusId = which === 'mcpJson' ? 'connectMcpJsonStatus' : 'connectPromptStatus';
+  const text = $('#' + sourceId).textContent || '';
+  try {
+    await navigator.clipboard.writeText(text);
+    $('#' + statusId).textContent = 'Copied!';
+    setTimeout(() => { $('#' + statusId).textContent = ''; }, 2000);
+  } catch(e) {
+    // Fallback for older browsers / restrictive contexts: select-and-execCommand
+    const pre = $('#' + sourceId);
+    const range = document.createRange();
+    range.selectNode(pre);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    try {
+      document.execCommand('copy');
+      $('#' + statusId).textContent = 'Copied (fallback)';
+      setTimeout(() => { $('#' + statusId).textContent = ''; }, 2000);
+    } catch(e2) {
+      $('#' + statusId).textContent = 'Copy failed — select + Ctrl+C';
+    }
+    window.getSelection().removeAllRanges();
+  }
 }
 
 async function savePatternI(){
