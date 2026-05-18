@@ -3519,9 +3519,10 @@ async function doDispatch(){
       status.className = 'saved-msg';
       return;
     }
-    status.textContent = 'Dispatched (idx=' + d.new_idx + ', ' + fmtBytes(d.blob_bytes) + ')';
+    status.textContent = 'Dispatched (idx=' + d.new_idx + ', ' + fmtBytes(d.blob_bytes) + ') — text kept; edit or clear to send again';
     status.className = 'saved-msg success';
-    ta.value = '';
+    // Text intentionally NOT cleared — so a repeat dispatch is one click, not
+    // a re-type. User clears the textarea themselves when they're done.
     // Refresh quota meter on the selected card (size changed). Cheapest path
     // is a full mempack-list reload, but that re-renders cards and loses the
     // selection animation; instead, mutate in place + tick activity feed so
