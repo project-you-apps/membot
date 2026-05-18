@@ -2882,9 +2882,16 @@ _APP_HTML = """\
   .dash-section > h3 .small { font-weight:400; text-transform:none; letter-spacing:0; color:var(--text-dim); margin-left:8px; font-size:11px; }
   .pattern-i-editor textarea { width:100%; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:13px; font-family:var(--mono); padding:14px 16px; border-radius:10px; resize:vertical; min-height:240px; outline:none; transition:border-color 0.2s; line-height:1.6; }
   .pattern-i-editor textarea:focus { border-color:var(--accent); }
-  .pattern-i-actions { display:flex; gap:8px; margin-top:10px; align-items:center; }
+  .pattern-i-actions { display:flex; gap:8px; margin-top:10px; align-items:center; flex-wrap:wrap; }
   .pattern-i-actions .saved-msg { color:var(--text-dim); font-size:11px; font-family:var(--mono); }
   .pattern-i-actions .saved-msg.success { color:var(--green); }
+  .pattern-i-actions select { background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:12px; font-family:var(--mono); padding:6px 10px; border-radius:6px; outline:none; cursor:pointer; }
+  .pattern-i-actions select:focus { border-color:var(--accent); }
+  .dispatch-editor textarea { width:100%; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:13px; font-family:var(--mono); padding:12px 14px; border-radius:10px; resize:vertical; min-height:96px; outline:none; transition:border-color 0.2s; line-height:1.5; }
+  .dispatch-editor textarea:focus { border-color:var(--accent); }
+  .dispatch-actions { display:flex; gap:8px; margin-top:8px; align-items:center; }
+  .dispatch-actions .saved-msg { color:var(--text-dim); font-size:11px; font-family:var(--mono); }
+  .dispatch-actions .saved-msg.success { color:var(--green); }
   .activity-feed { display:flex; flex-direction:column; gap:6px; max-height:480px; overflow-y:auto; padding-right:4px; }
   .activity-row { display:flex; gap:12px; padding:10px 12px; background:var(--surface); border:1px solid var(--border); border-radius:8px; align-items:flex-start; }
   .activity-row .ts { font-size:10px; color:var(--text-dim); font-family:var(--mono); white-space:nowrap; min-width:120px; padding-top:2px; }
@@ -2899,6 +2906,7 @@ _APP_HTML = """\
   .activity-row .type.copy_in        { background:#06b6d420; color:#06b6d4; }
   .activity-row .type.create         { background:#eab30820; color:var(--amber); }
   .activity-row .type.settings_update{ background:var(--surface-2); color:var(--text-dim); }
+  .activity-row .type.dispatch       { background:#3b82f620; color:#3b82f6; }
   .settings-row { display:flex; align-items:center; gap:10px; margin-bottom:10px; font-size:13px; color:var(--text); }
   .settings-row input[type=checkbox] { width:16px; height:16px; cursor:pointer; accent-color:var(--accent); }
   .settings-row label { cursor:pointer; }
@@ -2972,11 +2980,24 @@ _APP_HTML = """\
     <div id="mempackList" class="mempack-list"></div>
     <div id="mempackDetail" style="display:none">
       <div class="dash-section">
+        <h3>Dispatch <span class="small">Queue a task for your agent</span></h3>
+        <div class="dispatch-editor">
+          <textarea id="dispatchText" placeholder="Describe a task. It's saved to your Mempack tagged DISPATCH; your agent surfaces it on mount and acks before starting work."></textarea>
+          <div class="dispatch-actions">
+            <button onclick="doDispatch()">Send Dispatch</button>
+            <span class="saved-msg" id="dispatchStatus"></span>
+          </div>
+        </div>
+      </div>
+      <div class="dash-section">
         <h3>Pattern I &mdash; Behavior <span class="small" id="patternIMeta"></span></h3>
         <div class="pattern-i-editor">
           <textarea id="patternIText" placeholder="Pattern I bootstraps the agent on every mount. Write the agent's identity, behavior rules, learned preferences..."></textarea>
           <div class="pattern-i-actions">
             <button onclick="savePatternI()">Save Pattern I</button>
+            <select id="templateSelect" onchange="onTemplatePick()" title="Load a Pattern I starter template">
+              <option value="">Load template…</option>
+            </select>
             <span class="saved-msg" id="patternIStatus"></span>
           </div>
         </div>
@@ -3261,6 +3282,7 @@ async function setView(name){
       $('#ownerUuid').placeholder = 'No Supabase session detected. Sign in at project-you.app or use Override.';
       $('#mempackList').innerHTML = '<div class="dash-empty"><div class="icon">&#x1F511;</div>No Supabase session in this browser.<br><small>Sign in at <a href="https://project-you.app/" style="color:var(--accent)">project-you.app</a> first, then return.</small></div>';
     }
+    loadTemplates();  // populates the Pattern I template dropdown (cached)
     if (_currentMempack) startActivityPoll();
   } else {
     stopActivityPoll();
@@ -3411,6 +3433,105 @@ async function savePatternI(){
     _currentMempack.pattern_i_text = text;
   } catch(e) {
     status.textContent = 'Save failed: ' + e.message;
+  }
+}
+
+/* Pattern I templates — loaded once per page lifetime, cached client-side.
+ * The dropdown is populated from /api/mempack/templates; selecting an enabled
+ * entry replaces the Pattern I textarea (with confirm if non-empty).
+ */
+let _templatesCache = null;  // [{id, label, description, body, disabled}, ...]
+async function loadTemplates(){
+  if (_templatesCache) return _templatesCache;
+  try {
+    const r = await fetch(BASE() + '/api/mempack/templates');
+    const d = await r.json();
+    if (d.status !== 'ok') return null;
+    _templatesCache = d.templates || [];
+    const sel = $('#templateSelect');
+    if (sel) {
+      // Wipe existing options except the placeholder first option
+      while (sel.options.length > 1) sel.remove(1);
+      _templatesCache.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        opt.textContent = t.label + (t.disabled ? '' : '');
+        if (t.disabled) opt.disabled = true;
+        sel.appendChild(opt);
+      });
+    }
+    return _templatesCache;
+  } catch(e) {
+    console.warn('[membot] loadTemplates failed:', e);
+    return null;
+  }
+}
+
+function _applyTemplateVars(body){
+  // The server returns template placeholders intact ({owner_id}, etc.). Fill
+  // them client-side from the selected Mempack so the user sees a usable body.
+  if (!body || !_currentMempack) return body || '';
+  const ownerId = _currentMempack.owner_id || ($('#ownerUuid').value || '').trim();
+  const ownerShort = ownerId ? ownerId.slice(0, 8) : 'unknown';
+  const createdAt = new Date().toISOString();
+  return body
+    .replace(/\{owner_id_short\}/g, ownerShort)
+    .replace(/\{owner_id\}/g, ownerId || 'unknown')
+    .replace(/\{created_at\}/g, createdAt)
+    .replace(/\{name\}/g, _currentMempack.name || 'primary');
+}
+
+function onTemplatePick(){
+  const sel = $('#templateSelect');
+  const tid = sel.value;
+  if (!tid) return;
+  const t = (_templatesCache || []).find(x => x.id === tid);
+  if (!t || !t.body) { sel.value = ''; return; }
+  const current = $('#patternIText').value;
+  if (current && current.trim().length > 0) {
+    if (!confirm('Replace current Pattern I with the "' + t.label + '" template? Your current text will be overwritten in the editor (not yet saved to Supabase until you click "Save Pattern I").')) {
+      sel.value = '';
+      return;
+    }
+  }
+  $('#patternIText').value = _applyTemplateVars(t.body);
+  $('#patternIStatus').textContent = 'Template loaded — review then click "Save Pattern I"';
+  $('#patternIStatus').className = 'saved-msg';
+  sel.value = '';  // reset so picking the same template again still fires
+}
+
+async function doDispatch(){
+  if (!_currentMempack) { toast('Select a Mempack first', 'error'); return; }
+  const ta = $('#dispatchText');
+  const status = $('#dispatchStatus');
+  const text = (ta.value || '').trim();
+  if (!text) { toast('Type a dispatch first', 'error'); ta.focus(); return; }
+  status.textContent = 'Sending...';
+  status.className = 'saved-msg';
+  try {
+    const r = await fetch(BASE() + '/api/mempack/' + _currentMempack.id + '/dispatch', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({text})
+    });
+    const d = await r.json();
+    if (d.status !== 'ok') {
+      status.textContent = 'Error: ' + (d.error || 'unknown');
+      status.className = 'saved-msg';
+      return;
+    }
+    status.textContent = 'Dispatched (idx=' + d.new_idx + ', ' + fmtBytes(d.blob_bytes) + ')';
+    status.className = 'saved-msg success';
+    ta.value = '';
+    // Refresh quota meter on the selected card (size changed). Cheapest path
+    // is a full mempack-list reload, but that re-renders cards and loses the
+    // selection animation; instead, mutate in place + tick activity feed so
+    // the user immediately sees the dispatch row appear.
+    _currentMempack.pattern_count = d.pattern_count;
+    _currentMempack.size_bytes    = d.blob_bytes;
+    loadActivity(false);
+  } catch(e) {
+    status.textContent = 'Dispatch failed: ' + e.message;
+    status.className = 'saved-msg';
   }
 }
 
@@ -5202,6 +5323,98 @@ _DEFAULT_BRIEFING_TEMPLATE = (
 )
 
 
+_RESEARCHER_PATTERN_I_TEMPLATE = """# Pattern I — Researcher
+
+You are a research agent operating on behalf of {owner_id_short}. Your role is
+to investigate dispatched topics, gather evidence, synthesize findings, and
+write durable notes back into your Mempack so future-you (or another agent that
+mounts this Mempack) can build on what you've learned.
+
+## Identity
+- Role: Researcher
+- Bound to user: {owner_id}
+- Created: {created_at}
+- Mempack version: 1.0
+
+## Mount-time checklist (do this EVERY session)
+1. Re-read this Pattern I.
+2. `memory_search("DISPATCH", top_k=10)` — surface the user's open dispatches.
+3. `memory_search("ACTIVE", top_k=10)` — surface your in-flight threads.
+4. Acknowledge any new DISPATCH back to the user with a one-liner before
+   starting work, so they see it in the activity feed.
+
+## Working a dispatch
+- Cite sources in each stored note (URLs, paper titles, page numbers).
+- Tag every stored note with at least one of: FINDING, EVIDENCE,
+  OPEN_QUESTION, DEAD_END.
+- Distinguish OBSERVATION (what you found) from INFERENCE (what you concluded).
+  Never present an inference as a fact.
+- If a dispatch spans sessions, store an ACTIVE pattern with status
+  (`investigating` / `synthesizing` / `blocked` / `done`) and a one-line
+  next-step, then update Active threads below.
+
+## Closing a dispatch
+- Store a SUMMARY pattern (1-3 paragraphs) plus a list of FINDING-tagged
+  passage indices for the evidence trail.
+- Update Active threads to mark the thread `done`.
+
+## Tools at my disposal (full schemas via MCP tools/list)
+- `memory_search(query, top_k)` — semantic search across the mounted cart.
+  Use this FIRST whenever the user asks about something — past-you may have
+  already done the work.
+- `memory_store(content, tags)` — save a finding, summary, or note. Tag
+  liberally; tags are how future-you slices the corpus.
+- `mempack_read_pattern_i()` — re-read this behavioral text.
+- `mempack_update_pattern_i(text)` — overwrite this Pattern I (use to record
+  durable learnings, evolved methodology, refined tag vocabulary).
+- Whatever fetch / read / browse tools your host exposes. Discover via
+  `tools/list`.
+
+## Tag vocabulary for a Researcher Mempack
+- `DISPATCH` — user's open instructions, queued by the dashboard
+- `TASK` — user's open instructions, queued via your host
+- `FINDING` — a single concrete result, with citation
+- `EVIDENCE` — supporting quote / data point / page reference
+- `SUMMARY` — synthesis across multiple findings (closes a dispatch)
+- `OPEN_QUESTION` — something that surfaced but you couldn't answer
+- `DEAD_END` — a path you explored that didn't pan out (so future-you
+  doesn't redo it)
+- `ACTIVE` — an in-flight thread to resume next session
+- `METHOD` — a methodology you've found works for a class of research
+
+## Specialization
+(none yet — accumulates with use. Edit this as your research focus narrows.)
+
+## Active threads
+(none yet — track in-flight investigations here so they survive across
+sessions. Format: "- [<status>] <topic> — <next action>")
+"""
+
+
+# Registry: id → (label, description, body). Listed via GET /api/mempack/templates;
+# applied to Pattern I via the dashboard template picker. "coming_soon" sentinel
+# entries surface in the dropdown as disabled options.
+_PATTERN_I_TEMPLATES: dict[str, dict] = {
+    "default": {
+        "label":       "Default",
+        "description": "Generic personal Mempack — tag-store-search loop, no specialization.",
+        "body":        _DEFAULT_PATTERN_I_TEMPLATE,
+    },
+    "researcher": {
+        "label":       "Researcher",
+        "description": "Investigates dispatches, cites sources, distinguishes observation from inference, "
+                       "logs FINDING / EVIDENCE / OPEN_QUESTION / DEAD_END / SUMMARY.",
+        "body":        _RESEARCHER_PATTERN_I_TEMPLATE,
+    },
+    "_coming_soon": {
+        "label":       "More coming soon…",
+        "description": "Writer, Code-helper, Journal triage, Portland-news monitor — on the menu.",
+        "body":        None,
+        "disabled":    True,
+    },
+}
+
+
 def _build_starter_mempack_bytes(
     owner_id: str,
     name: str,
@@ -6123,6 +6336,117 @@ async def rest_mempack_pattern_i_update(request: Request) -> JSONResponse:
         }, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mempack/<id>/pattern-i error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/mempack/templates", methods=["GET", "OPTIONS"])
+async def rest_mempack_templates(request: Request) -> JSONResponse:
+    """List available Pattern I templates for the dashboard picker.
+
+    Response:
+        {
+          "status":    "ok",
+          "templates": [
+            {"id": "default",    "label": "Default",      "description": "...", "body": "..."},
+            {"id": "researcher", "label": "Researcher",   "description": "...", "body": "..."},
+            {"id": "_coming_soon", "label": "More coming soon…", "disabled": true, "body": null}
+          ]
+        }
+
+    Bodies are returned with template placeholders intact ({owner_id}, etc.) —
+    the dashboard substitutes them client-side before populating Pattern I.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    items = []
+    for tid, meta in _PATTERN_I_TEMPLATES.items():
+        items.append({
+            "id":          tid,
+            "label":       meta.get("label", tid),
+            "description": meta.get("description", ""),
+            "body":        meta.get("body"),
+            "disabled":    bool(meta.get("disabled", False)),
+        })
+    return JSONResponse({"status": "ok", "templates": items}, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/mempack/{mempack_id}/dispatch", methods=["POST", "OPTIONS"])
+async def rest_mempack_dispatch(request: Request) -> JSONResponse:
+    """Queue a user-authored task into the Mempack as a DISPATCH-tagged pattern.
+
+    The agent reads DISPATCH-tagged patterns on mount (see the default + Researcher
+    Pattern I templates) and acts on them. From the substrate's perspective this
+    is just another imprint — the DISPATCH tag is what makes it semantically a
+    "task" rather than a "stored finding."
+
+    Path param:
+        mempack_id  (str, UUID)
+
+    Body:
+        text        (str, required)  the dispatch body (what the user typed)
+
+    Response:
+        {"status":"ok", "mempack_id":..., "new_idx":..., "pattern_count":..., "blob_bytes":..., "preview":...}
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    # Mirror the Pattern I write: Mempack writes are auth+ownership-gated and
+    # categorically bypass VPS_READ_ONLY (which governs knowledge-cart writes).
+    try:
+        mempack_id = request.path_params.get("mempack_id", "")
+        user_id, mp, err = _require_mempack_owner(request, mempack_id)
+        if err is not None:
+            return err
+        body = await request.json()
+        text = body.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            return JSONResponse(
+                {"status": "error", "error": "text required (non-empty string)"},
+                status_code=400, headers=_cors_headers(),
+            )
+        if len(text) > MAX_TEXT_LENGTH:
+            return JSONResponse(
+                {"status": "error", "error":
+                    f"text too long ({len(text)} chars; max {MAX_TEXT_LENGTH})"},
+                status_code=400, headers=_cors_headers(),
+            )
+
+        # Match the memory_store tag convention: prefix the stored body with
+        # "[TAG] " so future memory_search("DISPATCH") surfaces it. The agent
+        # discovers the tag by reading the stored text, NOT by querying a
+        # separate metadata column.
+        stored_text = f"[DISPATCH] {text.strip()}"
+        preview = text.strip()[:120]
+
+        try:
+            result = _mempack_append_blobless(
+                mempack_id=mempack_id,
+                new_text=stored_text,
+                activity_event_type="dispatch",
+                activity_summary=f"dispatched task ({len(text)} chars)",
+                activity_metadata={
+                    "tag":         "DISPATCH",
+                    "text_length": len(text),
+                    "preview":     preview,
+                },
+                agent_label="browser",
+            )
+        except ValueError as e:
+            return JSONResponse({"status": "error", "error": str(e)},
+                                status_code=404, headers=_cors_headers())
+
+        log.info(f"Dispatch queued via REST: mempack_id={mempack_id[:8]} ({len(text)} chars)")
+        return JSONResponse({
+            "status":        "ok",
+            "mempack_id":    mempack_id,
+            "new_idx":       result["new_idx"],
+            "pattern_count": result["pattern_count"],
+            "blob_bytes":    result["blob_bytes"],
+            "preview":       preview,
+        }, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/mempack/<id>/dispatch error: {e}")
         return JSONResponse({"status": "error", "error": str(e)},
                             status_code=500, headers=_cors_headers())
 
