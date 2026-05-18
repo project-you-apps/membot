@@ -3472,13 +3472,17 @@ function selectMempack(id, items){
 function populateConnectPanel(mp){
   const ownerId = mp.owner_id || ($('#ownerUuid').value || '').trim() || '<your-uuid>';
   const name = mp.name || 'primary';
-  const sseUrl = (location.protocol === 'https:' ? 'https:' : 'http:') + '//' + location.host + '/membot/sse';
+  // Droplet membot runs `--transport http` (StreamableHTTP) — endpoint is /mcp,
+  // NOT /sse. The 5/12 mcp.json.example is stale. Most modern MCP clients
+  // (Claude Code, Cursor, Windsurf) accept either "streamableHttp" or "http"
+  // as the type field; "sse" type pointing at /mcp will NOT connect.
+  const mcpUrl = (location.protocol === 'https:' ? 'https:' : 'http:') + '//' + location.host + '/membot/mcp';
   const mcpSnippet =
     '{\n' +
     '  "mcpServers": {\n' +
     '    "membot": {\n' +
-    '      "type": "sse",\n' +
-    '      "url": "' + sseUrl + '"\n' +
+    '      "type": "streamableHttp",\n' +
+    '      "url": "' + mcpUrl + '"\n' +
     '    }\n' +
     '  }\n' +
     '}';
