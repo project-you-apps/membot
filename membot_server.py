@@ -960,7 +960,8 @@ def _mempack_persist_new_pattern(state: dict, new_text: str, new_emb: np.ndarray
 
 
 def _mempack_persist_pattern_update(
-    state: dict, idx: int, new_text: str, new_emb: np.ndarray
+    state: dict, idx: int, new_text: str, new_emb: np.ndarray,
+    previous_text: str | None = None,
 ) -> str:
     """Round-trip an IN-PLACE pattern update back to Supabase.
 
@@ -1059,6 +1060,12 @@ def _mempack_persist_pattern_update(
         log.warning(f"Mempack cache write failed (non-fatal): {e}")
 
     # 7. Activity log (best-effort — never block the update on log failure).
+    # Includes previous_text (capped) so the activity feed can offer recovery
+    # for accidental or agent-driven overwrites. See Fix A in todo list.
+    _PREV_CAP = 8000
+    _prev = previous_text if isinstance(previous_text, str) else ""
+    _prev_trunc = len(_prev) > _PREV_CAP
+    _prev_capped = _prev[:_PREV_CAP] if _prev_trunc else _prev
     try:
         if sbs.is_logging_enabled(mempack_id):
             event_type = "pattern_i_update" if idx == PATTERN_I_IDX else "pattern_update"
@@ -1069,9 +1076,12 @@ def _mempack_persist_pattern_update(
                 summary=f"{verb} ({len(new_text)} chars)",
                 pattern_idx=idx,
                 metadata={
-                    "blob_bytes":  len(blob_bytes),
-                    "text_length": len(new_text),
-                    "preview":     (new_text or "")[:120],
+                    "blob_bytes":              len(blob_bytes),
+                    "text_length":             len(new_text),
+                    "preview":                 (new_text or "")[:120],
+                    "previous_text":           _prev_capped,
+                    "previous_text_length":    len(_prev),
+                    "previous_text_truncated": _prev_trunc,
                 },
                 agent_label=state.get("agent_label"),
             )
@@ -2987,6 +2997,19 @@ _APP_HTML = """\
   .activity-row .type.create         { background:#eab30820; color:var(--amber); }
   .activity-row .type.settings_update{ background:var(--surface-2); color:var(--text-dim); }
   .activity-row .type.dispatch       { background:#3b82f620; color:#3b82f6; }
+  /* "Previous version" expander on pattern_i_update / pattern_update rows. */
+  .prev-version-toggle { display:inline-flex; align-items:center; gap:4px; background:transparent; border:1px solid var(--border); color:var(--text-dim); font-size:11px; font-family:var(--mono); padding:3px 8px; border-radius:4px; margin-top:6px; cursor:pointer; transition:all 0.15s; }
+  .prev-version-toggle:hover { color:var(--accent); border-color:var(--accent); }
+  .prev-version-toggle .caret { transition:transform 0.15s; }
+  .prev-version-toggle.open .caret { transform:rotate(90deg); }
+  .prev-version-block { display:none; margin-top:8px; }
+  .prev-version-block.open { display:block; }
+  .prev-version-text { padding:10px 12px; background:var(--surface-2); border:1px solid var(--border); border-radius:6px; font-family:var(--mono); font-size:11px; color:var(--text-dim); white-space:pre-wrap; word-break:break-word; max-height:320px; overflow-y:auto; margin:0; }
+  .prev-version-truncated-note { display:block; font-size:10px; color:var(--amber); margin-bottom:6px; }
+  .prev-version-actions { display:flex; gap:6px; margin-top:6px; }
+  .prev-version-copy { font-size:10px; font-family:var(--mono); padding:3px 8px; border-radius:4px; background:var(--surface); border:1px solid var(--border); color:var(--text-dim); cursor:pointer; }
+  .prev-version-copy:hover { color:var(--accent); border-color:var(--accent); }
+  .prev-version-copy.copied { color:var(--green); border-color:var(--green); }
   .settings-row { display:flex; align-items:center; gap:10px; margin-bottom:10px; font-size:13px; color:var(--text); }
   .settings-row input[type=checkbox] { width:16px; height:16px; cursor:pointer; accent-color:var(--accent); }
   .settings-row label { cursor:pointer; }
@@ -3955,15 +3978,85 @@ async function loadActivity(reset){
 }
 
 function _renderActivityRow(row){
-  const preview = (row.metadata && row.metadata.preview) || '';
+  const meta = row.metadata || {};
+  const preview = meta.preview || '';
+  // Previous-version expander: present on pattern_i_update / pattern_update
+  // events where we captured the prior text (Fix A — recoverability for
+  // accidental or agent-driven overwrites).
+  const prevText = meta.previous_text || '';
+  const prevLen  = meta.previous_text_length || 0;
+  const prevTrunc = !!meta.previous_text_truncated;
+  let prevBlock = '';
+  if (prevText && prevLen > 0) {
+    const label = 'View previous version (' + prevLen + ' chars)';
+    const truncNote = prevTrunc
+      ? ('<span class="prev-version-truncated-note">'
+        + 'NOTE: previous body truncated at 8 KB in this activity row '
+        + '(full was ' + prevLen + ' chars). For the complete prior text, '
+        + 'check earlier activity rows or restore from a manual backup.'
+        + '</span>')
+      : '';
+    prevBlock =
+      '<button type="button" class="prev-version-toggle" onclick="togglePrevVersion(this)">'
+      + '<span class="caret">&#x25B8;</span> ' + esc(label)
+      + '</button>'
+      + '<div class="prev-version-block">'
+      +   truncNote
+      +   '<pre class="prev-version-text">' + esc(prevText) + '</pre>'
+      +   '<div class="prev-version-actions">'
+      +     '<button type="button" class="prev-version-copy" onclick="copyPrevVersion(this)">Copy previous text</button>'
+      +   '</div>'
+      + '</div>';
+  }
   return '<div class="activity-row">'
     + '<div class="ts">' + esc(fmtTs(row.created_at)) + '</div>'
     + '<div class="body">'
     +   '<div class="summary">' + esc(row.summary || '') + '</div>'
     +   (preview ? '<div class="preview">' + esc(preview) + '</div>' : '')
+    +   prevBlock
     + '</div>'
     + '<span class="type ' + esc(row.event_type) + '">' + esc(row.event_type) + '</span>'
     + '</div>';
+}
+
+function togglePrevVersion(btn){
+  const block = btn.nextElementSibling;
+  if (!block) return;
+  const isOpen = block.classList.toggle('open');
+  btn.classList.toggle('open', isOpen);
+}
+
+async function copyPrevVersion(btn){
+  // Find the <pre> sibling that holds the previous text within this block.
+  const block = btn.closest('.prev-version-block');
+  if (!block) return;
+  const pre = block.querySelector('.prev-version-text');
+  if (!pre) return;
+  const text = pre.textContent || '';
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.classList.add('copied');
+    const original = btn.textContent;
+    btn.textContent = 'Copied to clipboard';
+    setTimeout(() => {
+      btn.classList.remove('copied');
+      btn.textContent = original;
+    }, 2000);
+  } catch(e) {
+    // Fallback for restrictive contexts (file://, older browsers)
+    const range = document.createRange();
+    range.selectNode(pre);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    try {
+      document.execCommand('copy');
+      btn.classList.add('copied');
+      btn.textContent = 'Copied (select-and-copy fallback)';
+      setTimeout(() => { btn.classList.remove('copied'); btn.textContent = 'Copy previous text'; }, 2000);
+    } catch(e2) {
+      btn.textContent = 'Copy failed — text is selected, hit Ctrl+C';
+    }
+  }
 }
 
 function startActivityPoll(){
@@ -4589,6 +4682,11 @@ def mempack_update_pattern_i(text: str, session_id: str = "") -> str:
 
         new_bin_row = (emb > 0).astype(np.uint8).reshape(1, -1)
 
+        # Capture previous Pattern I body BEFORE mutating state, so we can
+        # pass it to the persist function for the activity log (Fix A —
+        # recoverability for agent-driven overwrites).
+        previous_text = texts[PATTERN_I_IDX] if len(texts) > PATTERN_I_IDX else None
+
         if len(texts) > PATTERN_I_IDX:
             # In-place overwrite
             texts[PATTERN_I_IDX] = text
@@ -4618,7 +4716,7 @@ def mempack_update_pattern_i(text: str, session_id: str = "") -> str:
 
         # 3. Persist to Supabase (update existing row or append if missing)
         persist_msg = _mempack_persist_pattern_update(
-            state, PATTERN_I_IDX, text, emb
+            state, PATTERN_I_IDX, text, emb, previous_text=previous_text,
         )
 
         elapsed_ms = (time.time() - t0) * 1000
@@ -6511,12 +6609,24 @@ def _mempack_replace_blobless(
     """Replace pattern at idx in a Mempack without a mounted session.
 
     For Pattern I rewrites from /app dashboard. Pads if idx >= len(texts).
+
+    Captures previous_text from the existing slot BEFORE mutation and stuffs
+    it into the activity_metadata so the activity feed can offer a recovery
+    surface (Fix A — no schema change, no tombstone semantics, just a usable
+    audit trail).
     """
     mp, cache_path, embeddings, texts = _mempack_load_for_mutation(mempack_id)
     if idx >= len(texts):
         raise ValueError(
             f"Mempack has {len(texts)} patterns; idx={idx} out of range"
         )
+    # Capture BEFORE mutation. Cap at 8 KB to keep the activity row JSONB
+    # bounded; the full length is recorded separately so the UI can warn
+    # "previous body truncated — full version was N chars."
+    _PREV_CAP = 8000
+    previous_text = texts[idx] if isinstance(texts[idx], str) else ""
+    previous_text_truncated = len(previous_text) > _PREV_CAP
+    previous_text_capped = previous_text[:_PREV_CAP] if previous_text_truncated else previous_text
     if new_embedding is None:
         new_embedding = embed_text(new_text, prefix="search_document").astype(np.float32)
     texts[idx] = new_text
@@ -6527,6 +6637,24 @@ def _mempack_replace_blobless(
     if activity_summary is None:
         verb = "rewrote Pattern I" if idx == PATTERN_I_IDX else f"updated pattern at idx {idx}"
         activity_summary = f"{verb} ({len(new_text)} chars)"
+    # Default metadata includes previous_text for recoverability. If a caller
+    # supplied custom metadata, respect it but ensure the prev-text fields
+    # are present so the UI's expander always has something to show.
+    default_metadata = {
+        "text_length":              len(new_text),
+        "preview":                  (new_text or "")[:120],
+        "previous_text":            previous_text_capped,
+        "previous_text_length":     len(previous_text),
+        "previous_text_truncated":  previous_text_truncated,
+    }
+    if activity_metadata is not None:
+        # Layer caller-provided keys on top, then ensure prev-text fields exist
+        merged_metadata = {**default_metadata, **activity_metadata}
+        for k, v in default_metadata.items():
+            merged_metadata.setdefault(k, v)
+        activity_metadata = merged_metadata
+    else:
+        activity_metadata = default_metadata
     blob_size = _mempack_repack_and_persist(
         mp, cache_path, new_embeddings, texts,
         mutated_idx=idx,
@@ -6534,10 +6662,7 @@ def _mempack_replace_blobless(
         is_replace=True,
         activity_event_type=activity_event_type,
         activity_summary=activity_summary,
-        activity_metadata=activity_metadata or {
-            "text_length": len(new_text),
-            "preview":     (new_text or "")[:120],
-        },
+        activity_metadata=activity_metadata,
         agent_label=agent_label,
     )
     return {
