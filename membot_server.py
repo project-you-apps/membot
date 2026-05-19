@@ -2758,11 +2758,16 @@ async def app_frontend_trailing_slash(request: Request):
 
     Starlette doesn't auto-redirect on slash mismatch when routes are
     registered via FastMCP's custom_route helper, so `/app/` was 404ing.
-    Nginx already strips `/membot/` to `/`, so this catches the public
-    `https://project-you.app/membot/app/` URL too.
+
+    Use a RELATIVE redirect ('../app') so the browser resolves it against
+    whatever prefix it's behind: from `https://project-you.app/membot/app/`
+    -> `https://project-you.app/membot/app`; from local
+    `http://localhost:8050/app/` -> `http://localhost:8050/app`. An absolute
+    '/app' would 404 in prod (nginx doesn't re-prepend `/membot/` to the
+    Location header it forwards).
     """
     from starlette.responses import RedirectResponse
-    return RedirectResponse(url="/app", status_code=301)
+    return RedirectResponse(url="../app", status_code=301)
 
 _APP_HTML = """\
 <!DOCTYPE html>
