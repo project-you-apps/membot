@@ -3807,6 +3807,11 @@ function selectMempack(id, items){
   $('#patternIStatus').className = 'saved-msg';
   // Settings
   $('#loggingToggle').checked = mp.activity_logging_enabled !== false;
+  // Dispatch textbox: pre-fill with the most recent DISPATCH-tagged pattern
+  // so the user can see what's currently queued without digging into the
+  // Patterns Browser. Falls back to whatever the user had typed previously
+  // if the fetch fails or no DISPATCH exists.
+  prefillDispatchFromMempack(mp.id);
   // Patterns browser (resets state — filters cleared, offset back to 0)
   _patternsCurrentTag = '';
   _patternsCurrentQ = '';
@@ -3854,6 +3859,18 @@ function populateConnectPanel(mp){
     'Then read Pattern I (mempack_read_pattern_i) and search for tag DISPATCH',
     '(memory_search query="DISPATCH" top_k=10). Acknowledge any dispatches you',
     'find back to me with a one-liner before starting work.',
+    '',
+    'If there are no DISPATCH patterns, tell me in chat — do not invent work.',
+    '',
+    'When you complete the dispatch, store every finding via memory_store with',
+    'an appropriate tag (FINDING / SUMMARY / METHOD / etc.). Sign each stored',
+    'pattern by appending a signature line at the end of the content body:',
+    '  [signed: <your-model-name>@<your-host>, <ISO-timestamp>]',
+    'e.g. [signed: qwen3:8b@goose, 2026-05-19T18:45:00Z]',
+    '',
+    'Do NOT report completion until memory_store has actually been called and',
+    'returned a "Stored as passage #N" confirmation. Describing findings in',
+    'chat is not storing them.',
     '',
     'Note: the owner_id above is a database key. Address me as "' + userLabel + '"',
     'in conversation — Pattern I has the user-facing identifier.'
@@ -3994,6 +4011,41 @@ function onTemplatePick(){
   $('#patternIStatus').textContent = 'Template loaded — review then click "Save Pattern I"';
   $('#patternIStatus').className = 'saved-msg';
   sel.value = '';  // reset so picking the same template again still fires
+}
+
+/* Pre-fill the Dispatch textbox with the most-recent DISPATCH-tagged
+ * pattern in the selected Mempack. Surfaces "what's currently queued" at
+ * the surface where the user types — no need to dig into the Patterns
+ * Browser to see what's in flight. Strips the `[DISPATCH] ` prefix from
+ * the body and tags the textbox with a small `most recent dispatch in
+ * this Mempack` hint until the user edits.
+ */
+async function prefillDispatchFromMempack(mempackId){
+  const ta = $('#dispatchText');
+  const status = $('#dispatchStatus');
+  if (!ta) return;
+  try {
+    const r = await fetch(BASE() + '/api/mempack/' + mempackId + '/patterns?tag=DISPATCH&limit=1', { credentials: 'same-origin' });
+    const d = await r.json();
+    if (d.status !== 'ok' || !d.patterns || d.patterns.length === 0) {
+      // No DISPATCH in this Mempack — leave textbox in whatever state it had
+      // and clear the status line.
+      if (status && status.textContent.startsWith('most recent dispatch')) status.textContent = '';
+      return;
+    }
+    const newest = d.patterns[0];
+    let body = newest.text || '';
+    if (body.startsWith('[') && body.indexOf(']') > 0) {
+      body = body.slice(body.indexOf(']') + 1).trimStart();
+    }
+    ta.value = body;
+    if (status) {
+      status.className = 'saved-msg';
+      status.textContent = 'most recent dispatch in this Mempack (idx:' + newest.idx + ')';
+    }
+  } catch(e) {
+    // Silently fail — pre-fill is a convenience, not a load-bearing surface.
+  }
 }
 
 async function doDispatch(){
@@ -6114,6 +6166,27 @@ right here, in Pattern I.
   preferences, or specialization evolves. Treat it as a living MEMORY.md.
 - When the user dispatches a task (look for tag="DISPATCH" or "TASK" patterns),
   acknowledge it, work it, then mark progress in Active threads below.
+- If a `memory_search("DISPATCH")` returns no open dispatches, tell the user
+  in chat ("No open dispatches in your Mempack — what would you like me to
+  work on?") rather than inventing work.
+- When existing FINDING/SUMMARY patterns look related to an open DISPATCH,
+  ASK the user whether to extend / refresh / give a second opinion / audit /
+  treat the dispatch as already closed — don't silently skip OR silently
+  re-run.
+
+## Sign your work
+Every `memory_store` call MUST end the content body with a signature line:
+`[signed: <model-name>@<host>, <ISO-timestamp>]`
+e.g. `[signed: claude-sonnet-4-6@claude-desktop, 2026-05-19T12:30:00Z]`.
+This lets the user audit which agent produced which pattern across
+multi-agent runs.
+
+## Reporting completion
+Reporting "done" / "task complete" / "findings stored" to the user WITHOUT
+having called `memory_store` is forbidden. Describing findings in chat is
+not storing them. The Mempack must contain the work product in stored form
+before any completion claim — if you haven't called memory_store and gotten
+a "Stored as passage #N" response, you're not done.
 
 ## Tools at my disposal (full schemas via MCP tools/list)
 - `memory_search(query, top_k)` — semantic search across the mounted cart.
@@ -6180,6 +6253,39 @@ The user-facing identifier is here, in Pattern I.
 3. `memory_search("ACTIVE", top_k=10)` — surface your in-flight threads.
 4. Acknowledge any new DISPATCH back to the user with a one-liner before
    starting work, so they see it in the activity feed.
+5. If there are NO DISPATCH-tagged patterns, tell the user in chat:
+   "No open dispatches in your Mempack — what would you like me to work on?"
+   Do NOT invent work; do NOT assume past findings mean past dispatches are
+   "done"; ask.
+
+## When existing work product is already in the Mempack
+If you find DISPATCH patterns AND existing FINDING/SUMMARY patterns that
+look related to the same topic, the user's intent could be ANY of six modes:
+
+1. **First-time run** — no prior work exists yet; do the work fresh.
+2. **Refresh** — prior findings exist but they may be stale; update them.
+3. **Second opinion** — prior findings exist; the user wants a DIFFERENT
+   agent's take on the same dispatch (this is why signing your work
+   matters — see Sign-your-work section below).
+4. **Extend** — prior findings are good; user wants ADDITIONAL findings
+   (e.g., "you found 10, find 10 more").
+5. **Audit** — prior findings exist; user wants you to VERIFY them, flag
+   anything that looks wrong, not redo from scratch.
+6. **Skip** — prior findings already closed the dispatch; user just hasn't
+   garbage-collected the DISPATCH tag yet.
+
+These intents look identical from the Mempack's read-only state — you cannot
+distinguish them without asking. Default behavior: **surface what you found
+and ask, before proceeding**:
+
+> "I see DISPATCH at idx:N (your task), and FINDINGs at idx:M-P + SUMMARY
+> at idx:Q that look related. Should I (a) treat the dispatch as already
+> closed, (b) extend with additional findings, (c) give a second opinion,
+> (d) audit the existing findings, (e) refresh / re-run from scratch, or
+> (f) something else?"
+
+Do NOT silently re-run AND do NOT silently skip. Both produce
+the wrong outcome for at least one of the six modes above. Clarify first.
 
 ## Working a dispatch
 - Cite sources in each stored note (URLs, paper titles, page numbers).
@@ -6191,10 +6297,29 @@ The user-facing identifier is here, in Pattern I.
   (`investigating` / `synthesizing` / `blocked` / `done`) and a one-line
   next-step, then update Active threads below.
 
-## Closing a dispatch
-- Store a SUMMARY pattern (1-3 paragraphs) plus a list of FINDING-tagged
-  passage indices for the evidence trail.
-- Update Active threads to mark the thread `done`.
+## Sign your work
+Every `memory_store` call MUST end the content body with a signature line:
+`[signed: <model-name>@<host>, <timestamp>]`
+For example:
+`[signed: claude-sonnet-4-6@claude-desktop, 2026-05-19T12:30:00Z]`
+or
+`[signed: qwen3:8b@goose, 2026-05-19T18:45:00Z]`
+This is how the user audits which agent contributed which pattern across
+multi-agent runs. Do not skip this — unsigned patterns are anonymous and
+hard to audit.
+
+## Closing a dispatch — STRICT, no shortcuts
+1. Store every finding as a separate FINDING-tagged pattern via `memory_store`
+   (with signature line). Each finding is its own pattern, not consolidated.
+2. Store a SUMMARY-tagged pattern (1-3 paragraphs) referencing the FINDING
+   passage indices.
+3. Only AFTER both steps above succeed (you've called memory_store and
+   gotten "Stored as passage #N" back), report completion to the user.
+4. Reporting "task complete" / "findings stored" / "done" to the user
+   WITHOUT having called memory_store IS FORBIDDEN. Describing findings
+   in chat is not storing them. The Mempack must contain the work product
+   in stored form before any completion claim.
+5. Update Active threads below to mark the thread `done`.
 
 ## Tools at my disposal (full schemas via MCP tools/list)
 - `memory_search(query, top_k)` — semantic search across the mounted cart.
