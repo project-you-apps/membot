@@ -3036,6 +3036,14 @@ _APP_HTML = """\
   .patterns-pagination { display:flex; justify-content:center; margin-top:10px; }
   .patterns-pagination button { font-size:12px; font-family:var(--mono); padding:6px 16px; border-radius:6px; background:var(--surface); border:1px solid var(--border); color:var(--text-dim); cursor:pointer; }
   .patterns-pagination button:hover { color:var(--accent); border-color:var(--accent); }
+  .patterns-download { display:flex; align-items:center; gap:6px; margin-top:14px; padding-top:12px; border-top:1px dashed var(--border); flex-wrap:wrap; }
+  .patterns-download-label { font-size:11px; color:var(--text-dim); font-family:var(--mono); margin-right:4px; }
+  .patterns-download-btn { font-size:11px; font-family:var(--mono); padding:5px 12px; border-radius:5px; background:var(--surface); border:1px solid var(--border); color:var(--text); cursor:pointer; transition:all 0.15s; }
+  .patterns-download-btn:hover { color:var(--accent); border-color:var(--accent); background:var(--surface-2); }
+  .patterns-download-btn:disabled { opacity:0.5; cursor:wait; }
+  .patterns-download-status { font-size:11px; color:var(--text-dim); font-family:var(--mono); margin-left:6px; }
+  .patterns-download-status.success { color:var(--green); }
+  .patterns-download-status.error   { color:#ef4444; }
   /* "Previous version" expander on pattern_i_update / pattern_update rows. */
   .prev-version-toggle { display:inline-flex; align-items:center; gap:4px; background:transparent; border:1px solid var(--border); color:var(--text-dim); font-size:11px; font-family:var(--mono); padding:3px 8px; border-radius:4px; margin-top:6px; cursor:pointer; transition:all 0.15s; }
   .prev-version-toggle:hover { color:var(--accent); border-color:var(--accent); }
@@ -3201,6 +3209,14 @@ _APP_HTML = """\
         <div id="patternsList" class="patterns-list"></div>
         <div class="patterns-pagination" id="patternsPagination" style="display:none">
           <button onclick="loadMorePatterns()">Load more</button>
+        </div>
+        <div class="patterns-download" id="patternsDownload" style="display:none">
+          <span class="patterns-download-label">Download current view:</span>
+          <button class="patterns-download-btn" onclick="downloadPatterns('md')">.md</button>
+          <button class="patterns-download-btn" onclick="downloadPatterns('txt')">.txt</button>
+          <button class="patterns-download-btn" onclick="downloadPatterns('docx')">.docx</button>
+          <button class="patterns-download-btn" onclick="downloadPatterns('pdf')">.pdf</button>
+          <span class="patterns-download-status" id="patternsDownloadStatus"></span>
         </div>
       </div>
       <div class="dash-section">
@@ -4196,6 +4212,9 @@ async function loadPatterns(reset){
       cnt.textContent = 'Showing ' + _patternsOffset + ' of ' + _patternsTotal + filter_str;
     }
     if (pag) pag.style.display = (_patternsOffset < _patternsTotal) ? '' : 'none';
+    // Show the download bar only when there's something downloadable.
+    const dl = $('#patternsDownload');
+    if (dl) dl.style.display = (_patternsTotal > 0) ? '' : 'none';
   } catch(e) {
     list.innerHTML = '<div class="dash-empty"><div class="icon">&#x26A0;</div>' + esc(e.message) + '</div>';
   }
@@ -4281,6 +4300,63 @@ function onPatternsSearchInput(){
 
 function loadMorePatterns(){
   loadPatterns(false);
+}
+
+/* Download the current Patterns Browser filter+search state as a single
+ * document. Server renders the filtered patterns to markdown, then
+ * optionally pipes through pandoc (docx/pdf). Filename comes from the
+ * Content-Disposition response header.
+ */
+async function downloadPatterns(format){
+  if (!_currentMempack) return;
+  const status = $('#patternsDownloadStatus');
+  const btns = document.querySelectorAll('.patterns-download-btn');
+  const params = new URLSearchParams();
+  params.set('format', format);
+  if (_patternsCurrentTag) params.set('tag', _patternsCurrentTag);
+  if (_patternsCurrentQ)   params.set('q',   _patternsCurrentQ);
+  const url = BASE() + '/api/mempack/' + _currentMempack.id + '/patterns/export?' + params.toString();
+  // Disable buttons while in flight (pdf can take a few seconds)
+  btns.forEach(b => { b.disabled = true; });
+  status.className = 'patterns-download-status';
+  status.textContent = format === 'pdf' ? 'Rendering PDF&hellip;' : 'Preparing&hellip;';
+  try {
+    const r = await fetch(url, { credentials: 'same-origin' });
+    if (!r.ok) {
+      let detail = 'HTTP ' + r.status;
+      try { const errd = await r.json(); if (errd && errd.error) detail = errd.error; } catch(_) {}
+      status.className = 'patterns-download-status error';
+      status.textContent = 'Download failed: ' + detail;
+      return;
+    }
+    const blob = await r.blob();
+    // Extract filename from Content-Disposition header
+    const cd = r.headers.get('content-disposition') || '';
+    const fnMatch = cd.match(/filename="([^"]+)"/);
+    const filename = fnMatch ? fnMatch[1] : ('mempack.' + format);
+    // Trigger browser download via blob URL + invisible anchor
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
+    status.className = 'patterns-download-status success';
+    status.textContent = 'Saved as ' + filename;
+    setTimeout(() => {
+      if (status.textContent.startsWith('Saved as ')) {
+        status.className = 'patterns-download-status';
+        status.textContent = '';
+      }
+    }, 4000);
+  } catch(e) {
+    status.className = 'patterns-download-status error';
+    status.textContent = 'Download error: ' + e.message;
+  } finally {
+    btns.forEach(b => { b.disabled = false; });
+  }
 }
 
 // Restore last view on page load (UUID auto-detected from Supabase cookie inside setView)
@@ -7222,6 +7298,236 @@ async def rest_mempack_patterns(request: Request) -> JSONResponse:
                             status_code=404, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mempack/<id>/patterns error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+def _render_patterns_as_markdown(patterns: list[dict], mempack_name: str,
+                                  tag_filter: str = "", q_filter: str = "") -> str:
+    """Build a single markdown document from a filtered pattern list.
+
+    Each pattern becomes an `## idx:N · TAGS` section followed by the body.
+    The `[TAG]` prefix is stripped from the body since we already render the
+    tags in the section header — avoids "FINDING — FINDING — ..." duplication.
+    """
+    from datetime import datetime, timezone as _tz
+    parts: list[str] = []
+    title = f"# Mempack: {mempack_name}"
+    if tag_filter:
+        title += f" — Filter: `{tag_filter}`"
+    if q_filter:
+        title += f" — Search: `\"{q_filter}\"`"
+    parts.append(title)
+    parts.append("")
+    parts.append(
+        f"_Exported {datetime.now(_tz.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}_  "
+        f"&nbsp;·&nbsp; **{len(patterns)} pattern(s)**"
+    )
+    parts.append("")
+    parts.append("---")
+    parts.append("")
+    for p in patterns:
+        tags = p.get("tags") or []
+        tags_str = ", ".join(tags) if tags else "(no tags)"
+        parts.append(f"## idx:{p['idx']} · `{tags_str}`")
+        parts.append("")
+        body = p.get("text") or ""
+        # Strip leading [TAG] prefix to avoid double-rendering the tags.
+        if body.startswith("[") and "]" in body[:200]:
+            body = body[body.find("]") + 1:].lstrip()
+        parts.append(body)
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def _safe_filename_component(name: str) -> str:
+    """Normalize a string into a safe filename slug — alphanumerics, dash, underscore, dot."""
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_\-.]", "_", name or "")
+    safe = safe.strip("_") or "mempack"
+    return safe[:64]
+
+
+@mcp.custom_route("/api/mempack/{mempack_id}/patterns/export", methods=["GET", "OPTIONS"])
+async def rest_mempack_patterns_export(request: Request):
+    """Download the filtered Patterns Browser state as a single document.
+
+    Same filtering/sorting semantics as GET /api/mempack/{id}/patterns
+    (tag + q + skip_reserved). Renders the filtered list to a single
+    markdown document, then optionally pipes that markdown through Pandoc
+    to produce docx or PDF.
+
+    Query params:
+        format          'md' (default) | 'txt' | 'docx' | 'pdf'
+        tag             tag filter (uppercase, exact); same as list endpoint
+        q               substring filter on body text
+        skip_reserved   default true (skip Pattern 0 + Pattern I)
+
+    Auth: same as Patterns Browser — owner-only.
+
+    Pandoc is required for docx + pdf. The droplet has pandoc 2.2.1 +
+    wkhtmltopdf 0.12.5 installed (apt). PDF is rendered via wkhtmltopdf
+    (HTML-rendering engine) — smaller dependency than LaTeX and good
+    enough output for our research-doc use case.
+    """
+    from starlette.responses import Response
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        mempack_id = request.path_params.get("mempack_id", "")
+        user_id, mp, err = _require_mempack_owner(request, mempack_id)
+        if err is not None:
+            return err
+
+        format_param = (request.query_params.get("format") or "md").lower()
+        if format_param not in ("md", "txt", "docx", "pdf"):
+            return JSONResponse(
+                {"status": "error",
+                 "error": f"format must be one of md|txt|docx|pdf; got: {format_param!r}"},
+                status_code=400, headers=_cors_headers(),
+            )
+
+        tag = (request.query_params.get("tag") or "").strip().upper()
+        q = (request.query_params.get("q") or "").strip()
+        skip_reserved_param = (request.query_params.get("skip_reserved", "true") or "").lower()
+        skip_reserved = skip_reserved_param not in ("false", "0", "no", "off")
+
+        # Filter exactly the same way the list endpoint does, so what the
+        # user downloads matches what they see in the Patterns Browser.
+        _mp, _cache, _embeddings, texts = _mempack_load_for_mutation(mempack_id)
+        patterns: list[dict] = []
+        for idx, text in enumerate(texts):
+            if skip_reserved and idx <= PATTERN_I_IDX:
+                continue
+            if not isinstance(text, str):
+                continue
+            tag_list = _extract_tags_from_text(text)
+            tag_upper = [t.upper() for t in tag_list]
+            if tag and tag not in tag_upper:
+                continue
+            if q and q.lower() not in text.lower():
+                continue
+            patterns.append({"idx": idx, "text": text, "tags": tag_upper})
+        patterns.sort(key=lambda r: r["idx"], reverse=True)
+
+        mempack_name = mp.get("name") or "primary"
+        md_content = _render_patterns_as_markdown(
+            patterns, mempack_name, tag_filter=tag, q_filter=q,
+        )
+
+        # Filename: <mempack>_<tag-or-all>_<date>.<ext>
+        from datetime import datetime, timezone as _tz
+        date_str = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+        tag_part = f"_{_safe_filename_component(tag)}" if tag else ""
+        base_filename = f"{_safe_filename_component(mempack_name)}{tag_part}_{date_str}"
+
+        # Plain-text formats: serve the markdown directly.
+        if format_param == "md":
+            return Response(
+                content=md_content.encode("utf-8"),
+                media_type="text/markdown; charset=utf-8",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{base_filename}.md"',
+                    **_cors_headers(),
+                },
+            )
+        if format_param == "txt":
+            return Response(
+                content=md_content.encode("utf-8"),
+                media_type="text/plain; charset=utf-8",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{base_filename}.txt"',
+                    **_cors_headers(),
+                },
+            )
+
+        # Pandoc-piped formats. docx writes to stdout cleanly; PDF needs a
+        # temp file because pandoc 2.x's PDF backend doesn't reliably emit
+        # binary to stdout when paired with wkhtmltopdf.
+        import subprocess
+        import tempfile
+        if format_param == "docx":
+            cmd = ["pandoc", "-f", "markdown", "-t", "docx", "-o", "-"]
+            try:
+                result = subprocess.run(
+                    cmd, input=md_content.encode("utf-8"),
+                    capture_output=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                return JSONResponse(
+                    {"status": "error", "error": "pandoc docx timeout (30s)"},
+                    status_code=504, headers=_cors_headers(),
+                )
+            if result.returncode != 0 or not result.stdout:
+                log.error(
+                    f"pandoc docx export failed (rc={result.returncode}): "
+                    f"{result.stderr.decode('utf-8', errors='replace')[:500]}"
+                )
+                return JSONResponse(
+                    {"status": "error", "error": "pandoc docx export failed"},
+                    status_code=500, headers=_cors_headers(),
+                )
+            return Response(
+                content=result.stdout,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{base_filename}.docx"',
+                    **_cors_headers(),
+                },
+            )
+
+        # format_param == "pdf"
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_pdf_path = tmp.name
+        try:
+            cmd = [
+                "pandoc", "-f", "markdown",
+                "--pdf-engine=wkhtmltopdf",
+                "-V", "margin-top=18mm", "-V", "margin-bottom=18mm",
+                "-V", "margin-left=18mm", "-V", "margin-right=18mm",
+                "-o", tmp_pdf_path,
+            ]
+            try:
+                result = subprocess.run(
+                    cmd, input=md_content.encode("utf-8"),
+                    capture_output=True, timeout=60,
+                )
+            except subprocess.TimeoutExpired:
+                return JSONResponse(
+                    {"status": "error", "error": "pandoc PDF timeout (60s)"},
+                    status_code=504, headers=_cors_headers(),
+                )
+            if result.returncode != 0:
+                log.error(
+                    f"pandoc pdf export failed (rc={result.returncode}): "
+                    f"{result.stderr.decode('utf-8', errors='replace')[:500]}"
+                )
+                return JSONResponse(
+                    {"status": "error", "error": "pandoc PDF export failed"},
+                    status_code=500, headers=_cors_headers(),
+                )
+            with open(tmp_pdf_path, "rb") as fh:
+                pdf_bytes = fh.read()
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{base_filename}.pdf"',
+                    **_cors_headers(),
+                },
+            )
+        finally:
+            try:
+                os.unlink(tmp_pdf_path)
+            except OSError:
+                pass
+    except ValueError as e:
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=404, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/mempack/<id>/patterns/export error: {e}")
         return JSONResponse({"status": "error", "error": str(e)},
                             status_code=500, headers=_cors_headers())
 
