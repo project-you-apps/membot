@@ -4035,13 +4035,23 @@ async function prefillDispatchFromMempack(mempackId){
     }
     const newest = d.patterns[0];
     let body = newest.text || '';
+    // Strip leading [DISPATCH] tag prefix
     if (body.startsWith('[') && body.indexOf(']') > 0) {
       body = body.slice(body.indexOf(']') + 1).trimStart();
+    }
+    // Strip trailing [dispatched: <iso-timestamp>] line — surfaced in the
+    // status label instead so the textbox shows only the user's words.
+    let dispatchedAt = null;
+    const dispatchedMatch = body.match(/\s*\[dispatched:\s*([^\]]+)\]\s*$/);
+    if (dispatchedMatch) {
+      dispatchedAt = dispatchedMatch[1].trim();
+      body = body.slice(0, dispatchedMatch.index).trimEnd();
     }
     ta.value = body;
     if (status) {
       status.className = 'saved-msg';
-      status.textContent = 'most recent dispatch in this Mempack (idx:' + newest.idx + ')';
+      const tsBit = dispatchedAt ? ' · ' + dispatchedAt : '';
+      status.textContent = 'most recent dispatch in this Mempack (idx:' + newest.idx + ')' + tsBit;
     }
   } catch(e) {
     // Silently fail — pre-fill is a convenience, not a load-bearing surface.
@@ -6258,6 +6268,18 @@ The user-facing identifier is here, in Pattern I.
    Do NOT invent work; do NOT assume past findings mean past dispatches are
    "done"; ask.
 
+## DISPATCH body format (server-stamped)
+DISPATCH patterns the user queues from the dashboard have this shape:
+
+    [DISPATCH] <user's instruction>
+
+    [dispatched: 2026-05-19T18:30:00Z]
+
+The trailing `[dispatched: <ISO timestamp UTC>]` is server-stamped at imprint
+time — use it for freshness assessment and ordering. You can trust this
+timestamp; it is NOT something the user typed. Don't second-guess the date —
+treat it as ground truth for "when this task was queued."
+
 ## When existing work product is already in the Mempack
 If you find DISPATCH patterns AND existing FINDING/SUMMARY patterns that
 look related to the same topic, the user's intent could be ANY of six modes:
@@ -7910,8 +7932,16 @@ async def rest_mempack_dispatch(request: Request) -> JSONResponse:
         # "[TAG] " so future memory_search("DISPATCH") surfaces it. The agent
         # discovers the tag by reading the stored text, NOT by querying a
         # separate metadata column.
-        stored_text = f"[DISPATCH] {text.strip()}"
-        preview = text.strip()[:120]
+        #
+        # Server-stamp the imprint time at the end of the body so agents
+        # don't have to guess "is today's date 2024 or 2026?" — local models
+        # in particular are trained to hedge on temporal grounding and need
+        # an explicit anchor. Format: ISO 8601 UTC with seconds precision.
+        from datetime import datetime as _dt, timezone as _tz
+        dispatched_iso = _dt.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        body_text = text.strip()
+        stored_text = f"[DISPATCH] {body_text}\n\n[dispatched: {dispatched_iso}]"
+        preview = body_text[:120]
 
         try:
             result = _mempack_append_blobless(
@@ -7920,9 +7950,10 @@ async def rest_mempack_dispatch(request: Request) -> JSONResponse:
                 activity_event_type="dispatch",
                 activity_summary=f"dispatched task ({len(text)} chars)",
                 activity_metadata={
-                    "tag":         "DISPATCH",
-                    "text_length": len(text),
-                    "preview":     preview,
+                    "tag":            "DISPATCH",
+                    "text_length":    len(text),
+                    "preview":        preview,
+                    "dispatched_at":  dispatched_iso,
                 },
                 agent_label="browser",
             )
