@@ -3730,11 +3730,20 @@ function populateConnectPanel(mp){
     '  }',
     '}'
   ].join(String.fromCharCode(10));
+  // Pull a friendly user label off whoami if available — the prompt nudges
+  // the agent to address the user by name/email rather than the UUID it
+  // had to pass to mount_cartridge. UUID stays in the tool args because
+  // the API requires it.
+  const _wp = (_whoamiCache && _whoamiCache.whoami) || {};
+  const userLabel = _wp.full_name || _wp.email || (ownerId && ownerId !== '<your-uuid>' ? ownerId.slice(0, 8) : 'me');
   const prompt = [
-    'Mount the Mempack named "' + name + '" with owner_id ' + ownerId + ',',
-    'then read Pattern I (mempack_read_pattern_i) and search for tag DISPATCH',
+    'Mount the Mempack named "' + name + '" with owner_id ' + ownerId + '.',
+    'Then read Pattern I (mempack_read_pattern_i) and search for tag DISPATCH',
     '(memory_search query="DISPATCH" top_k=10). Acknowledge any dispatches you',
-    'find back to me with a one-liner before starting work.'
+    'find back to me with a one-liner before starting work.',
+    '',
+    'Note: the owner_id above is a database key. Address me as "' + userLabel + '"',
+    'in conversation — Pattern I has the user-facing identifier.'
   ].join(String.fromCharCode(10));
   $('#connectMcpJson').textContent = mcpSnippet;
   $('#connectPrompt').textContent = prompt;
@@ -5647,9 +5656,16 @@ _DEFAULT_PATTERN_I_TEMPLATE = """# Pattern I — Default Mempack Behavior
 You are an AI agent using a Mempack provisioned for {owner_id_short}.
 
 ## Identity
-- Bound to user: {owner_id}
+- User: {owner_id}
 - Created: {created_at}
 - Mempack version: 1.0
+
+## How to address the user
+Refer to the user as **{owner_id_short}** (or **{owner_id}**) in every
+response. Do NOT use the UUID you see in tool-call arguments — that's a
+database key (used by `mount_cartridge(name, owner_id=...)`, Supabase
+Storage paths, etc.), not the user's name. The user-facing identifier is
+right here, in Pattern I.
 
 ## Behavior
 - Read this Pattern I first on every session to remind yourself who you are.
@@ -5710,9 +5726,16 @@ mounts this Mempack) can build on what you've learned.
 
 ## Identity
 - Role: Researcher
-- Bound to user: {owner_id}
+- User: {owner_id}
 - Created: {created_at}
 - Mempack version: 1.0
+
+## How to address the user
+Refer to the user as **{owner_id_short}** (or **{owner_id}**) in every
+response. Do NOT use the UUID you see in tool-call arguments — that's just a
+database key (used internally by `mount_cartridge(name, owner_id=...)`,
+Supabase Storage paths, mempack_patterns rows). It is not the user's name.
+The user-facing identifier is here, in Pattern I.
 
 ## Mount-time checklist (do this EVERY session)
 1. Re-read this Pattern I.
@@ -5798,12 +5821,21 @@ def _build_starter_mempack_bytes(
     name: str,
     briefing: str | None = None,
     pattern_i_text: str | None = None,
+    email: str | None = None,
+    full_name: str | None = None,
 ) -> dict:
     """Build the bytes + metadata needed to provision a fresh Mempack into Supabase.
 
     Returns a dict with: blob_bytes, hippocampus_bytes, texts, briefing,
     pattern_i_text, manifest. Suitable for passing to
     supabase_storage.auto_provision_primary or to the migration script.
+
+    email/full_name (optional): when provided, the briefing + Pattern I body
+    substitute the friendly identifiers into `{owner_id_short}` and
+    `{owner_id}` slots so the agent reads "operating on behalf of <name>"
+    instead of "operating on behalf of <uuid-prefix>". Falls back to the
+    UUID-prefix display when neither is available (e.g. password sign-ups
+    without metadata, or callers that don't know the user's metadata).
     """
     import io
     import struct as _struct
@@ -5813,13 +5845,19 @@ def _build_starter_mempack_bytes(
     )
 
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ")
-    owner_id_short = owner_id[:8] if owner_id else "unknown"
+    # Resolve the agent-facing identifiers. Keep `owner_id` (UUID) as the
+    # storage path / API key throughout, but prefer human-friendly forms for
+    # any text the agent will read in Pattern I / briefing.
+    uuid_short = owner_id[:8] if owner_id else "unknown"
+    email_local = email.split("@", 1)[0] if email and "@" in email else None
+    label_short = full_name or email_local or uuid_short      # "Andy Grossberg" / "andy.grossberg" / "ececf504"
+    label_full  = email or full_name or owner_id or "unknown" # "andy@gmail.com" / "Andy Grossberg" / UUID
 
     briefing = briefing or _DEFAULT_BRIEFING_TEMPLATE.format(
-        owner_id=owner_id, owner_id_short=owner_id_short, name=name,
+        owner_id=label_full, owner_id_short=label_short, name=name,
     )
     pattern_i_text = pattern_i_text or _DEFAULT_PATTERN_I_TEMPLATE.format(
-        owner_id=owner_id, owner_id_short=owner_id_short, created_at=created_at,
+        owner_id=label_full, owner_id_short=label_short, created_at=created_at,
     )
 
     idx0_marker = (
@@ -5967,12 +6005,18 @@ async def rest_mempack_create(request: Request) -> JSONResponse:
                 status_code=409, headers=_cors_headers(),
             )
 
-        # Build starter bytes + metadata
+        # Build starter bytes + metadata. Lift email + full_name off the
+        # caller's verified JWT so the agent-facing templates greet the user
+        # by name/email instead of UUID prefix.
+        _claims_for_provision = _get_user_claims_from_request(request) or {}
+        _meta_for_provision = _claims_for_provision.get("user_metadata") or {}
         starter = _build_starter_mempack_bytes(
             owner_id=owner_id,
             name=clean_name,
             briefing=data.get("briefing"),
             pattern_i_text=data.get("pattern_i"),
+            email=_claims_for_provision.get("email"),
+            full_name=_meta_for_provision.get("full_name") or _meta_for_provision.get("name"),
         )
 
         # Atomic-ish provision: row(pending) -> blob upload -> pattern rows -> row(ready)
@@ -6206,7 +6250,15 @@ async def rest_mempacks_list(request: Request) -> JSONResponse:
         if owner_id and not mempacks and auto_provision and _supabase_available():
             try:
                 import supabase_storage as sbs
-                starter = _build_starter_mempack_bytes(owner_id=owner_id, name="primary")
+                # Lift email + full_name off the caller's JWT so the auto-
+                # provisioned briefing + Pattern I greet by name/email.
+                _claims_p = _get_user_claims_from_request(request) or {}
+                _meta_p = _claims_p.get("user_metadata") or {}
+                starter = _build_starter_mempack_bytes(
+                    owner_id=owner_id, name="primary",
+                    email=_claims_p.get("email"),
+                    full_name=_meta_p.get("full_name") or _meta_p.get("name"),
+                )
                 sbs.auto_provision_primary(
                     owner_id=owner_id,
                     starter_blob_bytes=starter["blob_bytes"],
