@@ -3029,10 +3029,16 @@ _APP_HTML = """\
   .pattern-body { display:none; padding:10px 12px 12px 12px; border-top:1px solid var(--border); }
   .pattern-row.open .pattern-body { display:block; }
   .pattern-text { background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:12px; font-family:var(--mono); font-size:12px; color:var(--text); line-height:1.5; white-space:pre-wrap; word-break:break-word; max-height:400px; overflow-y:auto; margin:0; }
-  .pattern-actions { display:flex; gap:6px; margin-top:8px; }
+  .pattern-actions { display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap; }
   .pattern-copy-btn { font-size:11px; font-family:var(--mono); padding:4px 10px; border-radius:5px; background:var(--surface); border:1px solid var(--border); color:var(--text-dim); cursor:pointer; }
   .pattern-copy-btn:hover { color:var(--accent); border-color:var(--accent); }
   .pattern-copy-btn.copied { color:var(--green); border-color:var(--green); }
+  .pattern-actions-sep { color:var(--text-dim); opacity:0.5; }
+  .pattern-actions-label { font-size:10px; color:var(--text-dim); font-family:var(--mono); }
+  .pattern-row-dl-btn { font-size:10px; padding:3px 8px; }
+  .pattern-download-row-status { font-size:10px; color:var(--text-dim); font-family:var(--mono); margin-left:4px; }
+  .pattern-download-row-status.success { color:var(--green); }
+  .pattern-download-row-status.error   { color:#ef4444; }
   .patterns-pagination { display:flex; justify-content:center; margin-top:10px; }
   .patterns-pagination button { font-size:12px; font-family:var(--mono); padding:6px 16px; border-radius:6px; background:var(--surface); border:1px solid var(--border); color:var(--text-dim); cursor:pointer; }
   .patterns-pagination button:hover { color:var(--accent); border-color:var(--accent); }
@@ -4245,9 +4251,27 @@ function _renderPatternRow(p){
     +   '<pre class="pattern-text">' + esc(p.text || '') + '</pre>'
     +   '<div class="pattern-actions">'
     +     '<button class="pattern-copy-btn" onclick="copyPatternBody(this)">Copy</button>'
+    +     '<span class="pattern-actions-sep">&middot;</span>'
+    +     '<span class="pattern-actions-label">Download:</span>'
+    +     '<button class="pattern-download-btn pattern-row-dl-btn" data-fmt="md"   onclick="onPatternDl(this)">.md</button>'
+    +     '<button class="pattern-download-btn pattern-row-dl-btn" data-fmt="txt"  onclick="onPatternDl(this)">.txt</button>'
+    +     '<button class="pattern-download-btn pattern-row-dl-btn" data-fmt="docx" onclick="onPatternDl(this)">.docx</button>'
+    +     '<button class="pattern-download-btn pattern-row-dl-btn" data-fmt="pdf"  onclick="onPatternDl(this)">.pdf</button>'
+    +     '<span class="pattern-download-row-status"></span>'
     +   '</div>'
     + '</div>'
     + '</div>';
+}
+
+function onPatternDl(btn){
+  // Tiny bridge: reads format + idx from data attrs to avoid the
+  // single-quote string-collision that comes with inline arg literals.
+  const fmt = btn.dataset.fmt;
+  const row = btn.closest('.pattern-row');
+  if (!row) return;
+  const idx = parseInt(row.dataset.idx, 10);
+  if (isNaN(idx)) return;
+  downloadPatterns(fmt, idx);
 }
 
 function togglePatternBody(headerEl){
@@ -4302,39 +4326,63 @@ function loadMorePatterns(){
   loadPatterns(false);
 }
 
-/* Download the current Patterns Browser filter+search state as a single
- * document. Server renders the filtered patterns to markdown, then
- * optionally pipes through pandoc (docx/pdf). Filename comes from the
- * Content-Disposition response header.
+/* Download Patterns Browser content as a document.
+ *
+ *   downloadPatterns('md')        — bulk: filtered set (current tag + q)
+ *   downloadPatterns('md', 5)     — single pattern by idx
+ *
+ * Single-pattern mode wires status messages to the per-row status span
+ * inside that row's .pattern-actions block; bulk mode uses the global
+ * #patternsDownloadStatus span under the patterns list.
  */
-async function downloadPatterns(format){
+async function downloadPatterns(format, idx){
   if (!_currentMempack) return;
-  const status = $('#patternsDownloadStatus');
-  const btns = document.querySelectorAll('.patterns-download-btn');
+  const isSingle = (idx !== undefined && idx !== null);
+
+  // Locate the right status element + button group for this scope.
+  let statusEl, btns;
+  if (isSingle) {
+    const row = document.querySelector('.pattern-row[data-idx="' + idx + '"]');
+    if (!row) return;
+    statusEl = row.querySelector('.pattern-download-row-status');
+    btns = row.querySelectorAll('.pattern-row-dl-btn, .pattern-copy-btn');
+  } else {
+    statusEl = $('#patternsDownloadStatus');
+    btns = document.querySelectorAll('.patterns-download-btn');
+  }
+
   const params = new URLSearchParams();
   params.set('format', format);
-  if (_patternsCurrentTag) params.set('tag', _patternsCurrentTag);
-  if (_patternsCurrentQ)   params.set('q',   _patternsCurrentQ);
+  if (isSingle) {
+    params.set('idx', String(idx));
+  } else {
+    if (_patternsCurrentTag) params.set('tag', _patternsCurrentTag);
+    if (_patternsCurrentQ)   params.set('q',   _patternsCurrentQ);
+  }
   const url = BASE() + '/api/mempack/' + _currentMempack.id + '/patterns/export?' + params.toString();
-  // Disable buttons while in flight (pdf can take a few seconds)
+
+  // Disable buttons while in flight (PDF can take 2-5 seconds)
   btns.forEach(b => { b.disabled = true; });
-  status.className = 'patterns-download-status';
-  status.textContent = format === 'pdf' ? 'Rendering PDF&hellip;' : 'Preparing&hellip;';
+  if (statusEl) {
+    statusEl.className = isSingle ? 'pattern-download-row-status' : 'patterns-download-status';
+    statusEl.textContent = format === 'pdf' ? 'Rendering PDF…' : 'Preparing…';
+  }
+
   try {
     const r = await fetch(url, { credentials: 'same-origin' });
     if (!r.ok) {
       let detail = 'HTTP ' + r.status;
       try { const errd = await r.json(); if (errd && errd.error) detail = errd.error; } catch(_) {}
-      status.className = 'patterns-download-status error';
-      status.textContent = 'Download failed: ' + detail;
+      if (statusEl) {
+        statusEl.className = (isSingle ? 'pattern-download-row-status' : 'patterns-download-status') + ' error';
+        statusEl.textContent = 'Download failed: ' + detail;
+      }
       return;
     }
     const blob = await r.blob();
-    // Extract filename from Content-Disposition header
     const cd = r.headers.get('content-disposition') || '';
     const fnMatch = cd.match(/filename="([^"]+)"/);
     const filename = fnMatch ? fnMatch[1] : ('mempack.' + format);
-    // Trigger browser download via blob URL + invisible anchor
     const blobUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = blobUrl;
@@ -4343,17 +4391,21 @@ async function downloadPatterns(format){
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(blobUrl), 1500);
-    status.className = 'patterns-download-status success';
-    status.textContent = 'Saved as ' + filename;
-    setTimeout(() => {
-      if (status.textContent.startsWith('Saved as ')) {
-        status.className = 'patterns-download-status';
-        status.textContent = '';
-      }
-    }, 4000);
+    if (statusEl) {
+      statusEl.className = (isSingle ? 'pattern-download-row-status' : 'patterns-download-status') + ' success';
+      statusEl.textContent = 'Saved as ' + filename;
+      setTimeout(() => {
+        if (statusEl.textContent.startsWith('Saved as ')) {
+          statusEl.className = isSingle ? 'pattern-download-row-status' : 'patterns-download-status';
+          statusEl.textContent = '';
+        }
+      }, 4000);
+    }
   } catch(e) {
-    status.className = 'patterns-download-status error';
-    status.textContent = 'Download error: ' + e.message;
+    if (statusEl) {
+      statusEl.className = (isSingle ? 'pattern-download-row-status' : 'patterns-download-status') + ' error';
+      statusEl.textContent = 'Download error: ' + e.message;
+    }
   } finally {
     btns.forEach(b => { b.disabled = false; });
   }
@@ -7342,6 +7394,18 @@ def _render_patterns_as_markdown(patterns: list[dict], mempack_name: str,
     return "\n".join(parts)
 
 
+def _render_single_pattern_as_markdown(pattern: dict, mempack_name: str) -> str:
+    """Build a single-pattern markdown doc. Lighter than the bulk render:
+    one H1 header (idx + tags), no top-of-doc summary, no separators.
+    """
+    tags = pattern.get("tags") or []
+    tags_str = ", ".join(tags) if tags else "(no tags)"
+    body = pattern.get("text") or ""
+    if body.startswith("[") and "]" in body[:200]:
+        body = body[body.find("]") + 1:].lstrip()
+    return f"# {mempack_name} · idx:{pattern['idx']} · `{tags_str}`\n\n{body}\n"
+
+
 def _safe_filename_component(name: str) -> str:
     """Normalize a string into a safe filename slug — alphanumerics, dash, underscore, dot."""
     import re
@@ -7394,34 +7458,82 @@ async def rest_mempack_patterns_export(request: Request):
         skip_reserved_param = (request.query_params.get("skip_reserved", "true") or "").lower()
         skip_reserved = skip_reserved_param not in ("false", "0", "no", "off")
 
-        # Filter exactly the same way the list endpoint does, so what the
-        # user downloads matches what they see in the Patterns Browser.
+        # Single-pattern short-circuit: when ?idx=N is supplied, ignore filters
+        # and just emit that one pattern. Used by the per-row download buttons
+        # in the Patterns Browser — different unit of work than the filtered-set
+        # bulk download.
+        single_idx_param = (request.query_params.get("idx") or "").strip()
+        single_idx: int | None = None
+        if single_idx_param != "":
+            try:
+                single_idx = int(single_idx_param)
+            except ValueError:
+                return JSONResponse(
+                    {"status": "error", "error": f"idx must be an integer; got: {single_idx_param!r}"},
+                    status_code=400, headers=_cors_headers(),
+                )
+            if single_idx < 0:
+                return JSONResponse(
+                    {"status": "error", "error": "idx must be >= 0"},
+                    status_code=400, headers=_cors_headers(),
+                )
+
+        # Load cart once whether we're doing single or bulk.
         _mp, _cache, _embeddings, texts = _mempack_load_for_mutation(mempack_id)
-        patterns: list[dict] = []
-        for idx, text in enumerate(texts):
-            if skip_reserved and idx <= PATTERN_I_IDX:
-                continue
+        mempack_name = mp.get("name") or "primary"
+
+        if single_idx is not None:
+            # ── Single-pattern path ──
+            if single_idx >= len(texts):
+                return JSONResponse(
+                    {"status": "error",
+                     "error": f"idx={single_idx} out of range (mempack has {len(texts)} patterns)"},
+                    status_code=404, headers=_cors_headers(),
+                )
+            text = texts[single_idx]
             if not isinstance(text, str):
-                continue
+                return JSONResponse(
+                    {"status": "error", "error": f"pattern at idx={single_idx} has no text body"},
+                    status_code=404, headers=_cors_headers(),
+                )
             tag_list = _extract_tags_from_text(text)
             tag_upper = [t.upper() for t in tag_list]
-            if tag and tag not in tag_upper:
-                continue
-            if q and q.lower() not in text.lower():
-                continue
-            patterns.append({"idx": idx, "text": text, "tags": tag_upper})
-        patterns.sort(key=lambda r: r["idx"], reverse=True)
+            single_pattern = {"idx": single_idx, "text": text, "tags": tag_upper}
+            md_content = _render_single_pattern_as_markdown(single_pattern, mempack_name)
+        else:
+            # ── Filtered-set (bulk) path: same logic as the list endpoint ──
+            patterns: list[dict] = []
+            for idx, text in enumerate(texts):
+                if skip_reserved and idx <= PATTERN_I_IDX:
+                    continue
+                if not isinstance(text, str):
+                    continue
+                tag_list = _extract_tags_from_text(text)
+                tag_upper = [t.upper() for t in tag_list]
+                if tag and tag not in tag_upper:
+                    continue
+                if q and q.lower() not in text.lower():
+                    continue
+                patterns.append({"idx": idx, "text": text, "tags": tag_upper})
+            patterns.sort(key=lambda r: r["idx"], reverse=True)
+            md_content = _render_patterns_as_markdown(
+                patterns, mempack_name, tag_filter=tag, q_filter=q,
+            )
 
-        mempack_name = mp.get("name") or "primary"
-        md_content = _render_patterns_as_markdown(
-            patterns, mempack_name, tag_filter=tag, q_filter=q,
-        )
-
-        # Filename: <mempack>_<tag-or-all>_<date>.<ext>
+        # Filename: per-pattern uses idx + first tag; bulk uses filter tag (if any).
         from datetime import datetime, timezone as _tz
         date_str = datetime.now(_tz.utc).strftime("%Y-%m-%d")
-        tag_part = f"_{_safe_filename_component(tag)}" if tag else ""
-        base_filename = f"{_safe_filename_component(mempack_name)}{tag_part}_{date_str}"
+        if single_idx is not None:
+            tag_part = ""
+            if tag_upper:
+                tag_part = f"_{_safe_filename_component(tag_upper[0])}"
+            base_filename = (
+                f"{_safe_filename_component(mempack_name)}_idx{single_idx}"
+                f"{tag_part}_{date_str}"
+            )
+        else:
+            tag_part = f"_{_safe_filename_component(tag)}" if tag else ""
+            base_filename = f"{_safe_filename_component(mempack_name)}{tag_part}_{date_str}"
 
         # Plain-text formats: serve the markdown directly.
         if format_param == "md":
