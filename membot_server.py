@@ -2915,6 +2915,12 @@ _APP_HTML = """\
   .dash-row { display:flex; gap:8px; align-items:center; margin-bottom:14px; }
   .dash-row input.uuid-input { flex:1; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:12px; padding:8px 12px; border-radius:8px; outline:none; font-family:var(--mono); }
   .dash-row input.uuid-input:focus { border-color:var(--accent); }
+  .owner-display { flex:1; display:flex; flex-direction:column; gap:6px; min-width:0; }
+  .owner-email-line { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .owner-email-key { font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--text-dim); font-weight:600; flex-shrink:0; }
+  .owner-email { font-size:13px; color:var(--text-bright); font-weight:600; word-break:break-all; min-width:0; }
+  .owner-email.anonymous { color:var(--text-dim); font-weight:400; font-style:italic; }
+  .dash-row input.uuid-input.uuid-input--secondary { font-size:10px; padding:4px 8px; color:var(--text-dim); opacity:0.65; }
   .dash-row button { background:var(--accent); color:white; border:none; padding:8px 18px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; transition:all 0.2s; }
   .dash-row button:hover { background:var(--accent-dim); }
   .dash-row button.secondary { background:var(--surface-2); color:var(--text); border:1px solid var(--border); }
@@ -3048,9 +3054,15 @@ _APP_HTML = """\
   <div id="mempackView" style="display:none">
     <p class="intro"><strong>Mempack &mdash; portable per-agent memory.</strong> Each agent gets its own writable cart that travels with it. This dashboard is your home base for what your agent has been doing on your behalf.</p>
     <div class="dash-row" id="ownerRow">
-      <input type="text" id="ownerUuid" class="uuid-input" placeholder="Detecting Supabase session..." readonly>
+      <div class="owner-display">
+        <div class="owner-email-line">
+          <span class="owner-email-key">Signed in as</span>
+          <span class="owner-email" id="ownerEmailLabel">(detecting&hellip;)</span>
+        </div>
+        <input type="text" id="ownerUuid" class="uuid-input uuid-input--secondary" placeholder="UUID will appear once signed in" title="Internal owner UUID (used by the API)" readonly>
+      </div>
       <button onclick="loadMempacks()">Reload</button>
-      <button class="secondary" onclick="overrideOwner()" title="Sign in as a different user (admin/debug)">Override</button>
+      <button class="secondary" onclick="overrideOwner()" title="Override owner UUID (admin/debug)">Override</button>
     </div>
     <div id="mempackList" class="mempack-list"></div>
     <div id="mempackDetail" style="display:none">
@@ -3435,7 +3447,24 @@ let _authMenuOpen = false;
 let _signinPopupRef = null;
 let _signinPopupPoll = null;
 
+function renderOwnerEmailLabel(whoami){
+  // Updates the "Signed in as <email>" label at the top of the Mempack tab.
+  // Falls through to "Anonymous" italic when no session is detected.
+  const el = document.getElementById('ownerEmailLabel');
+  if (!el) return;
+  if (whoami && whoami.signed_in) {
+    el.textContent = whoami.email || whoami.full_name || (whoami.user_id ? whoami.user_id.slice(0, 8) : 'Signed in');
+    el.classList.remove('anonymous');
+  } else {
+    el.textContent = 'Anonymous';
+    el.classList.add('anonymous');
+  }
+}
+
 function renderAuthChip(whoami){
+  // Side-effect: also refresh the owner-email label since both surfaces are
+  // informed by the same whoami payload.
+  renderOwnerEmailLabel(whoami);
   const chip = document.getElementById('authChip');
   if (!chip) return;
   const signedIn = whoami && whoami.signed_in;
@@ -3794,14 +3823,34 @@ async function loadTemplates(){
 
 function _applyTemplateVars(body){
   // The server returns template placeholders intact ({owner_id}, etc.). Fill
-  // them client-side from the selected Mempack so the user sees a usable body.
+  // them client-side from the selected Mempack + the signed-in user so the
+  // agent reads a human-friendly greeting instead of "operating on behalf of
+  // 3579e6ee". Falls back to the UUID prefix when no email/name available.
+  //
+  // {owner_id_short}: human-greeting form
+  //     1st: full_name (from OAuth)        e.g. "Andy Grossberg"
+  //     2nd: email local-part              e.g. "andy.grossberg"
+  //     3rd: UUID prefix                   e.g. "3579e6ee"
+  // {owner_id}: identifier line
+  //     1st: email                         e.g. "andy.grossberg@gmail.com"
+  //     2nd: full UUID                     e.g. "3579e6ee-6412-..."
+  //     3rd: "unknown"
+  //
+  // Note: the UUID is kept as the authoritative owner_id in the Mempack
+  // schema; we just stop SHOWING it in the agent-facing template body.
   if (!body || !_currentMempack) return body || '';
-  const ownerId = _currentMempack.owner_id || ($('#ownerUuid').value || '').trim();
-  const ownerShort = ownerId ? ownerId.slice(0, 8) : 'unknown';
+  const ownerId  = _currentMempack.owner_id || ($('#ownerUuid').value || '').trim();
+  const whoami   = _whoamiCache.whoami;
+  const fullName = whoami ? whoami.full_name : null;
+  const email    = whoami ? whoami.email : null;
+  const ownerShort = fullName
+    ? fullName
+    : (email ? email.split('@')[0] : (ownerId ? ownerId.slice(0, 8) : 'unknown'));
+  const ownerFull  = email || ownerId || 'unknown';
   const createdAt = new Date().toISOString();
   return body
     .replace(/\{owner_id_short\}/g, ownerShort)
-    .replace(/\{owner_id\}/g, ownerId || 'unknown')
+    .replace(/\{owner_id\}/g, ownerFull)
     .replace(/\{created_at\}/g, createdAt)
     .replace(/\{name\}/g, _currentMempack.name || 'primary');
 }
