@@ -2997,6 +2997,45 @@ _APP_HTML = """\
   .activity-row .type.create         { background:#eab30820; color:var(--amber); }
   .activity-row .type.settings_update{ background:var(--surface-2); color:var(--text-dim); }
   .activity-row .type.dispatch       { background:#3b82f620; color:#3b82f6; }
+  /* Patterns browser — content view of the Mempack's stored passages. */
+  .patterns-controls { display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  .patterns-search { flex:1; min-width:200px; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:12px; padding:8px 12px; border-radius:8px; outline:none; font-family:var(--mono); }
+  .patterns-search:focus { border-color:var(--accent); }
+  .patterns-tag-filter { background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:12px; font-family:var(--mono); padding:7px 10px; border-radius:6px; outline:none; cursor:pointer; }
+  .patterns-tag-filter:focus { border-color:var(--accent); }
+  .patterns-count { font-size:11px; color:var(--text-dim); font-family:var(--mono); }
+  .patterns-list { display:flex; flex-direction:column; gap:6px; max-height:560px; overflow-y:auto; padding-right:4px; }
+  .pattern-row { background:var(--surface); border:1px solid var(--border); border-radius:8px; transition:border-color 0.15s; }
+  .pattern-row:hover { border-color:var(--border-hover); }
+  .pattern-row.open { border-color:var(--accent); }
+  .pattern-header { display:flex; gap:10px; align-items:center; padding:10px 12px; cursor:pointer; user-select:none; }
+  .pattern-header .pattern-idx { font-family:var(--mono); font-size:11px; color:var(--text-dim); flex-shrink:0; }
+  .pattern-header .pattern-tags { display:flex; gap:4px; flex-wrap:wrap; flex:1; min-width:0; }
+  .pattern-tag-chip { font-family:var(--mono); font-size:10px; font-weight:700; padding:2px 6px; border-radius:3px; text-transform:uppercase; letter-spacing:0.3px; background:var(--surface-2); color:var(--text-dim); }
+  .pattern-tag-chip.tag-FINDING       { background:var(--accent-glow); color:var(--accent); }
+  .pattern-tag-chip.tag-SUMMARY       { background:var(--green-glow); color:var(--green); }
+  .pattern-tag-chip.tag-DISPATCH      { background:#3b82f620; color:#3b82f6; }
+  .pattern-tag-chip.tag-TASK          { background:#3b82f620; color:#3b82f6; }
+  .pattern-tag-chip.tag-METHOD        { background:#eab30820; color:var(--amber); }
+  .pattern-tag-chip.tag-EVIDENCE      { background:#06b6d420; color:#06b6d4; }
+  .pattern-tag-chip.tag-OPEN_QUESTION { background:#eab30820; color:var(--amber); }
+  .pattern-tag-chip.tag-DEAD_END      { background:var(--surface-2); color:var(--text-dim); text-decoration:line-through; }
+  .pattern-tag-chip.tag-ACTIVE        { background:#a855f720; color:#a855f7; }
+  .pattern-header .pattern-length { font-family:var(--mono); font-size:10px; color:var(--text-dim); flex-shrink:0; }
+  .pattern-header .pattern-caret { color:var(--text-dim); font-size:11px; transition:transform 0.15s; flex-shrink:0; }
+  .pattern-row.open .pattern-caret { transform:rotate(90deg); }
+  .pattern-preview { padding:0 12px 10px 12px; font-family:var(--mono); font-size:11px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .pattern-row.open .pattern-preview { display:none; }
+  .pattern-body { display:none; padding:10px 12px 12px 12px; border-top:1px solid var(--border); }
+  .pattern-row.open .pattern-body { display:block; }
+  .pattern-text { background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:12px; font-family:var(--mono); font-size:12px; color:var(--text); line-height:1.5; white-space:pre-wrap; word-break:break-word; max-height:400px; overflow-y:auto; margin:0; }
+  .pattern-actions { display:flex; gap:6px; margin-top:8px; }
+  .pattern-copy-btn { font-size:11px; font-family:var(--mono); padding:4px 10px; border-radius:5px; background:var(--surface); border:1px solid var(--border); color:var(--text-dim); cursor:pointer; }
+  .pattern-copy-btn:hover { color:var(--accent); border-color:var(--accent); }
+  .pattern-copy-btn.copied { color:var(--green); border-color:var(--green); }
+  .patterns-pagination { display:flex; justify-content:center; margin-top:10px; }
+  .patterns-pagination button { font-size:12px; font-family:var(--mono); padding:6px 16px; border-radius:6px; background:var(--surface); border:1px solid var(--border); color:var(--text-dim); cursor:pointer; }
+  .patterns-pagination button:hover { color:var(--accent); border-color:var(--accent); }
   /* "Previous version" expander on pattern_i_update / pattern_update rows. */
   .prev-version-toggle { display:inline-flex; align-items:center; gap:4px; background:transparent; border:1px solid var(--border); color:var(--text-dim); font-size:11px; font-family:var(--mono); padding:3px 8px; border-radius:4px; margin-top:6px; cursor:pointer; transition:all 0.15s; }
   .prev-version-toggle:hover { color:var(--accent); border-color:var(--accent); }
@@ -3139,6 +3178,29 @@ _APP_HTML = """\
             </select>
             <span class="saved-msg" id="patternIStatus"></span>
           </div>
+        </div>
+      </div>
+      <div class="dash-section">
+        <h3>Patterns <span class="small" id="patternsMeta">browse this Mempack&rsquo;s content</span></h3>
+        <div class="patterns-controls">
+          <input type="text" id="patternsSearchInput" placeholder="Filter by text&hellip;" class="patterns-search" oninput="onPatternsSearchInput()">
+          <select id="patternsTagFilter" class="patterns-tag-filter" onchange="onPatternsTagChange()">
+            <option value="">All tags</option>
+            <option value="FINDING">FINDING</option>
+            <option value="SUMMARY">SUMMARY</option>
+            <option value="DISPATCH">DISPATCH</option>
+            <option value="TASK">TASK</option>
+            <option value="METHOD">METHOD</option>
+            <option value="EVIDENCE">EVIDENCE</option>
+            <option value="OPEN_QUESTION">OPEN_QUESTION</option>
+            <option value="DEAD_END">DEAD_END</option>
+            <option value="ACTIVE">ACTIVE</option>
+          </select>
+          <span class="patterns-count" id="patternsCount"></span>
+        </div>
+        <div id="patternsList" class="patterns-list"></div>
+        <div class="patterns-pagination" id="patternsPagination" style="display:none">
+          <button onclick="loadMorePatterns()">Load more</button>
         </div>
       </div>
       <div class="dash-section">
@@ -3723,6 +3785,12 @@ function selectMempack(id, items){
   $('#patternIStatus').className = 'saved-msg';
   // Settings
   $('#loggingToggle').checked = mp.activity_logging_enabled !== false;
+  // Patterns browser (resets state — filters cleared, offset back to 0)
+  _patternsCurrentTag = '';
+  _patternsCurrentQ = '';
+  if ($('#patternsTagFilter')) $('#patternsTagFilter').value = '';
+  if ($('#patternsSearchInput')) $('#patternsSearchInput').value = '';
+  loadPatterns(true);
   // Activity (initial fetch + start polling)
   $('#activityFeed').innerHTML = '<div class="dash-empty">Loading activity...</div>';
   loadActivity(true);
@@ -4071,6 +4139,149 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) stopActivityPoll();
   else if (_currentMempack && document.querySelector('.view-tab.active')?.dataset.view === 'mempack') startActivityPoll();
 });
+
+/* =========================================================
+ * Patterns Browser
+ *   - Lists every stored pattern in the selected Mempack
+ *   - Filter by tag (FINDING / SUMMARY / DISPATCH / METHOD / ...)
+ *   - Substring text search (debounced)
+ *   - Expand-to-read with Copy button
+ *   - Paginated; "Load more" appends
+ *   - Skips Pattern 0 (header marker) + Pattern I (handled by the editor above)
+ * ========================================================= */
+let _patternsOffset = 0;
+let _patternsTotal = 0;
+let _patternsCurrentTag = '';
+let _patternsCurrentQ = '';
+let _patternsSearchTimer = null;
+const _PATTERNS_PAGE_SIZE = 50;
+
+async function loadPatterns(reset){
+  if (!_currentMempack) return;
+  const list = $('#patternsList');
+  const pag  = $('#patternsPagination');
+  const cnt  = $('#patternsCount');
+  if (reset) {
+    _patternsOffset = 0;
+    list.innerHTML = '<div class="dash-empty"><div class="spinner"></div> Loading patterns&hellip;</div>';
+    if (cnt) cnt.textContent = '';
+    if (pag) pag.style.display = 'none';
+  }
+  const params = new URLSearchParams();
+  params.set('offset', String(_patternsOffset));
+  params.set('limit',  String(_PATTERNS_PAGE_SIZE));
+  if (_patternsCurrentTag) params.set('tag', _patternsCurrentTag);
+  if (_patternsCurrentQ)   params.set('q',   _patternsCurrentQ);
+  const url = BASE() + '/api/mempack/' + _currentMempack.id + '/patterns?' + params.toString();
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    if (d.status !== 'ok') {
+      list.innerHTML = '<div class="dash-empty"><div class="icon">&#x26A0;</div>' + esc(d.error || 'Load failed') + '</div>';
+      return;
+    }
+    _patternsTotal = d.total || 0;
+    const rows = (d.patterns || []).map(_renderPatternRow).join('');
+    if (reset) {
+      list.innerHTML = rows || '<div class="dash-empty"><div class="icon">&#x1F4DD;</div>No patterns match.</div>';
+    } else {
+      list.insertAdjacentHTML('beforeend', rows);
+    }
+    _patternsOffset = _patternsOffset + (d.patterns || []).length;
+    if (cnt) {
+      const filter_bits = [];
+      if (_patternsCurrentTag) filter_bits.push(_patternsCurrentTag);
+      if (_patternsCurrentQ)   filter_bits.push('"' + _patternsCurrentQ + '"');
+      const filter_str = filter_bits.length ? ' (' + filter_bits.join(' + ') + ')' : '';
+      cnt.textContent = 'Showing ' + _patternsOffset + ' of ' + _patternsTotal + filter_str;
+    }
+    if (pag) pag.style.display = (_patternsOffset < _patternsTotal) ? '' : 'none';
+  } catch(e) {
+    list.innerHTML = '<div class="dash-empty"><div class="icon">&#x26A0;</div>' + esc(e.message) + '</div>';
+  }
+}
+
+function _renderPatternRow(p){
+  const tagChips = (p.tags || []).map(t =>
+    '<span class="pattern-tag-chip tag-' + esc(t) + '">' + esc(t) + '</span>'
+  ).join('');
+  const noTagFallback = (p.tags || []).length === 0
+    ? '<span class="pattern-tag-chip">(no tags)</span>'
+    : '';
+  // Preview text: strip the leading "[TAG] " bracket so the inline preview
+  // doesn't waste characters re-stating what the chips already show.
+  let preview = p.preview || '';
+  if (preview.startsWith('[') && preview.indexOf(']') > 0) {
+    preview = preview.slice(preview.indexOf(']') + 1).trim();
+  }
+  return '<div class="pattern-row" data-idx="' + p.idx + '">'
+    + '<div class="pattern-header" onclick="togglePatternBody(this)">'
+    +   '<span class="pattern-idx">idx:' + p.idx + '</span>'
+    +   '<span class="pattern-tags">' + tagChips + noTagFallback + '</span>'
+    +   '<span class="pattern-length">' + p.length + ' chars</span>'
+    +   '<span class="pattern-caret">&#x25B8;</span>'
+    + '</div>'
+    + '<div class="pattern-preview">' + esc(preview) + '</div>'
+    + '<div class="pattern-body">'
+    +   '<pre class="pattern-text">' + esc(p.text || '') + '</pre>'
+    +   '<div class="pattern-actions">'
+    +     '<button class="pattern-copy-btn" onclick="copyPatternBody(this)">Copy</button>'
+    +   '</div>'
+    + '</div>'
+    + '</div>';
+}
+
+function togglePatternBody(headerEl){
+  const row = headerEl.closest('.pattern-row');
+  if (!row) return;
+  row.classList.toggle('open');
+}
+
+async function copyPatternBody(btn){
+  const row = btn.closest('.pattern-row');
+  if (!row) return;
+  const pre = row.querySelector('.pattern-text');
+  if (!pre) return;
+  const text = pre.textContent || '';
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.classList.add('copied');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.classList.remove('copied'); btn.textContent = 'Copy'; }, 2000);
+  } catch(e) {
+    // Fallback: select + execCommand
+    const range = document.createRange();
+    range.selectNode(pre);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    try {
+      document.execCommand('copy');
+      btn.classList.add('copied');
+      btn.textContent = 'Copied (fallback)';
+      setTimeout(() => { btn.classList.remove('copied'); btn.textContent = 'Copy'; }, 2000);
+    } catch(e2) {
+      btn.textContent = 'Select + Ctrl+C';
+    }
+    window.getSelection().removeAllRanges();
+  }
+}
+
+function onPatternsTagChange(){
+  _patternsCurrentTag = $('#patternsTagFilter').value;
+  loadPatterns(true);
+}
+
+function onPatternsSearchInput(){
+  clearTimeout(_patternsSearchTimer);
+  _patternsSearchTimer = setTimeout(() => {
+    _patternsCurrentQ = $('#patternsSearchInput').value.trim();
+    loadPatterns(true);
+  }, 300);
+}
+
+function loadMorePatterns(){
+  loadPatterns(false);
+}
 
 // Restore last view on page load (UUID auto-detected from Supabase cookie inside setView)
 (function(){
@@ -6907,6 +7118,110 @@ async def rest_mempack_activity(request: Request) -> JSONResponse:
         }, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mempack/<id>/activity error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/mempack/{mempack_id}/patterns", methods=["GET", "OPTIONS"])
+async def rest_mempack_patterns(request: Request) -> JSONResponse:
+    """List patterns in a Mempack so the dashboard can render a content browser.
+
+    Path param:
+        mempack_id      (str, UUID)
+
+    Query params:
+        tag             (str, optional)   filter to patterns whose prefix tag matches
+                                          (case-insensitive); e.g. 'FINDING', 'SUMMARY'
+        q               (str, optional)   case-insensitive substring filter on body text
+        offset          (int, default 0)  pagination offset over the FILTERED, sorted list
+        limit           (int, default 50, max 200)
+        skip_reserved   (bool, default true) skip Pattern 0 (header) + Pattern I (idx=1)
+                                          since those have their own dashboard surfaces
+
+    Response:
+        {
+          "status":     "ok",
+          "mempack_id": "...",
+          "total":      <int — count AFTER filters, BEFORE pagination>,
+          "offset":     <int>,
+          "limit":      <int>,
+          "patterns": [
+            {"idx": <int>, "text": "...", "length": <int>, "tags": ["FINDING", ...], "preview": "..."},
+            ...
+          ]
+        }
+
+    Patterns are returned newest-first (idx descending), so the most recent
+    findings appear at the top of the browser. Pagination is offset/limit
+    over the filtered, sorted list.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        mempack_id = request.path_params.get("mempack_id", "")
+        user_id, mp, err = _require_mempack_owner(request, mempack_id)
+        if err is not None:
+            return err
+
+        # Query param parsing with defensive caps.
+        tag = (request.query_params.get("tag") or "").strip().upper()
+        q = (request.query_params.get("q") or "").strip()
+        try:
+            offset = max(0, int(request.query_params.get("offset", "0")))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = int(request.query_params.get("limit", "50"))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 200))
+        skip_reserved_param = (request.query_params.get("skip_reserved", "true") or "").lower()
+        skip_reserved = skip_reserved_param not in ("false", "0", "no", "off")
+
+        # Load the cart via the existing read+cache helper.
+        # _mempack_load_for_mutation also serves read-only callers — it doesn't
+        # mutate anything on its own; the name reflects its typical use.
+        _mp, _cache, _embeddings, texts = _mempack_load_for_mutation(mempack_id)
+
+        # Build the filtered + sorted list.
+        results: list[dict] = []
+        for idx, text in enumerate(texts):
+            if skip_reserved and idx <= PATTERN_I_IDX:
+                continue
+            if not isinstance(text, str):
+                continue
+            tag_list = _extract_tags_from_text(text)
+            tag_upper = [t.upper() for t in tag_list]
+            if tag and tag not in tag_upper:
+                continue
+            if q and q.lower() not in text.lower():
+                continue
+            results.append({
+                "idx":     idx,
+                "text":    text,
+                "length":  len(text),
+                "tags":    tag_upper,
+                "preview": text[:200] + ("…" if len(text) > 200 else ""),
+            })
+
+        # Newest first (highest idx at top — matches the activity-feed convention)
+        results.sort(key=lambda r: r["idx"], reverse=True)
+        total = len(results)
+        page = results[offset:offset + limit]
+
+        return JSONResponse({
+            "status":     "ok",
+            "mempack_id": mempack_id,
+            "total":      total,
+            "offset":     offset,
+            "limit":      limit,
+            "patterns":   page,
+        }, headers=_cors_headers())
+    except ValueError as e:
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=404, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/mempack/<id>/patterns error: {e}")
         return JSONResponse({"status": "error", "error": str(e)},
                             status_code=500, headers=_cors_headers())
 
