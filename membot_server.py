@@ -640,11 +640,20 @@ def _read_jwt_from_request(request) -> str | None:
     return token
 
 
-def _get_user_id_from_request(request) -> str | None:
-    """Verify the Supabase JWT and return the `sub` claim (user UUID), or None.
+def _get_user_claims_from_request(request) -> dict | None:
+    """Verify the Supabase JWT and return the full decoded claims dict, or None.
 
-    Returns None for: anonymous request, missing/expired/invalid JWT, or
-    when SUPABASE_JWT_SECRET isn't configured (fail-closed for safety).
+    Returns None for: anonymous request, missing/expired/invalid JWT, or when
+    SUPABASE_JWT_SECRET isn't configured (fail-closed for safety).
+
+    Useful claims typically present:
+      - sub                    : user UUID
+      - email                  : user email
+      - user_metadata          : {avatar_url, full_name, name, picture, ...}
+                                 populated from the OAuth provider for social
+                                 sign-ins; mostly empty for password sign-ups.
+      - app_metadata           : {provider, providers, ...}
+      - aud / exp / iat / iss  : standard JWT
     """
     secret = os.environ.get("SUPABASE_JWT_SECRET")
     if not secret:
@@ -659,10 +668,21 @@ def _get_user_id_from_request(request) -> str | None:
         return None
     try:
         decoded = _pyjwt.decode(token, secret, algorithms=[_JWT_ALG], audience=_JWT_AUD)
-        return decoded.get("sub")
+        return decoded if isinstance(decoded, dict) else None
     except Exception as e:
         log.warning(f"JWT decode failed: {type(e).__name__}: {e}")
         return None
+
+
+def _get_user_id_from_request(request) -> str | None:
+    """Verify the Supabase JWT and return the `sub` claim (user UUID), or None.
+
+    Thin wrapper over _get_user_claims_from_request for the common case where
+    only the user_id is needed. See _get_user_claims_from_request for the full
+    claims dict (email, user_metadata, etc.).
+    """
+    claims = _get_user_claims_from_request(request)
+    return claims.get("sub") if claims else None
 
 
 def _require_authenticated(request):
@@ -2731,6 +2751,19 @@ async def app_frontend(request: Request) -> HTMLResponse:
         f"data:image/png;base64,{_app_icon_b64}" if _app_icon_b64 else "")
     return HTMLResponse(html)
 
+
+@mcp.custom_route("/app/", methods=["GET"])
+async def app_frontend_trailing_slash(request: Request):
+    """Trailing-slash variant — 301 to canonical /app.
+
+    Starlette doesn't auto-redirect on slash mismatch when routes are
+    registered via FastMCP's custom_route helper, so `/app/` was 404ing.
+    Nginx already strips `/membot/` to `/`, so this catches the public
+    `https://project-you.app/membot/app/` URL too.
+    """
+    from starlette.responses import RedirectResponse
+    return RedirectResponse(url="/app", status_code=301)
+
 _APP_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -2775,6 +2808,24 @@ _APP_HTML = """\
   .status-dot { width:10px; height:10px; border-radius:50%; background:var(--text-dim); transition:all 0.3s; }
   .status-dot.connected { background:var(--green); box-shadow:0 0 8px var(--green-glow); }
   .status-dot.error { background:var(--red); }
+  /* Auth chip — signed-out: "Sign in" button. Signed-in: avatar + dropdown. */
+  .auth-chip { position:relative; flex-shrink:0; margin-left:12px; }
+  .auth-signin-btn { display:flex; align-items:center; gap:6px; padding:6px 12px; border-radius:8px; background:var(--accent-glow); color:var(--accent); border:1px solid transparent; font-size:12px; font-weight:600; font-family:inherit; cursor:pointer; transition:all 0.2s; }
+  .auth-signin-btn:hover { background:var(--accent); color:#fff; }
+  .auth-avatar-btn { width:36px; height:36px; border-radius:50%; padding:0; border:1px solid var(--border); background:var(--surface); cursor:pointer; overflow:hidden; display:flex; align-items:center; justify-content:center; transition:border-color 0.2s; }
+  .auth-avatar-btn:hover { border-color:var(--accent); }
+  .auth-avatar-btn img { width:100%; height:100%; object-fit:cover; }
+  .auth-avatar-btn .auth-initial { color:var(--text-bright); font-weight:700; font-size:14px; background:linear-gradient(135deg, var(--accent), #8b5cf6); width:100%; height:100%; display:flex; align-items:center; justify-content:center; }
+  .auth-menu { position:absolute; right:0; top:calc(100% + 6px); min-width:220px; background:var(--surface); border:1px solid var(--border); border-radius:10px; box-shadow:0 8px 32px rgba(0,0,0,0.4); z-index:50; padding:4px 0; }
+  .auth-menu-header { padding:10px 14px; border-bottom:1px solid var(--border); }
+  .auth-menu-header .label { font-size:10px; text-transform:uppercase; letter-spacing:0.5px; color:var(--text-dim); margin-bottom:2px; }
+  .auth-menu-header .email { font-size:13px; color:var(--text-bright); word-break:break-all; }
+  .auth-menu-item { display:flex; align-items:center; gap:10px; width:100%; padding:9px 14px; background:transparent; border:none; color:var(--text-dim); font-size:12px; text-align:left; cursor:pointer; font-family:inherit; transition:background 0.15s; }
+  .auth-menu-item:hover { background:var(--surface-2); color:var(--text); }
+  .auth-menu-item.danger:hover { color:#ef4444; }
+  .auth-menu-item .soon-badge { margin-left:auto; font-size:10px; color:var(--text-dim); opacity:0.6; }
+  .auth-menu-item.disabled { cursor:not-allowed; opacity:0.5; }
+  .auth-menu-item.disabled:hover { background:transparent; color:var(--text-dim); }
   .cart-bar { display:flex; gap:10px; margin-bottom:20px; overflow-x:auto; padding-bottom:4px; align-items:center; }
   .cart-chip { flex-shrink:0; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 16px; min-width:140px; transition:all 0.2s; cursor:pointer; }
   .cart-chip:hover { border-color:var(--border-hover); transform:translateY(-1px); }
@@ -2946,6 +2997,7 @@ _APP_HTML = """\
       <div class="status-dot" id="statusDot"></div>
       <span id="statusText">Connecting...</span>
     </div>
+    <div class="auth-chip" id="authChip"><!-- populated by renderAuthChip() --></div>
   </div>
   <div class="view-tabs" role="tablist">
     <button class="view-tab active" data-view="search" onclick="setView('search')">Search</button>
@@ -3340,28 +3392,184 @@ async function setView(name){
 /* Identify the signed-in user via the server, since Supabase cookies are
  * HttpOnly and not readable from document.cookie. The cookie IS sent with
  * every same-origin fetch automatically, so /api/whoami can read it
- * server-side and tell us the user_id. Returns the UUID string or null.
+ * server-side and tell us the user_id + email + avatar + name.
  *
- * Async — caller must await. Cached briefly on success to avoid hammering
- * the endpoint when several callers (setView + cookie poller) ask at once.
+ * getWhoami() returns the full {signed_in, user_id, email, full_name,
+ * avatar_url} object; detectSupabaseUser() is a back-compat wrapper that
+ * returns just the user_id string (or null) for callers that haven't been
+ * upgraded yet.
  */
-let _whoamiCache = { ts: 0, value: null };
+let _whoamiCache = { ts: 0, whoami: null };
 const _WHOAMI_CACHE_MS = 3000;
-async function detectSupabaseUser(){
+async function getWhoami(){
   const now = Date.now();
-  if (now - _whoamiCache.ts < _WHOAMI_CACHE_MS) return _whoamiCache.value;
+  if (now - _whoamiCache.ts < _WHOAMI_CACHE_MS) return _whoamiCache.whoami;
   try {
     const r = await fetch(BASE() + '/api/whoami', { credentials: 'same-origin' });
     const d = await r.json();
-    const uid = d && d.user_id ? d.user_id : null;
-    _whoamiCache = { ts: now, value: uid };
-    if (!uid) console.warn('[membot] detectSupabaseUser: server reports no signed-in user (cookie missing or invalid JWT)');
-    return uid;
+    _whoamiCache = { ts: now, whoami: d };
+    if (!d || !d.user_id) console.warn('[membot] getWhoami: server reports no signed-in user (cookie missing or invalid JWT)');
+    return d;
   } catch(e) {
-    console.warn('[membot] detectSupabaseUser /api/whoami failed:', e);
+    console.warn('[membot] getWhoami /api/whoami failed:', e);
     return null;
   }
 }
+async function detectSupabaseUser(){
+  const w = await getWhoami();
+  return w && w.user_id ? w.user_id : null;
+}
+
+/* =========================================================
+ * Auth chip (Option D — sign-in via popup to /vps/app)
+ *   - Signed out: "Sign in" button → opens a popup to project-you.app
+ *   - Signed in:  avatar (or initial) → dropdown with email + Profile (soon) + Sign out
+ *   - Popup-open mode polls /api/whoami fast (every 2s); reverts to slow poll on close
+ * ========================================================= */
+let _authMenuOpen = false;
+let _signinPopupRef = null;
+let _signinPopupPoll = null;
+
+function renderAuthChip(whoami){
+  const chip = document.getElementById('authChip');
+  if (!chip) return;
+  const signedIn = whoami && whoami.signed_in;
+  if (!signedIn) {
+    chip.innerHTML =
+      '<button class="auth-signin-btn" onclick="doSignIn()" title="Sign in to access your Mempack">'
+      + '<span>&#x1F511;</span> Sign in'
+      + '</button>';
+    _authMenuOpen = false;
+    return;
+  }
+  const email = whoami.email || '(no email)';
+  const name = whoami.full_name || email;
+  const avatar = whoami.avatar_url;
+  const initial = (whoami.email && whoami.email[0] ? whoami.email[0] : (whoami.user_id || '?')[0]).toUpperCase();
+  const avatarHtml = avatar
+    ? '<img src="' + esc(avatar) + '" alt="">'
+    : '<span class="auth-initial">' + esc(initial) + '</span>';
+  const menuHtml = _authMenuOpen
+    ? ('<div class="auth-menu" id="authMenu">'
+      +   '<div class="auth-menu-header">'
+      +     '<div class="label">Signed in as</div>'
+      +     '<div class="email" title="' + esc(name) + '">' + esc(email) + '</div>'
+      +   '</div>'
+      +   '<button class="auth-menu-item disabled" onclick="event.stopPropagation()">'
+      +     '<span>&#x1F464;</span> Profile <span class="soon-badge">soon</span>'
+      +   '</button>'
+      +   '<button class="auth-menu-item danger" onclick="doSignOut()">'
+      +     '<span>&#x21AA;</span> Sign out'
+      +   '</button>'
+      + '</div>')
+    : '';
+  chip.innerHTML =
+    '<button class="auth-avatar-btn" onclick="toggleAuthMenu(event)" title="' + esc(name) + '">'
+    + avatarHtml
+    + '</button>'
+    + menuHtml;
+}
+
+async function refreshAuthChip(){
+  // Bypass cache so we see current state
+  _whoamiCache = { ts: 0, whoami: null };
+  const w = await getWhoami();
+  renderAuthChip(w);
+  return w;
+}
+
+function toggleAuthMenu(ev){
+  if (ev) ev.stopPropagation();
+  _authMenuOpen = !_authMenuOpen;
+  // Re-render with cached state; no network round-trip
+  renderAuthChip(_whoamiCache.whoami);
+}
+
+// Close menu on outside click
+document.addEventListener('mousedown', (ev) => {
+  if (!_authMenuOpen) return;
+  const chip = document.getElementById('authChip');
+  if (chip && !chip.contains(ev.target)) {
+    _authMenuOpen = false;
+    renderAuthChip(_whoamiCache.whoami);
+  }
+});
+
+function doSignIn(){
+  // Stamp APP_ID so the central auth router (project-you.app/) lands the user
+  // back at /membot/app/ after sign-in completes inside VPS's modal.
+  try { localStorage.setItem('auth_return_app', 'membot'); } catch(_) {}
+
+  const url = 'https://project-you.app/vps/app/';
+  const w = 480;
+  const h = 720;
+  const left = (screen.width  - w) / 2;
+  const top  = (screen.height - h) / 2;
+  const features = [
+    'width=' + w, 'height=' + h,
+    'left=' + left, 'top=' + top,
+    'resizable=yes', 'scrollbars=yes', 'status=no', 'toolbar=no', 'menubar=no',
+  ].join(',');
+  _signinPopupRef = window.open(url, 'membot-signin', features);
+  if (!_signinPopupRef) {
+    toast('Popup blocked — allow popups for project-you.app, or sign in at project-you.app/vps/app and come back', 'error');
+    return;
+  }
+  _signinPopupRef.focus();
+
+  // While the popup is open, poll /api/whoami every 2s. When the cookie
+  // shows signed-in, update the chip and stop. When the popup closes (with
+  // or without success), do one more refresh and stop.
+  if (_signinPopupPoll) clearInterval(_signinPopupPoll);
+  let ticks = 0;
+  _signinPopupPoll = setInterval(async () => {
+    ticks += 1;
+    const popupClosed = !_signinPopupRef || _signinPopupRef.closed;
+    const w = await refreshAuthChip();
+    const signedIn = w && w.signed_in;
+    if (signedIn) {
+      // Got auth — close popup if still open, stop polling, refresh dependent UI
+      if (_signinPopupRef && !_signinPopupRef.closed) {
+        try { _signinPopupRef.close(); } catch(_) {}
+      }
+      clearInterval(_signinPopupPoll);
+      _signinPopupPoll = null;
+      _signinPopupRef = null;
+      toast('Signed in as ' + (w.email || 'user'), 'success');
+      // Kick the cookie watcher so Mempack tab re-loads under the new user
+      _userWatchTick();
+    } else if (popupClosed) {
+      clearInterval(_signinPopupPoll);
+      _signinPopupPoll = null;
+      _signinPopupRef = null;
+    } else if (ticks > 300) {
+      // 10-minute hard cap — give up polling even if popup still open
+      clearInterval(_signinPopupPoll);
+      _signinPopupPoll = null;
+    }
+  }, 2000);
+}
+
+async function doSignOut(){
+  _authMenuOpen = false;
+  try {
+    const r = await fetch(BASE() + '/api/auth/signout', {
+      method: 'POST', credentials: 'same-origin',
+    });
+    const d = await r.json();
+    if (d.status !== 'ok') { toast('Sign out failed: ' + (d.error || 'unknown'), 'error'); return; }
+    toast('Signed out (' + (d.count || 0) + ' cookies cleared)', 'success');
+  } catch(e) {
+    toast('Sign out failed: ' + e.message, 'error');
+    return;
+  }
+  // Refresh chip + cookie watcher (which will clear the Mempack tab)
+  await refreshAuthChip();
+  _userWatchTick();
+}
+
+// Initial chip render at page load (before first _userWatchTick)
+refreshAuthChip();
 
 function overrideOwner(){
   const current = $('#ownerUuid').value;
@@ -3728,11 +3936,14 @@ let _lastDetectedUser = null;
 const _USER_POLL_MS = 10000;
 async function _userWatchTick(){
   // Bypass the whoami cache so the poll always sees fresh server-side state
-  _whoamiCache = { ts: 0, value: null };
-  const now = await detectSupabaseUser();
+  _whoamiCache = { ts: 0, whoami: null };
+  const whoami = await getWhoami();
+  const now = whoami && whoami.user_id ? whoami.user_id : null;
   const override = localStorage.getItem('membot-owner-override');
   const effective = override || now;
   const lastEffective = override || _lastDetectedUser;
+  // Always keep the auth chip in sync with current state.
+  renderAuthChip(whoami);
   if (effective !== lastEffective) {
     console.log('[membot] auth state changed:', lastEffective ? lastEffective.slice(0,8) : 'anon',
                 '->', effective ? effective.slice(0,8) : 'anon');
@@ -5787,7 +5998,22 @@ async def rest_whoami(request: Request) -> JSONResponse:
     """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
-    user_id = _get_user_id_from_request(request)
+    claims = _get_user_claims_from_request(request)
+    user_id = claims.get("sub") if claims else None
+
+    # Surface the display fields the dashboard auth chip needs. The Supabase
+    # JWT carries `email` as a top-level claim; OAuth providers populate
+    # `user_metadata.{avatar_url, full_name, name, picture}` on first sign-in.
+    # Password sign-ups have an email but no avatar/name unless the user adds
+    # them via a profile-edit flow (TBD).
+    email = None
+    full_name = None
+    avatar_url = None
+    if claims:
+        email = claims.get("email")
+        meta = claims.get("user_metadata") or {}
+        full_name = meta.get("full_name") or meta.get("name")
+        avatar_url = meta.get("avatar_url") or meta.get("picture")
 
     # Diagnostic block — exposes cookie NAMES (not values) and whether the
     # JWT secret is configured. Helps debug nginx-strips-cookies / wrong-
@@ -5802,9 +6028,12 @@ async def rest_whoami(request: Request) -> JSONResponse:
     sb_cookie_count = sum(1 for n in cookie_names if n.startswith("sb-"))
 
     return JSONResponse({
-        "status":    "ok",
-        "signed_in": bool(user_id),
-        "user_id":   user_id,
+        "status":     "ok",
+        "signed_in":  bool(user_id),
+        "user_id":    user_id,
+        "email":      email,
+        "full_name":  full_name,
+        "avatar_url": avatar_url,
         "debug": {
             "cookie_count":    len(cookie_names),
             "cookie_names":    cookie_names,
@@ -5813,6 +6042,69 @@ async def rest_whoami(request: Request) -> JSONResponse:
             "jwt_secret_set":  bool(os.environ.get("SUPABASE_JWT_SECRET")),
         },
     }, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/auth/signout", methods=["POST", "OPTIONS"])
+async def rest_auth_signout(request: Request) -> JSONResponse:
+    """Clear all Supabase auth cookies on the .project-you.app domain.
+
+    Supabase JS writes cookies named `sb-<projectref>-auth-token`, optionally
+    chunked across `.0`, `.1`, etc. when the session blob exceeds a single
+    cookie's size limit. We can't predict the chunk count in advance, so we
+    enumerate every sb-* cookie name in the incoming request and expire each
+    one via a Set-Cookie response header with Max-Age=0.
+
+    Cookie attributes (must MATCH what the issuer set, or browsers won't
+    overwrite):
+      - Domain=.project-you.app   (shared across project-you.app, /vps/app,
+                                   /membot/app, future Heartbeat — set by
+                                   @supabase/ssr's cookieOptions in VPS)
+      - Path=/
+      - SameSite=Lax
+      - Secure                    (HTTPS only — set by @supabase/ssr in prod)
+
+    Always returns 200 — sign-out is idempotent. If the caller wasn't signed
+    in to begin with, no cookies get cleared and we return ok anyway.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+
+    cookie_header = request.headers.get("cookie") or request.headers.get("Cookie") or ""
+    sb_cookie_names: list[str] = []
+    for chunk in cookie_header.split(";"):
+        name = chunk.strip().split("=", 1)[0]
+        if name.startswith("sb-"):
+            sb_cookie_names.append(name)
+
+    # Build a JSONResponse and attach a Set-Cookie header per cookie to expire.
+    # FastAPI/Starlette's response.delete_cookie() handles the Set-Cookie
+    # serialization correctly including all the attributes browsers require
+    # for an overwrite-and-expire.
+    resp = JSONResponse({
+        "status":          "ok",
+        "cleared_cookies": sb_cookie_names,
+        "count":           len(sb_cookie_names),
+    }, headers=_cors_headers())
+
+    # In production this server sits behind nginx terminating HTTPS for
+    # project-you.app. The Supabase JS cookies are scoped to .project-you.app
+    # with Secure + SameSite=Lax. Match those exactly.
+    is_prod = bool(os.environ.get("MEMBOT_PROD", "").strip()) or \
+              request.headers.get("x-forwarded-proto") == "https"
+    cookie_domain = ".project-you.app" if is_prod else None
+
+    for name in sb_cookie_names:
+        resp.delete_cookie(
+            key=name,
+            path="/",
+            domain=cookie_domain,
+            secure=is_prod,
+            httponly=True,
+            samesite="lax",
+        )
+
+    log.info(f"signout cleared {len(sb_cookie_names)} sb-* cookies (prod={is_prod})")
+    return resp
 
 
 @mcp.custom_route("/api/mempacks", methods=["GET", "OPTIONS"])
