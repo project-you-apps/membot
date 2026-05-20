@@ -2779,6 +2779,41 @@ async def app_frontend_trailing_slash(request: Request):
     from starlette.responses import RedirectResponse
     return RedirectResponse(url="../app", status_code=301)
 
+
+@mcp.custom_route("/downloads/mempack_local_agent.py", methods=["GET"])
+async def download_mempack_local_agent(request: Request):
+    """Serve the mempack_local_agent.py harness as a downloadable Python file.
+
+    The Python harness ships alongside membot at /opt/membot/tools/
+    mempack_local_agent.py. We serve it as a single-file download so any
+    user (not just developers with git access) can grab it from the
+    Connect-an-agent panel and run a fully local Ollama-backed agent
+    against their Mempack — no Claude Desktop, no API key required.
+
+    Adds Content-Disposition: attachment so browsers offer Save As.
+    """
+    from starlette.responses import FileResponse, JSONResponse
+    # The file lives next to this module on the droplet (in tools/).
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "tools", "mempack_local_agent.py"),
+        os.path.join(here, "mempack_local_agent.py"),  # fallback if relocated
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return FileResponse(
+                path=path,
+                media_type="text/x-python",
+                filename="mempack_local_agent.py",
+                headers=_cors_headers(),
+            )
+    log.error(f"mempack_local_agent.py not found in any of: {candidates}")
+    return JSONResponse(
+        {"status": "error", "error": "harness not deployed; check /opt/membot/tools/"},
+        status_code=404, headers=_cors_headers(),
+    )
+
+
 _APP_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -2977,6 +3012,18 @@ _APP_HTML = """\
   .connect-paths ul { margin:6px 0 0 0; padding-left:18px; }
   .connect-paths li { font-size:12px; color:var(--text-dim); line-height:1.7; }
   .connect-paths li code { background:var(--surface-2); padding:1px 5px; border-radius:3px; font-size:11px; }
+  .connect-local-section { margin-top:22px; padding-top:16px; border-top:1px solid var(--accent); }
+  .connect-local-header { color:var(--accent) !important; font-size:12px; }
+  .connect-local-intro { font-size:13px; color:var(--text-dim); line-height:1.55; margin:8px 0 14px 0; }
+  .connect-local-intro strong { color:var(--text-bright); }
+  .connect-local-intro code { background:var(--surface-2); padding:1px 5px; border-radius:3px; font-size:12px; }
+  .connect-local-note { font-size:11px; color:var(--text-dim); margin:6px 0 0 0; line-height:1.5; }
+  .connect-local-note code { background:var(--surface-2); padding:1px 4px; border-radius:3px; font-size:10px; }
+  .connect-link { color:var(--accent); text-decoration:none; border-bottom:1px dotted var(--accent); }
+  .connect-link:hover { border-bottom-style:solid; }
+  .connect-download-btn { display:inline-flex; align-items:center; gap:8px; padding:8px 14px; background:var(--accent-glow); border:1px solid var(--accent); color:var(--accent); border-radius:6px; font-family:var(--mono); font-size:12px; text-decoration:none; transition:all 0.2s; }
+  .connect-download-btn:hover { background:var(--accent); color:#fff; }
+  .connect-download-btn span { font-weight:700; }
   .dispatch-editor textarea { width:100%; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:13px; font-family:var(--mono); padding:12px 14px; border-radius:10px; resize:vertical; min-height:96px; outline:none; transition:border-color 0.2s; line-height:1.5; }
   .dispatch-editor textarea:focus { border-color:var(--accent); }
   .dispatch-actions { display:flex; gap:8px; margin-top:8px; align-items:center; }
@@ -3167,6 +3214,33 @@ _APP_HTML = """\
                 <li><strong>Claude Code:</strong> <code>.mcp.json</code> (project) or <code>~/.claude/mcp.json</code> (global)</li>
                 <li><strong>Windsurf:</strong> <code>~/.codeium/windsurf/mcp_config.json</code></li>
               </ul>
+            </div>
+            <div class="connect-local-section">
+              <div class="connect-step-label connect-local-header">Or &mdash; run a fully local agent (no API key needed)</div>
+              <p class="connect-local-intro">
+                <strong>Mempack Local Agent</strong> is a small Python script that wires a local Ollama model
+                to your Mempack via MCP. No Claude subscription, no API key &mdash; just Python + Ollama.
+                Bring your own model; the script handles the tool-call loop.
+              </p>
+              <div class="connect-step">
+                <div class="connect-step-label">1. Install Ollama and pull a tool-capable model</div>
+                <pre class="connect-code">ollama pull qwen2.5:14b   # or hermes3:8b, qwen2.5-coder:14b, llama3.1:8b
+pip install requests truststore   # truststore only needed on Win w/ corporate AV</pre>
+                <p class="connect-local-note">Download Ollama: <a href="https://ollama.com/download" target="_blank" rel="noopener" class="connect-link">ollama.com/download</a></p>
+              </div>
+              <div class="connect-step">
+                <div class="connect-step-label">2. Download the Python harness</div>
+                <a id="connectLocalDownload" class="connect-download-btn" href="#" download="mempack_local_agent.py">
+                  <span>&darr;</span> mempack_local_agent.py
+                </a>
+                <span class="connect-local-note">~14 KB &middot; single file &middot; one dep (<code>requests</code>) + optional <code>truststore</code></span>
+              </div>
+              <div class="connect-step">
+                <div class="connect-step-label">3. Run it with your owner_id baked in</div>
+                <pre class="connect-code" id="connectLocalCommand"></pre>
+                <button class="connect-copy" onclick="copyConnectSnippet('localCommand')">Copy command</button>
+                <span class="connect-copy-status" id="connectLocalCommandStatus"></span>
+              </div>
             </div>
           </div>
         </details>
@@ -3880,11 +3954,40 @@ function populateConnectPanel(mp){
   // Reset copy status indicators
   $('#connectMcpJsonStatus').textContent = '';
   $('#connectPromptStatus').textContent = '';
+
+  // ---- Local-agent section: build the run command + wire download link ----
+  // The harness URL is served from the same membot host so the download
+  // works behind any nginx prefix that already routes /membot/* through.
+  const dlBase = (location.protocol === 'https:' ? 'https:' : 'http:')
+                 + '//' + location.host + (location.pathname.indexOf('/membot/') >= 0 ? '/membot' : '');
+  const dlUrl = dlBase + '/downloads/mempack_local_agent.py';
+  const dlLink = $('#connectLocalDownload');
+  if (dlLink) dlLink.href = dlUrl;
+
+  // Build a copy-paste-friendly run command with owner_id, mempack name,
+  // and user label baked in. One-liner format (no shell line-continuations)
+  // so it works on PowerShell, cmd, bash, zsh, fish, etc. without
+  // per-shell quoting gymnastics.
+  const localCmd = [
+    '# One-shot mode (prompt + auto-exit):',
+    'python mempack_local_agent.py --owner-id ' + ownerId + ' --model qwen2.5:14b --user-label "' + userLabel + '" --prompt "Mount my primary Mempack and tell me what is queued."',
+    '',
+    '# Or interactive REPL (no --prompt; type prompts at the > prompt):',
+    'python mempack_local_agent.py --owner-id ' + ownerId + ' --model qwen2.5:14b --user-label "' + userLabel + '"',
+  ].join(String.fromCharCode(10));
+  const localCmdEl = $('#connectLocalCommand');
+  if (localCmdEl) localCmdEl.textContent = localCmd;
+  const localStatusEl = $('#connectLocalCommandStatus');
+  if (localStatusEl) localStatusEl.textContent = '';
 }
 
 async function copyConnectSnippet(which){
-  const sourceId = which === 'mcpJson' ? 'connectMcpJson' : 'connectPrompt';
-  const statusId = which === 'mcpJson' ? 'connectMcpJsonStatus' : 'connectPromptStatus';
+  const sourceMap = {
+    mcpJson:      ['connectMcpJson',      'connectMcpJsonStatus'],
+    prompt:       ['connectPrompt',       'connectPromptStatus'],
+    localCommand: ['connectLocalCommand', 'connectLocalCommandStatus'],
+  };
+  const [sourceId, statusId] = sourceMap[which] || sourceMap.mcpJson;
   const text = $('#' + sourceId).textContent || '';
   try {
     await navigator.clipboard.writeText(text);
