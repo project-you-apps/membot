@@ -3019,6 +3019,9 @@ _APP_HTML = """\
      <summary><h3>Connect an agent:</h3></summary> above) so both headers
      have equal visual weight when the panel is expanded. */
   .connect-local-section { margin-top:26px; padding-top:20px; border-top:2px solid var(--accent); }
+  .connect-close-row { display:flex; justify-content:flex-end; margin-top:22px; padding-top:14px; border-top:1px dashed var(--border); }
+  .connect-close-btn { background:var(--surface-2); border:1px solid var(--border); color:var(--text-dim); font-size:11px; font-family:var(--mono); padding:5px 14px; border-radius:5px; cursor:pointer; user-select:none; }
+  .connect-close-btn:hover { color:var(--accent); border-color:var(--accent); }
   .connect-local-header { display:block; margin:0 0 8px 0; color:var(--text-bright); }
   .connect-local-header .small { font-weight:400; text-transform:none; letter-spacing:0; color:var(--text-dim); margin-left:8px; font-size:13px; }
   .connect-local-intro { font-size:13px; color:var(--text-dim); line-height:1.55; margin:8px 0 14px 0; }
@@ -3248,6 +3251,9 @@ pip install requests truststore   # truststore only needed on Win w/ corporate A
                 <button class="connect-copy" onclick="copyConnectSnippet('localCommand')">Copy command</button>
                 <span class="connect-copy-status" id="connectLocalCommandStatus"></span>
               </div>
+            </div>
+            <div class="connect-close-row">
+              <button type="button" class="connect-close-btn" onclick="document.getElementById('connectPanel').removeAttribute('open')">Close &#9650;</button>
             </div>
           </div>
         </details>
