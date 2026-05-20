@@ -3223,7 +3223,7 @@ _APP_HTML = """\
               </ul>
             </div>
             <div class="connect-local-section">
-              <h3 class="connect-local-header">Or &mdash; run a fully local agent: <span class="small">Bring your own Ollama model. No API key. No subscription. Just Python + Ollama.</span></h3>
+              <h3 class="connect-local-header">Or &mdash; Run a fully local agent: <span class="small">Bring your own Ollama model. No API key. No subscription. Just Python + Ollama.</span></h3>
               <p class="connect-local-intro">
                 <strong>Mempack Local Agent</strong> is a small Python script that wires a local Ollama model
                 to your Mempack via MCP. The script handles the tool-call loop end-to-end.
