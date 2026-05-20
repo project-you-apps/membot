@@ -48,6 +48,7 @@ docs/*-PRE-SCOPE.md
 docs/*-PLAN.md
 docs/*-SCOPE.md
 docs/internal/
+docs/archived-for-future/
 
 # Test artifacts — keep test scripts in git, ignore their output
 tests/*_test_results/

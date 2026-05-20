@@ -432,22 +432,6 @@ Then access at `https://your-domain/membot/depot`.
 3. **Store**--new text is embedded, added to the cartridge, and its binary code is appended to the Hamming index
 4. **Save**--cartridge persists as secure `.npz` with SHA256 integrity manifest
 
-### The Neuromorphic Substrate
-
-Patterns are stored on a neuromorphic lattice--a 64x64 grid of 64 regions (16 million neurons) with Hebbian weights, Mexican hat inhibition, and energy dynamics. The lattice provides **content-addressable recall**: present a partial or noisy cue, and the attractor dynamics converge to the correct stored pattern. This is Hopfield network behavior, validated at 1 million Wikipedia embeddings with R@1=1.000 under clean, erasure, and bitflip conditions--no capacity wall found.
-
-Search uses the compact binary index (fast, no GPU). Recall uses the full lattice physics (noise-tolerant, associative). One substrate, two access modes.
-
-### Cross-Modal Association
-
-The lattice natively supports **multimodal associative recall**. Embed two different signals (e.g., image via CLIP, audio via CLAP), project them into a shared 768-dim vector, and train the lattice. The Hebbian weights encode the cross-modal association:
-
-- **Show it a picture → hear the sound.** Image cue → audio recalled (cosine 0.9998).
-- **Play a sound → see the picture.** Audio cue → image recalled (cosine 0.9969).
-- **Corrupt the input → clean recall.** 50% noise → denoised (cosine 0.9945).
-
-Three training passes. One pattern. No separate cross-modal model. The physics learns the binding between modalities through the same Hebbian mechanism that stores text. Any signal that can be embedded into a dense vector can participate in associative recall--text, vision, audio, or any combination.
-
 ## Brain Cartridges
 
 A brain cartridge is a self-contained memory unit:
@@ -675,13 +659,10 @@ bash start-tui.sh
 | **LLM dependency** | None. Search, store, and recall are LLM-free. | Every operation requires LLM calls (fact extraction, relationship building, compaction). |
 | **Storage model** | Portable brain cartridges--files you own and carry. | Cloud APIs, vendor lock-in, subscription pricing. |
 | **Search** | SimHash Hamming + keywords. Binary math, no neural inference. | Embedding cosine via API. Scales with token cost. |
-| **Association** | Hebbian attractor dynamics discover non-obvious connections. | Keyword/embedding overlap only. |
 | **Scale** | 4.8M entries on a $12/mo server. | Priced per query, per GB, per seat. |
-| **Physics** | Trained Hebbian weights, content-addressable recall, noise tolerance. | None. |
-| **Cross-modal** | Show a picture → hear the sound. Hebbian association, no separate model. | Not supported. |
 | **Energy** | Train once, query forever. No LLM calls in the pipeline. | Every ingest and query requires LLM inference. |
 
-The sign-zero binary encoding used by Membot is a form of [SimHash (Charikar, 2002)](https://dl.acm.org/doi/10.1145/509907.509965)--a well-established locality-sensitive hashing technique. Membot's innovation is combining SimHash with Hebbian settle dynamics: patterns are trained through a neuromorphic physics pipeline before their binary signatures are captured. The resulting signatures encode associative relationships not present in the original embedding geometry.
+The sign-zero binary encoding used by Membot is a form of [SimHash (Charikar, 2002)](https://dl.acm.org/doi/10.1145/509907.509965)--a well-established locality-sensitive hashing technique. The cartridges Membot serves are built by [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio), which combines SimHash with Hebbian settle dynamics: patterns are trained through a neuromorphic physics pipeline before their binary signatures are captured. The resulting signatures encode associative relationships not present in the original embedding geometry.
 
 ## Security
 
