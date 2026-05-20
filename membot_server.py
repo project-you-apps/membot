@@ -3012,8 +3012,15 @@ _APP_HTML = """\
   .connect-paths ul { margin:6px 0 0 0; padding-left:18px; }
   .connect-paths li { font-size:12px; color:var(--text-dim); line-height:1.7; }
   .connect-paths li code { background:var(--surface-2); padding:1px 5px; border-radius:3px; font-size:11px; }
-  .connect-local-section { margin-top:22px; padding-top:16px; border-top:1px solid var(--accent); }
-  .connect-local-header { color:var(--accent) !important; font-size:12px; }
+  /* Visual peer-break: solid accent rule + extra breathing room so the
+     local-agent path doesn't read as "more text" but as a sibling choice
+     to the Connect-an-agent block above. The h3 INSIDE this section
+     intentionally uses default browser h3 styling (same as the
+     <summary><h3>Connect an agent:</h3></summary> above) so both headers
+     have equal visual weight when the panel is expanded. */
+  .connect-local-section { margin-top:26px; padding-top:20px; border-top:2px solid var(--accent); }
+  .connect-local-header { display:block; margin:0 0 8px 0; color:var(--text-bright); }
+  .connect-local-header .small { font-weight:400; text-transform:none; letter-spacing:0; color:var(--text-dim); margin-left:8px; font-size:13px; }
   .connect-local-intro { font-size:13px; color:var(--text-dim); line-height:1.55; margin:8px 0 14px 0; }
   .connect-local-intro strong { color:var(--text-bright); }
   .connect-local-intro code { background:var(--surface-2); padding:1px 5px; border-radius:3px; font-size:12px; }
@@ -3191,7 +3198,7 @@ _APP_HTML = """\
     <div id="mempackDetail" style="display:none">
       <div class="dash-section">
         <details class="connect-panel" id="connectPanel">
-          <summary><h3 style="display:inline-block; margin:0;">Connect an agent <span class="small">Mount this Mempack from Claude Desktop, Cursor, Claude Code, Windsurf, &hellip;</span></h3></summary>
+          <summary><h3 style="display:inline-block; margin:0;">Connect an agent: <span class="small">Mount this Mempack from Claude Desktop, Cursor, Claude Code, Windsurf, &hellip;</span></h3></summary>
           <div class="connect-body">
             <p class="connect-intro">Your dispatched tasks sit in this Mempack until an MCP-aware client mounts it. Drop the snippet below into your client's <code>mcp.json</code>, restart it, then ask the agent to mount your Mempack and check for dispatches.</p>
             <div class="connect-step">
@@ -3216,11 +3223,10 @@ _APP_HTML = """\
               </ul>
             </div>
             <div class="connect-local-section">
-              <div class="connect-step-label connect-local-header">Or &mdash; run a fully local agent (no API key needed)</div>
+              <h3 class="connect-local-header">Or &mdash; run a fully local agent: <span class="small">Bring your own Ollama model. No API key. No subscription. Just Python + Ollama.</span></h3>
               <p class="connect-local-intro">
                 <strong>Mempack Local Agent</strong> is a small Python script that wires a local Ollama model
-                to your Mempack via MCP. No Claude subscription, no API key &mdash; just Python + Ollama.
-                Bring your own model; the script handles the tool-call loop.
+                to your Mempack via MCP. The script handles the tool-call loop end-to-end.
               </p>
               <div class="connect-step">
                 <div class="connect-step-label">1. Install Ollama and pull a tool-capable model</div>
