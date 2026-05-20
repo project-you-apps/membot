@@ -3076,6 +3076,7 @@ _APP_HTML = """\
   .pattern-tag-chip.tag-DEAD_END      { background:var(--surface-2); color:var(--text-dim); text-decoration:line-through; }
   .pattern-tag-chip.tag-ACTIVE        { background:#a855f720; color:#a855f7; }
   .pattern-header .pattern-length { font-family:var(--mono); font-size:10px; color:var(--text-dim); flex-shrink:0; }
+  .pattern-header .pattern-ts { font-family:var(--mono); font-size:10px; color:var(--text-dim); flex-shrink:0; opacity:0.75; }
   .pattern-header .pattern-caret { color:var(--text-dim); font-size:11px; transition:transform 0.15s; flex-shrink:0; }
   .pattern-row.open .pattern-caret { transform:rotate(90deg); }
   .pattern-preview { padding:0 12px 10px 12px; font-family:var(--mono); font-size:11px; color:var(--text-dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -4410,10 +4411,17 @@ function _renderPatternRow(p){
   if (preview.startsWith('[') && preview.indexOf(']') > 0) {
     preview = preview.slice(preview.indexOf(']') + 1).trim();
   }
+  // Timestamp: prefer the per-pattern created_at from mempack_patterns (real
+  // imprint time, captured at INSERT). Falls back to empty if the row isn't
+  // present (e.g. cart blob has more patterns than mempack_patterns table,
+  // which shouldn't happen but we guard anyway).
+  const ts = p.created_at ? fmtTs(p.created_at) : '';
+  const tsBit = ts ? '<span class="pattern-ts">' + esc(ts) + '</span>' : '';
   return '<div class="pattern-row" data-idx="' + p.idx + '">'
     + '<div class="pattern-header" onclick="togglePatternBody(this)">'
     +   '<span class="pattern-idx">idx:' + p.idx + '</span>'
     +   '<span class="pattern-tags">' + tagChips + noTagFallback + '</span>'
+    +   tsBit
     +   '<span class="pattern-length">' + p.length + ' chars</span>'
     +   '<span class="pattern-caret">&#x25B8;</span>'
     + '</div>'
@@ -7567,6 +7575,29 @@ async def rest_mempack_patterns(request: Request) -> JSONResponse:
         # mutate anything on its own; the name reflects its typical use.
         _mp, _cache, _embeddings, texts = _mempack_load_for_mutation(mempack_id)
 
+        # Fetch per-pattern created_at timestamps from mempack_patterns so the
+        # Patterns Browser can show "when did this land" inline. The texts
+        # array from the blob is 0-based and matches the pattern_idx column.
+        idx_to_created: dict[int, str] = {}
+        try:
+            import supabase_storage as sbs
+            sb = sbs.get_client()
+            ts_res = (
+                sb.table("mempack_patterns")
+                  .select("pattern_idx,created_at")
+                  .eq("mempack_id", mempack_id)
+                  .execute()
+            )
+            for row in (ts_res.data or []):
+                pi = row.get("pattern_idx")
+                ca = row.get("created_at")
+                if pi is not None and ca:
+                    idx_to_created[int(pi)] = ca
+        except Exception as e:
+            # Timestamp lookup is enrichment; never block the patterns list
+            # on it. Worst case the frontend shows no timestamp.
+            log.warning(f"patterns endpoint: created_at lookup failed (non-fatal): {e}")
+
         # Build the filtered + sorted list.
         results: list[dict] = []
         for idx, text in enumerate(texts):
@@ -7581,11 +7612,12 @@ async def rest_mempack_patterns(request: Request) -> JSONResponse:
             if q and q.lower() not in text.lower():
                 continue
             results.append({
-                "idx":     idx,
-                "text":    text,
-                "length":  len(text),
-                "tags":    tag_upper,
-                "preview": text[:200] + ("…" if len(text) > 200 else ""),
+                "idx":        idx,
+                "text":       text,
+                "length":     len(text),
+                "tags":       tag_upper,
+                "preview":    text[:200] + ("…" if len(text) > 200 else ""),
+                "created_at": idx_to_created.get(idx),  # ISO timestamp or null
             })
 
         # Newest first (highest idx at top — matches the activity-feed convention)
