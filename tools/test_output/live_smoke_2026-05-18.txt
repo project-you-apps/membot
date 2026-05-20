@@ -1,0 +1,26 @@
+=== LIVE test1: GET https://project-you.app/membot/api/mempack/templates ===
+HTTP=000 TIME=0.179900s BYTES=0
+
+First 400 chars of response body:
+
+
+=== LIVE test2: POST dispatch with no auth (expect 401) ===
+HTTP=000
+
+
+=== Service health ===
+May 18 21:49:33 SHACKERS-1 python[32443]: INFO:     Waiting for application startup.
+May 18 21:49:33 SHACKERS-1 python[32443]: [21:49:33] Starting worker 'SHACKERS-1#32443' with the following tasks:
+May 18 21:49:33 SHACKERS-1 python[32443]: [21:49:33] * trace(message: str, ...)
+May 18 21:49:33 SHACKERS-1 python[32443]: [21:49:33] * fail(message: str, ...)
+May 18 21:49:33 SHACKERS-1 python[32443]: [21:49:33] * sleep(seconds: float, ...)
+May 18 21:49:33 SHACKERS-1 python[32443]: [21:49:33] StreamableHTTP session manager started
+May 18 21:49:33 SHACKERS-1 python[32443]: INFO:     Application startup complete.
+May 18 21:49:33 SHACKERS-1 python[32443]: INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+May 18 21:49:46 SHACKERS-1 python[32443]: INFO:     127.0.0.1:43722 - "GET /app HTTP/1.0" 200 OK
+May 18 21:49:47 SHACKERS-1 python[32443]: INFO:     127.0.0.1:43724 - "GET /api/cartridges HTTP/1.0" 200 OK
+May 18 21:49:47 SHACKERS-1 python[32443]: [21:49:47] [REST] STATUS | client=unknown | ip=127.0.0.1 | ua=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)
+May 18 21:49:47 SHACKERS-1 python[32443]: [21:49:47] New session created: default
+May 18 21:49:47 SHACKERS-1 python[32443]: INFO:     127.0.0.1:43732 - "GET /api/status HTTP/1.0" 200 OK
+May 18 21:49:47 SHACKERS-1 python[32443]: INFO:     127.0.0.1:43744 - "GET /api/whoami HTTP/1.0" 200 OK
+May 18 21:49:47 SHACKERS-1 python[32443]: INFO:     127.0.0.1:43754 - "GET /api/whoami HTTP/1.0" 200 OK

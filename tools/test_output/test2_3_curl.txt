@@ -1,0 +1,6 @@
+=== test2: POST dispatch with bogus uuid + empty body (expect 401 — auth check fires first) ===
+HTTP_CODE=401
+{"status":"error","error":"Authentication required (sign in at project-you.app)"}
+=== test3: POST dispatch with valid-shape uuid + text body (still expect 401 — no auth cookie) ===
+HTTP_CODE=401
+{"status":"error","error":"Authentication required (sign in at project-you.app)"}

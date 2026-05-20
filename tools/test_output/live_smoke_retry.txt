@@ -1,0 +1,9 @@
+=== curl -k (skip TLS verify, prove it's a cert-chain issue) ===
+HTTP=200 TIME=0.289329s BYTES=5797
+
+First 400 chars:
+{"status":"ok","templates":[{"id":"default","label":"Default","description":"Generic personal Mempack — tag-store-search loop, no specialization.","body":"# Pattern I — Default Mempack Behavior\n\nYou are an AI agent using a Mempack provisioned for {owner_id_short}.\n\n## Identity\n- Bound to user: {owner_id}\n- Created: {created_at}\n- Mempack version: 1.0\n\n## Behavior\n- Read this Pattern 
+
+=== curl -k POST dispatch no-auth ===
+HTTP=401
+{"status":"error","error":"Authentication required (sign in at project-you.app)"}
