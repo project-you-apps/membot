@@ -254,6 +254,8 @@ walk_associate("love and loss", top_k=10, temperature=0.4)
     adjacent themes.
 ```
 
+**Calling from your own code:** [`tools/walk_associate_client_example.py`](tools/walk_associate_client_example.py) is a self-contained Python script that mounts a cart, calls `walk_associate` via MCP, and parses the response into a structured `{primary: [...], missed: [...]}` dict. Uses only `requests` (no FastMCP package needed on the client side), so the wire-level JSON-RPC protocol is visible and portable to any language. Run with defaults to hit the live droplet (`https://project-you.app/membot/mcp`) on gutenberg-poetry with "love and loss"; flags let you swap cart, query, or temperature.
+
 The architectural framing (see `concept-clusters/CC_walk-as-mcp-primitive-for-llm-exploration_2026-06-08`): Walk gives every LLM that mounts Membot a *tunable cognitive primitive* on top of standard retrieval. **Attention budget** = `top_k` x `walk_top_k` (how deeply the walk explores). **Goal-orientation** = `temperature` + query (where it points and how exploratory). The bridge from "external memory for LLMs" to "cognition substrate for LLMs."
 
 Mempack agents (`mempack_local_agent.py` SYSTEM_PROMPT_TEMPLATE) gained CORE BEHAVIOR #10 instructing the LLM to choose between `memory_search` and `walk_associate` based on task intent -- direct lookup vs exploratory discovery.
