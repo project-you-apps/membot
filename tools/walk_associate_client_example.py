@@ -38,6 +38,17 @@ from typing import Any
 
 import requests
 
+# Windows consoles default to cp1252/cp437, which choke on smart quotes, em-dashes,
+# macrons, etc. that show up in cart content. Force UTF-8 on stdout/stderr so we
+# can print poetry / wiki content without crashing. No-op on already-UTF-8 streams
+# (Linux/Mac).
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Minimal MCP client (JSON-RPC over Streamable HTTP)
