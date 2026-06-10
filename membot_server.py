@@ -5111,6 +5111,175 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
 
 
 @mcp.tool()
+def walk_associate(
+    query: str,
+    top_k: int = 10,
+    walk_top_k: int = 0,
+    walk_min_hits: int = 2,
+    walk_max_show: int = 10,
+    temperature: float = 0.0,
+    session_id: str = "",
+) -> str:
+    """Walk the substrate from a seed query to surface associations beyond direct matches.
+
+    Unlike memory_search which returns only the top-K direct semantic matches,
+    walk_associate additionally re-queries from each primary result's own embedding
+    and surfaces items that appear in multiple of those silent re-queries -- the
+    "you may have missed" set of associations the substrate found by walking outward
+    from the seed.
+
+    Use walk_associate for:
+    - Exploratory queries ("what's adjacent to X?", "who else cares about Y?")
+    - Discovering connections between concepts you didn't directly search for
+    - Member/collaborator discovery where adjacency matters as much as direct match
+
+    Use memory_search instead for direct factual lookup ("what did the user say about X").
+
+    Args:
+        query: The seed query / concept to walk from
+        top_k: Primary results returned to the caller (default 10)
+        walk_top_k: Per-primary walk-hop neighbor count (default 0 = auto = max(top_k*3, 20)).
+            Wider walk_top_k surfaces more "may have missed" associations at the cost of more
+            compute. Independent of top_k so callers can keep result lists short while still
+            getting rich walk surfacing.
+        walk_min_hits: Minimum walk-counts to promote an item to "may have missed" (default 2)
+        walk_max_show: Maximum "may have missed" items to surface (default 10)
+        temperature: 0.0 = deterministic walk (default); 0.1-1.0 adds noise to walk-hop
+            queries for basin escape. Use 0.3-0.5 for moderate serendipity, 0.7+ for
+            high-exploration mode.
+        session_id: Session identifier (uses default session if empty)
+    """
+    if len(query) > MAX_QUERY_LENGTH:
+        return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
+
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, session={session_id})")
+
+    if state["cartridge_name"] is None:
+        return "No cartridge mounted. Use mount_cartridge first."
+
+    has_embeddings = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
+    if not has_embeddings:
+        return ("walk_associate requires full embeddings to re-query from items. "
+                "This cart appears to be sign-bit-only; use memory_search instead.")
+
+    try:
+        t0 = time.time()
+
+        # 1. Embed query
+        query_emb = embed_text(query, prefix="search_query")
+
+        # Normalize the corpus for cosine
+        stored = state["embeddings"]
+        stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
+        stored_n = stored / stored_norms
+
+        # 2. Primary top-K via cosine
+        q_norm = query_emb / (np.linalg.norm(query_emb) + 1e-9)
+        primary_scores = stored_n @ q_norm
+        primary_idx = np.argpartition(-primary_scores, min(top_k, len(primary_scores) - 1))[:top_k]
+        primary_idx = primary_idx[np.argsort(-primary_scores[primary_idx])]
+        primary = [(int(i), float(primary_scores[i])) for i in primary_idx]
+        primary_ids = {idx for idx, _ in primary}
+
+        # 3. Walk hop: for each primary item, re-query corpus with its embedding
+        # (optionally perturbed by temperature for basin escape).
+        # walk_top_k defaults to wider than top_k so walk has room to surface
+        # associations that appear at ranks 5-20 from any single primary item.
+        effective_walk_k = walk_top_k if walk_top_k > 0 else max(top_k * 3, 20)
+        effective_walk_k = min(effective_walk_k, len(stored_n) - 1)
+
+        from collections import defaultdict
+        walk_counts: dict[int, int] = defaultdict(int)
+        walk_score_sum: dict[int, float] = defaultdict(float)
+
+        rng = np.random.default_rng() if temperature > 0 else None
+        noise_std = temperature * 0.1  # calibration: temp=0.5 -> noise_std=0.05
+
+        for idx, _ in primary:
+            item_vec = stored_n[idx]
+            if rng is not None and noise_std > 0:
+                perturbed = item_vec + rng.standard_normal(item_vec.shape).astype(np.float32) * noise_std
+                walk_vec = perturbed / (np.linalg.norm(perturbed) + 1e-9)
+            else:
+                walk_vec = item_vec
+            neighbor_scores = stored_n @ walk_vec
+            neighbor_scores[idx] = -np.inf  # exclude self
+            nbr_top = np.argpartition(-neighbor_scores, effective_walk_k)[:effective_walk_k]
+            for nidx in nbr_top:
+                walk_counts[int(nidx)] += 1
+                walk_score_sum[int(nidx)] += float(neighbor_scores[nidx])
+
+        # 4. "May have missed" = items walked-to >= walk_min_hits times AND not in primary
+        missed = []
+        for idx, cnt in walk_counts.items():
+            if idx in primary_ids:
+                continue
+            if cnt < walk_min_hits:
+                continue
+            avg_score = walk_score_sum[idx] / cnt
+            missed.append((idx, cnt, avg_score))
+        # Sort: most-walked first, then by average score
+        missed.sort(key=lambda x: (-x[1], -x[2]))
+        missed = missed[:walk_max_show]
+
+        elapsed_ms = (time.time() - t0) * 1000
+
+        # 5. Format results -- fetch full passages for split carts
+        all_indices = [i for i, _ in primary] + [i for i, _, _ in missed]
+        full_texts = {}
+        if state.get("is_split_cart") and state.get("sqlite_conn"):
+            full_texts = _sqlite_fetch_passages(state["sqlite_conn"], all_indices)
+
+        hippo = state.get("hippocampus")
+
+        def _format_text(i: int) -> str:
+            if i in full_texts:
+                text = full_texts[i]["passage"]
+            else:
+                text = state["texts"][i]
+            if len(text) > 500:
+                text = text[:500] + "..."
+            nav = ""
+            if hippo and i < len(hippo):
+                h = hippo[i]
+                parts = []
+                if h.get("prev"): parts.append(f"prev=#{h['prev']-1}")
+                if h.get("next"): parts.append(f"next=#{h['next']-1}")
+                if parts:
+                    nav = f" [{' '.join(parts)}]"
+            return text, nav
+
+        primary_lines = ["Primary matches (direct semantic similarity):"]
+        for rank, (i, score) in enumerate(primary, 1):
+            if score < 0.1:
+                continue
+            text, nav = _format_text(i)
+            primary_lines.append(f"#{rank} (idx:{i}) [{score:.3f}]{nav} {text}")
+
+        missed_lines = []
+        if missed:
+            temp_label = f", temperature={temperature:.1f}" if temperature > 0 else ""
+            missed_lines.append(f"\nYou may have missed (walked-to {walk_min_hits}+ times via primary{temp_label}):")
+            for rank, (i, cnt, avg_score) in enumerate(missed, 1):
+                text, nav = _format_text(i)
+                missed_lines.append(f"#{rank} (idx:{i}) [hits={cnt} avg={avg_score:.3f}]{nav} {text}")
+
+        state["query_count"] = state.get("query_count", 0) + 1
+        _log_activity(session_id, "walk", f"'{query[:40]}' -> primary={len(primary)} missed={len(missed)}", elapsed_ms)
+
+        header = (f"Walk [primary+walk-hop, temp={temperature:.2f}]: "
+                  f"{len(primary)} primary + {len(missed)} missed from "
+                  f"'{state['cartridge_name']}' ({elapsed_ms:.0f}ms)\n")
+        return header + "\n".join(primary_lines) + "\n".join(missed_lines)
+
+    except Exception as e:
+        log.error(f"Walk error: {e}")
+        return f"Walk error: {e}"
+
+
+@mcp.tool()
 def mempack_read_pattern_i(session_id: str = "") -> str:
     """Read Pattern I (agent behavior) from the currently mounted Mempack.
 

@@ -214,6 +214,92 @@ mcporter call membot.memory_search query="your query" top_k=5
 
 See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working example.
 
+## What's New (June 2026)
+
+### `walk_associate` -- substrate-walk MCP tool
+
+Membot now exposes **`walk_associate`** as a first-class MCP tool. Unlike `memory_search` which returns the top-K direct semantic matches, `walk_associate` additionally re-queries the substrate from each primary result's own embedding and surfaces items that appeared in multiple of those silent re-queries -- *"you may have missed"* associations the substrate found by walking outward from the seed.
+
+```python
+walk_associate(
+    query: str,
+    top_k: int = 10,              # primary results returned
+    walk_top_k: int = 0,          # per-primary walk-hop breadth (0 = auto = max(top_k*3, 20))
+    walk_min_hits: int = 2,       # min walks-to count to promote item to "may have missed"
+    walk_max_show: int = 10,      # max "may have missed" items returned
+    temperature: float = 0.0,     # 0.0 = deterministic; 0.3-0.5 = moderate serendipity; 0.7+ = high exploration
+    session_id: str = "",
+) -> str
+```
+
+**When to use `walk_associate` vs `memory_search`:**
+
+- **`memory_search`** -- direct factual lookup ("what did the user say about X?"). Returns ranked top-K. Use when the query maps to one cluster of closely-related passages and you want the obvious matches.
+- **`walk_associate`** -- exploratory discovery ("what's adjacent to X?", "who else cares about Y?", "find me collaborators around Z"). Returns direct matches PLUS items the substrate's walk discovered through associative re-querying. Use when adjacency matters as much as direct match -- member discovery, brainstorming, cross-cluster connection-finding.
+
+**The `temperature` knob** (see `concept-clusters/CC_associate-temperature-dial_2026-06-08`): controls how exploratory the walk is. Temperature 0.0 is deterministic -- walks each primary item's direct neighborhood. Temperature 0.3-0.5 perturbs walk-hop queries with controlled noise (basin escape) so the walk can hop to adjacent semantic neighborhoods. Temperature 0.7+ is high-exploration / brainstorming mode. Same query, different temperatures, different discovery modes.
+
+**Worked example** (gutenberg-poetry cart, 60k passages):
+
+```text
+walk_associate("love and loss", top_k=10, walk_min_hits=2, temperature=0.0)
+  -> 10 primary matches (Shakespeare sonnets, Keats elegies, etc.)
+  -> 3 "may have missed" Christina Rossetti poems -- Rossetti is famous for love-and-loss
+    work but didn't make the direct top-10; surfaced via walk-hop because multiple
+    primary items' nearest neighborhoods independently pointed at her poetry.
+
+walk_associate("love and loss", top_k=10, temperature=0.4)
+  -> Same 10 primary; missed set includes Rossetti's "Sweet Death" -- death-themed work
+    surfacing in a love-and-loss query because temperature broadened the walk into
+    adjacent themes.
+```
+
+The architectural framing (see `concept-clusters/CC_walk-as-mcp-primitive-for-llm-exploration_2026-06-08`): Walk gives every LLM that mounts Membot a *tunable cognitive primitive* on top of standard retrieval. **Attention budget** = `top_k` x `walk_top_k` (how deeply the walk explores). **Goal-orientation** = `temperature` + query (where it points and how exploratory). The bridge from "external memory for LLMs" to "cognition substrate for LLMs."
+
+Mempack agents (`mempack_local_agent.py` SYSTEM_PROMPT_TEMPLATE) gained CORE BEHAVIOR #10 instructing the LLM to choose between `memory_search` and `walk_associate` based on task intent -- direct lookup vs exploratory discovery.
+
+**Roadmap (future enhancements):**
+
+- `seed_idx: int` -- when walking from a known passage index (e.g., agent clicks a result to "continue the walk"), skip text re-embedding and walk straight from the cached embedding. Pure speed win; no semantic change because sentence-transformers inference is deterministic in eval mode (no dropout, no sampling -- re-embedding the same text returns bitwise-identical vectors).
+- `walk_from: str` mode flag -- choose `"results"` (default, current: 2-hop consensus from primary results -- "what's central to my hits") vs `"seed"` (stochastic sampling of the query's own neighborhood with temperature -- "what else is near my query that just missed the top-K"). Different semantics, both useful; the consensus mode is what's load-bearing for associative-discovery v1.
+- `return_trail: bool` -- surface the actual walk path (which primary led to which neighbor) for explainability. Useful for "we surfaced X because primary item Y walked there."
+
+### Reader prompt library + dual-mode Mempack synthesis
+
+Two additions to the reader/answer-synthesis side of the stack, driven by LongMemEval architectural diagnostics that surfaced (1) a question-type taxonomy where preference/recommendation questions need fundamentally different reader posture than factual recall, and (2) a temporal-anchoring gap where relative time references in memory need an absolute date anchor to be resolvable.
+
+**[`prompts.py`](prompts.py) — explicit prompt template library.** Four named variants any client can import:
+
+```python
+from membot.prompts import RECOMMENDED_DEFAULT, READER_PROMPTS
+
+# Use the recommended dual-mode template (handles factual recall AND recommendation)
+prompt = RECOMMENDED_DEFAULT.format(context=retrieved_text, question=user_q)
+
+# Or pick a specific variant by name
+prompt = READER_PROMPTS["minimal"].format(...)
+```
+
+| Variant | Best for |
+|---|---|
+| `restrictive` | qwen-14b-class small-tier readers (legacy default) |
+| `permissive` | same long structure with deduction rules relaxed |
+| `minimal` | Sonnet/Opus single-mode factual recall |
+| `general` | Sonnet/Opus dual-mode — handles factual AND recommendation/preference questions correctly. This is `RECOMMENDED_DEFAULT`. |
+
+Membot itself does NOT apply these prompts — it's a retrieval substrate. The library publishes recommended templates for clients (benchmark runners, batch pipelines, custom agentic readers) that need a deterministic single-shot reader prompt.
+
+**Mempack agent gets the framing inline.** The local agent's [`SYSTEM_PROMPT_TEMPLATE`](tools/mempack_local_agent.py) now includes two new CORE BEHAVIORS:
+
+- **#8 — Dual-mode answering**: factual recall (answer from retrieval) vs recommendation/preference/advice (derive preferences from retrieval, then commit to a novel recommendation aligned with them). Closes the same gap LongMemEval revealed: capable readers under "answer from memory only" framing refuse recommendation queries even when they cleanly identified the relevant preferences.
+- **#9 — Temporal anchoring**: use the timestamp field already in the template as the anchor for resolving relative time references ("yesterday", "last week") to absolute dates. Prefer session-date metadata from retrieved passages when present.
+
+Net effect: a typical Mempack agent now handles both factual ("what did I say about X") and recommendation ("what should I get given what you know about me") queries correctly without per-cart Pattern I customization, and is ready to consume server-side temporal metadata projection when it ships.
+
+See `concept-clusters/CC_question-type-reader-posture-mapping_2026-06-07.md` and `CC_metadata-projection-into-reader-context_2026-06-07.md` for the architectural rationale.
+
+---
+
 ## What's New (May 2026)
 
 ### Mempack — Per-Agent Writable Brain Cartridges
