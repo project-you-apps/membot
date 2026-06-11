@@ -5110,6 +5110,278 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
         return f"Search error: {e}"
 
 
+def walk_associate_core(
+    query: str,
+    top_k: int = 10,
+    walk_top_k: int = 0,
+    walk_min_hits: int = 2,
+    walk_max_show: int = 10,
+    temperature: float = 0.0,
+    session_id: str = "",
+) -> dict:
+    """Library-level walk_associate entry point. Returns a structured dict.
+
+    This is the function in-process consumers (e.g. the Web4 hub's membox
+    sidecar) should import and call directly. The @mcp.tool() wrapper at
+    `walk_associate(...)` simply calls this function and formats the result
+    into the documented MCP text response for LLM hosts.
+
+    Args (identical to the @mcp.tool() wrapper):
+        query: The seed query / concept to walk from
+        top_k: Primary results returned to the caller (default 10)
+        walk_top_k: Per-primary walk-hop neighbor count
+            (default 0 = auto = max(top_k*3, 20))
+        walk_min_hits: Minimum walk-counts to promote an item to "missed"
+            (default 2)
+        walk_max_show: Maximum "missed" items to surface (default 10)
+        temperature: 0.0 = deterministic walk (default); 0.1-1.0 adds noise
+            to walk-hop queries for basin escape
+        session_id: Session identifier (uses default session if empty)
+
+    Returns:
+        dict with the following shape:
+            {
+                "cart":        str | None,   # mounted cartridge name
+                "query":       str,
+                "temperature": float,
+                "elapsed_ms":  float,
+                "header":      str,          # human-readable summary line
+                                              # (first line of MCP text output)
+                "primary":     list[dict],   # direct semantic matches
+                "missed":      list[dict],   # walk-discovered consensus hits
+                "error":       str | None,   # set on failure; primary+missed
+                                              # are empty lists when error is set
+            }
+
+        Each item in "primary" has keys:
+            idx:   int           - passage index in the cart
+            score: float         - cosine similarity to the query
+            text:  str           - passage text (truncated to 500 chars)
+            prev:  int | None    - hippocampus nav link, prev passage idx
+            next:  int | None    - hippocampus nav link, next passage idx
+
+        Each item in "missed" has keys:
+            idx:   int
+            hits:  int           - how many primary results walked to this neighbor
+            avg:   float         - average cosine similarity across walk hops
+            text:  str
+            prev:  int | None
+            next:  int | None
+
+    Integration callers (Web4 hub-style) typically iterate primary + missed,
+    map `idx` -> their domain identifier (e.g. member LCT) via their own
+    sidecar metadata, then re-emit as `{agent_id, score, text, ...}` for their
+    own downstream consumers. This function intentionally only knows about
+    passage indices; the idx -> identifier mapping is the caller's
+    responsibility because only the caller knows what each passage represents.
+    """
+    result: dict = {
+        "cart": None,
+        "query": query,
+        "temperature": float(temperature),
+        "elapsed_ms": 0.0,
+        "header": "",
+        "primary": [],
+        "missed": [],
+        "error": None,
+    }
+
+    if len(query) > MAX_QUERY_LENGTH:
+        result["error"] = f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
+        return result
+
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, session={session_id})")
+
+    if state["cartridge_name"] is None:
+        result["error"] = "No cartridge mounted. Use mount_cartridge first."
+        return result
+    result["cart"] = state["cartridge_name"]
+
+    has_embeddings = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
+    if not has_embeddings:
+        result["error"] = ("walk_associate requires full embeddings to re-query from items. "
+                           "This cart appears to be sign-bit-only; use memory_search instead.")
+        return result
+
+    try:
+        t0 = time.time()
+
+        # 1. Embed query
+        query_emb = embed_text(query, prefix="search_query")
+
+        # Normalize the corpus for cosine
+        stored = state["embeddings"]
+        stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
+        stored_n = stored / stored_norms
+
+        # 2. Primary top-K via cosine
+        q_norm = query_emb / (np.linalg.norm(query_emb) + 1e-9)
+        primary_scores = stored_n @ q_norm
+        primary_idx = np.argpartition(-primary_scores, min(top_k, len(primary_scores) - 1))[:top_k]
+        primary_idx = primary_idx[np.argsort(-primary_scores[primary_idx])]
+        primary = [(int(i), float(primary_scores[i])) for i in primary_idx]
+        primary_ids = {idx for idx, _ in primary}
+
+        # 3. Walk hop: for each primary item, re-query corpus with its embedding
+        # (optionally perturbed by temperature for basin escape).
+        effective_walk_k = walk_top_k if walk_top_k > 0 else max(top_k * 3, 20)
+        effective_walk_k = min(effective_walk_k, len(stored_n) - 1)
+
+        from collections import defaultdict
+        walk_counts: dict[int, int] = defaultdict(int)
+        walk_score_sum: dict[int, float] = defaultdict(float)
+
+        rng = np.random.default_rng() if temperature > 0 else None
+        noise_std = temperature * 0.1  # calibration: temp=0.5 -> noise_std=0.05
+
+        for idx, _ in primary:
+            item_vec = stored_n[idx]
+            if rng is not None and noise_std > 0:
+                perturbed = item_vec + rng.standard_normal(item_vec.shape).astype(np.float32) * noise_std
+                walk_vec = perturbed / (np.linalg.norm(perturbed) + 1e-9)
+            else:
+                walk_vec = item_vec
+            neighbor_scores = stored_n @ walk_vec
+            neighbor_scores[idx] = -np.inf  # exclude self
+            nbr_top = np.argpartition(-neighbor_scores, effective_walk_k)[:effective_walk_k]
+            for nidx in nbr_top:
+                walk_counts[int(nidx)] += 1
+                walk_score_sum[int(nidx)] += float(neighbor_scores[nidx])
+
+        # 4. "May have missed" = items walked-to >= walk_min_hits times AND not in primary
+        missed_tuples = []
+        for idx, cnt in walk_counts.items():
+            if idx in primary_ids:
+                continue
+            if cnt < walk_min_hits:
+                continue
+            avg_score = walk_score_sum[idx] / cnt
+            missed_tuples.append((idx, cnt, avg_score))
+        missed_tuples.sort(key=lambda x: (-x[1], -x[2]))
+        missed_tuples = missed_tuples[:walk_max_show]
+
+        elapsed_ms = (time.time() - t0) * 1000
+
+        # 5. Resolve full passage text + hippocampus nav for each result idx
+        all_indices = [i for i, _ in primary] + [i for i, _, _ in missed_tuples]
+        full_texts = {}
+        if state.get("is_split_cart") and state.get("sqlite_conn"):
+            full_texts = _sqlite_fetch_passages(state["sqlite_conn"], all_indices)
+
+        hippo = state.get("hippocampus")
+
+        def _resolve(i: int) -> dict:
+            """Return {text, prev, next} for passage idx i."""
+            if i in full_texts:
+                text = full_texts[i]["passage"]
+            else:
+                text = state["texts"][i]
+            if len(text) > 500:
+                text = text[:500] + "..."
+            prev_idx, next_idx = None, None
+            if hippo and i < len(hippo):
+                h = hippo[i]
+                if h.get("prev"):
+                    prev_idx = int(h["prev"]) - 1
+                if h.get("next"):
+                    next_idx = int(h["next"]) - 1
+            return {"text": text, "prev": prev_idx, "next": next_idx}
+
+        # Build structured primary list. Core does NOT filter on score --
+        # in-process consumers (e.g. the Web4 hub sidecar) want every result
+        # with its score so they can apply their own threshold. The MCP text
+        # formatter applies a score < 0.1 display filter to keep LLM output
+        # readable.
+        for i, score in primary:
+            r = _resolve(i)
+            result["primary"].append({
+                "idx": i,
+                "score": score,
+                "text": r["text"],
+                "prev": r["prev"],
+                "next": r["next"],
+            })
+
+        # Build structured missed list
+        for i, cnt, avg_score in missed_tuples:
+            r = _resolve(i)
+            result["missed"].append({
+                "idx": i,
+                "hits": cnt,
+                "avg": avg_score,
+                "text": r["text"],
+                "prev": r["prev"],
+                "next": r["next"],
+            })
+
+        state["query_count"] = state.get("query_count", 0) + 1
+        _log_activity(session_id, "walk",
+                      f"'{query[:40]}' -> primary={len(result['primary'])} missed={len(result['missed'])}",
+                      elapsed_ms)
+
+        result["elapsed_ms"] = elapsed_ms
+        result["header"] = (f"Walk [primary+walk-hop, temp={temperature:.2f}]: "
+                            f"{len(result['primary'])} primary + {len(result['missed'])} missed from "
+                            f"'{state['cartridge_name']}' ({elapsed_ms:.0f}ms)")
+
+    except Exception as e:
+        log.error(f"Walk error: {e}")
+        result["error"] = f"Walk error: {e}"
+
+    return result
+
+
+def _format_walk_text(result: dict, walk_min_hits: int) -> str:
+    """Format a walk_associate_core result dict as the documented MCP text response.
+
+    Keeps the wire format byte-stable so existing MCP-text consumers
+    (the API spec doc's worked example, smoke_walk_associate.py, the
+    client example parser regex, Mempack agents) don't break.
+    """
+    if result.get("error"):
+        return result["error"]
+
+    primary_lines = ["Primary matches (direct semantic similarity):"]
+    for rank, item in enumerate(result["primary"], 1):
+        if item["score"] < 0.1:
+            continue  # display-only filter; the dict result keeps all items
+        nav = ""
+        nav_parts = []
+        if item.get("prev") is not None:
+            nav_parts.append(f"prev=#{item['prev']}")
+        if item.get("next") is not None:
+            nav_parts.append(f"next=#{item['next']}")
+        if nav_parts:
+            nav = f" [{' '.join(nav_parts)}]"
+        primary_lines.append(
+            f"#{rank} (idx:{item['idx']}) [{item['score']:.3f}]{nav} {item['text']}"
+        )
+
+    missed_lines = []
+    if result["missed"]:
+        temp = result.get("temperature", 0.0)
+        temp_label = f", temperature={temp:.1f}" if temp > 0 else ""
+        missed_lines.append(
+            f"\nYou may have missed (walked-to {walk_min_hits}+ times via primary{temp_label}):"
+        )
+        for rank, item in enumerate(result["missed"], 1):
+            nav = ""
+            nav_parts = []
+            if item.get("prev") is not None:
+                nav_parts.append(f"prev=#{item['prev']}")
+            if item.get("next") is not None:
+                nav_parts.append(f"next=#{item['next']}")
+            if nav_parts:
+                nav = f" [{' '.join(nav_parts)}]"
+            missed_lines.append(
+                f"#{rank} (idx:{item['idx']}) [hits={item['hits']} avg={item['avg']:.3f}]{nav} {item['text']}"
+            )
+
+    return result["header"] + "\n" + "\n".join(primary_lines) + "\n".join(missed_lines)
+
+
 @mcp.tool()
 def walk_associate(
     query: str,
@@ -5148,135 +5420,22 @@ def walk_associate(
             queries for basin escape. Use 0.3-0.5 for moderate serendipity, 0.7+ for
             high-exploration mode.
         session_id: Session identifier (uses default session if empty)
+
+    Note: In-process callers (e.g. localhost sidecars that import membot as a
+    library) should call `walk_associate_core(...)` directly and get the typed
+    dict result. This @mcp.tool() wrapper exists for MCP/LLM hosts that need
+    the documented text format.
     """
-    if len(query) > MAX_QUERY_LENGTH:
-        return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
-
-    session_id = _resolve_session_id(session_id)
-    state = _get_session(session_id)
-    log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, session={session_id})")
-
-    if state["cartridge_name"] is None:
-        return "No cartridge mounted. Use mount_cartridge first."
-
-    has_embeddings = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
-    if not has_embeddings:
-        return ("walk_associate requires full embeddings to re-query from items. "
-                "This cart appears to be sign-bit-only; use memory_search instead.")
-
-    try:
-        t0 = time.time()
-
-        # 1. Embed query
-        query_emb = embed_text(query, prefix="search_query")
-
-        # Normalize the corpus for cosine
-        stored = state["embeddings"]
-        stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
-        stored_n = stored / stored_norms
-
-        # 2. Primary top-K via cosine
-        q_norm = query_emb / (np.linalg.norm(query_emb) + 1e-9)
-        primary_scores = stored_n @ q_norm
-        primary_idx = np.argpartition(-primary_scores, min(top_k, len(primary_scores) - 1))[:top_k]
-        primary_idx = primary_idx[np.argsort(-primary_scores[primary_idx])]
-        primary = [(int(i), float(primary_scores[i])) for i in primary_idx]
-        primary_ids = {idx for idx, _ in primary}
-
-        # 3. Walk hop: for each primary item, re-query corpus with its embedding
-        # (optionally perturbed by temperature for basin escape).
-        # walk_top_k defaults to wider than top_k so walk has room to surface
-        # associations that appear at ranks 5-20 from any single primary item.
-        effective_walk_k = walk_top_k if walk_top_k > 0 else max(top_k * 3, 20)
-        effective_walk_k = min(effective_walk_k, len(stored_n) - 1)
-
-        from collections import defaultdict
-        walk_counts: dict[int, int] = defaultdict(int)
-        walk_score_sum: dict[int, float] = defaultdict(float)
-
-        rng = np.random.default_rng() if temperature > 0 else None
-        noise_std = temperature * 0.1  # calibration: temp=0.5 -> noise_std=0.05
-
-        for idx, _ in primary:
-            item_vec = stored_n[idx]
-            if rng is not None and noise_std > 0:
-                perturbed = item_vec + rng.standard_normal(item_vec.shape).astype(np.float32) * noise_std
-                walk_vec = perturbed / (np.linalg.norm(perturbed) + 1e-9)
-            else:
-                walk_vec = item_vec
-            neighbor_scores = stored_n @ walk_vec
-            neighbor_scores[idx] = -np.inf  # exclude self
-            nbr_top = np.argpartition(-neighbor_scores, effective_walk_k)[:effective_walk_k]
-            for nidx in nbr_top:
-                walk_counts[int(nidx)] += 1
-                walk_score_sum[int(nidx)] += float(neighbor_scores[nidx])
-
-        # 4. "May have missed" = items walked-to >= walk_min_hits times AND not in primary
-        missed = []
-        for idx, cnt in walk_counts.items():
-            if idx in primary_ids:
-                continue
-            if cnt < walk_min_hits:
-                continue
-            avg_score = walk_score_sum[idx] / cnt
-            missed.append((idx, cnt, avg_score))
-        # Sort: most-walked first, then by average score
-        missed.sort(key=lambda x: (-x[1], -x[2]))
-        missed = missed[:walk_max_show]
-
-        elapsed_ms = (time.time() - t0) * 1000
-
-        # 5. Format results -- fetch full passages for split carts
-        all_indices = [i for i, _ in primary] + [i for i, _, _ in missed]
-        full_texts = {}
-        if state.get("is_split_cart") and state.get("sqlite_conn"):
-            full_texts = _sqlite_fetch_passages(state["sqlite_conn"], all_indices)
-
-        hippo = state.get("hippocampus")
-
-        def _format_text(i: int) -> str:
-            if i in full_texts:
-                text = full_texts[i]["passage"]
-            else:
-                text = state["texts"][i]
-            if len(text) > 500:
-                text = text[:500] + "..."
-            nav = ""
-            if hippo and i < len(hippo):
-                h = hippo[i]
-                parts = []
-                if h.get("prev"): parts.append(f"prev=#{h['prev']-1}")
-                if h.get("next"): parts.append(f"next=#{h['next']-1}")
-                if parts:
-                    nav = f" [{' '.join(parts)}]"
-            return text, nav
-
-        primary_lines = ["Primary matches (direct semantic similarity):"]
-        for rank, (i, score) in enumerate(primary, 1):
-            if score < 0.1:
-                continue
-            text, nav = _format_text(i)
-            primary_lines.append(f"#{rank} (idx:{i}) [{score:.3f}]{nav} {text}")
-
-        missed_lines = []
-        if missed:
-            temp_label = f", temperature={temperature:.1f}" if temperature > 0 else ""
-            missed_lines.append(f"\nYou may have missed (walked-to {walk_min_hits}+ times via primary{temp_label}):")
-            for rank, (i, cnt, avg_score) in enumerate(missed, 1):
-                text, nav = _format_text(i)
-                missed_lines.append(f"#{rank} (idx:{i}) [hits={cnt} avg={avg_score:.3f}]{nav} {text}")
-
-        state["query_count"] = state.get("query_count", 0) + 1
-        _log_activity(session_id, "walk", f"'{query[:40]}' -> primary={len(primary)} missed={len(missed)}", elapsed_ms)
-
-        header = (f"Walk [primary+walk-hop, temp={temperature:.2f}]: "
-                  f"{len(primary)} primary + {len(missed)} missed from "
-                  f"'{state['cartridge_name']}' ({elapsed_ms:.0f}ms)\n")
-        return header + "\n".join(primary_lines) + "\n".join(missed_lines)
-
-    except Exception as e:
-        log.error(f"Walk error: {e}")
-        return f"Walk error: {e}"
+    result = walk_associate_core(
+        query=query,
+        top_k=top_k,
+        walk_top_k=walk_top_k,
+        walk_min_hits=walk_min_hits,
+        walk_max_show=walk_max_show,
+        temperature=temperature,
+        session_id=session_id,
+    )
+    return _format_walk_text(result, walk_min_hits)
 
 
 @mcp.tool()
