@@ -4932,16 +4932,29 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
 @mcp.tool()
 def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: bool = False) -> str:
     """Search the mounted cartridge using lattice physics + embedding similarity.
-    Runs the query through the neural lattice (settle → L2 signature) and blends
-    physics-based similarity with embedding cosine for ranked results.
 
-    Falls back to embedding-only search if GPU or signatures are unavailable.
+    Returns ranked PREVIEWS (~550 chars each) of the top matching passages, each with
+    an `idx` field. **To read the FULL text of any result, call `get_passage(idx)`.**
+    The `text` field in search results is intentionally truncated for token efficiency;
+    the full untruncated content is always retrievable by index via `get_passage`.
+
+    Each result also includes prev/next hints (when hippocampus nav is available) so
+    you can walk to adjacent passages by passing those indices to `get_passage`.
+
+    Runs the query through the neural lattice (settle → L2 signature) and blends
+    physics-based similarity with embedding cosine for ranked results. Falls back to
+    embedding-only search if GPU or signatures are unavailable.
 
     Args:
         query: Natural language search query
         top_k: Number of results to return (default 5)
         session_id: Session identifier (uses default session if empty)
         verbose: Show per-result signal breakdown (cosine, hamming, keyword boost)
+
+    Two-stage retrieval pattern:
+        1. memory_search(query) → ranked previews + indices
+        2. get_passage(idx) → full untruncated text of any preview that looks promising
+        3. Walk prev/next via the hints to read surrounding context
     """  # noqa: docstring kept generic for MCP schema — actual impl uses sign_zero Hamming
     if len(query) > MAX_QUERY_LENGTH:
         return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
@@ -6480,11 +6493,18 @@ def passage_links(idx: int, session_id: str = "") -> str:
 
 @mcp.tool()
 def get_passage(idx: int, session_id: str = "") -> str:
-    """Retrieve a passage by index with full text and navigation links.
+    """Retrieve the FULL untruncated text of a passage by index, with navigation links.
 
-    Use this after memory_search to navigate to prev/next passages
-    within the same document. Search results include [prev=#N next=#N]
-    hints — pass those indices here to read adjacent passages.
+    **This is the companion to `memory_search`** — search returns ~550-char previews +
+    indices; `get_passage(idx)` returns the complete untruncated content for any one.
+    Use this whenever you want more than the preview snippet from a search result, or
+    when you want to walk prev/next/sibling links to read surrounding context.
+
+    Common patterns:
+        - After memory_search: call get_passage(idx) on any preview that looks promising
+        - Walking a document: search returns [prev=#N next=#N] hints → pass those indices
+          here to read adjacent passages
+        - Drilling into a specific known passage: just call get_passage(idx) directly
 
     Args:
         idx: Passage index (0-based, from search results or prev/next hints)
