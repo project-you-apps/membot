@@ -93,6 +93,12 @@ def _new_cart_state() -> dict:
         "texts": [],                   # list[str]
         "binary_corpus": None,         # (N, 96) packed or (N, 768) unpacked sign_zero bits
         "hippocampus": None,           # list[dict] — per-pattern metadata
+        "per_pattern_meta": None,      # list[dict] | None — Cart Builder metadata
+                                       #   per pattern (content_type, source, page,
+                                       #   caption, image_b64 for graphics, html
+                                       #   for tables). Parsed from the on-disk
+                                       #   'per_pattern_meta' NPY entry (JSON-encoded)
+                                       #   by load_cartridge_safe. Absent on legacy carts.
         "has_embeddings": False,
         "is_split_cart": False,
         "sqlite_conn": None,           # sqlite3.Connection for split carts
@@ -172,6 +178,7 @@ def mount(cart_path: str, cart_id: Optional[str] = None,
     state["embeddings"] = embeddings
     state["texts"] = texts
     state["hippocampus"] = data.get("hippocampus")
+    state["per_pattern_meta"] = data.get("per_pattern_meta")
     state["n_patterns"] = len(texts)
     state["embedding_dim"] = embeddings.shape[1] if len(embeddings) > 0 else 0
     state["has_embeddings"] = len(embeddings) > 0 and embeddings.size > 0

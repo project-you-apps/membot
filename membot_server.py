@@ -6542,6 +6542,95 @@ def get_passage(idx: int, session_id: str = "") -> str:
     return header + full_text
 
 
+@mcp.tool()
+def get_pattern_meta(cartridge: str, idx: int, session_id: str = "") -> str:
+    """Retrieve the full per_pattern_meta record for one pattern index in a
+    Cart-Builder-authored cart. This is how agents get at graphics (image_b64
+    PNG bytes) and tables (HTML) baked into the cart at ingest.
+
+    Cart Builder (Vector+ Studio Day 2) extracts graphics and tables from
+    images / PDFs via Docling and bakes them into the cart alongside text as
+    a parallel `per_pattern_meta` array. Each record carries content_type
+    ('document' | 'graphic' | 'table'), source filename, page, chunk / chunks
+    counters, and content-type-specific fields:
+      - graphic: image_b64 (base64 PNG bytes, typically 50-500 KB), bbox, caption
+      - table:   html, bbox
+      - document: no extra binary payload
+
+    This tool returns ONE record at a time (per idx) to keep responses bounded —
+    a 500 KB image_b64 is a lot of context; a whole meta array could blow the
+    window. Use search results / hippocampus navigation / list_cartridges to
+    pick an idx, then call this tool to hydrate the record.
+
+    Args:
+        cartridge: Cart identifier. Tries the multi-cart pool first (cart_id
+            from multi_mount), then the session-mounted cart by cartridge name.
+            Also accepts the empty string to mean "whatever's in this session".
+        idx: 0-based pattern index (same address space as get_passage).
+        session_id: Session identifier (uses default session if empty).
+
+    Returns:
+        JSON-encoded string.
+          - On hit: json.dumps(record) — a dict with content_type + fields.
+            image_b64 is included verbatim if present.
+          - On absence (no per_pattern_meta on the cart, or idx out of range,
+            or no such cart): the JSON literal "null" — json.loads() gives None.
+          - On protocol error (empty cartridge AND no session mount): a
+            human-readable error string prefixed 'get_pattern_meta error:'
+            (mirrors the other tools' error convention).
+    """
+    import json as _json
+    log.info(f"get_pattern_meta(cartridge={cartridge!r}, idx={idx}, session={session_id!r})")
+
+    # 1. Try the multi-cart pool by cart_id.
+    meta_list = None
+    resolved_from = None
+    if cartridge:
+        mc_state = _mc.get_cart(cartridge)
+        if mc_state is not None:
+            meta_list = mc_state.get("per_pattern_meta")
+            resolved_from = f"multi_cart[{cartridge}]"
+
+    # 2. Fall back to the session-mounted cart. Match by cartridge_name if a
+    #    non-empty cartridge was passed; otherwise use whatever's mounted.
+    if meta_list is None and resolved_from is None:
+        sid = _resolve_session_id(session_id)
+        state = _get_session(sid)
+        if state.get("cartridge_name"):
+            if not cartridge or state["cartridge_name"] == cartridge:
+                meta_list = state.get("per_pattern_meta")
+                resolved_from = f"session[{sid}]/{state['cartridge_name']}"
+
+    if resolved_from is None:
+        return f"get_pattern_meta error: no cart matching {cartridge!r} is mounted."
+
+    # No per_pattern_meta on this cart (legacy cart without Cart-Builder metadata)
+    # or idx out of range — both are "null" per the contract.
+    if meta_list is None:
+        log.info(f"[get_pattern_meta] {resolved_from} has no per_pattern_meta (legacy cart)")
+        return "null"
+
+    if idx < 0 or idx >= len(meta_list):
+        log.info(f"[get_pattern_meta] idx={idx} out of range 0-{len(meta_list)-1} on {resolved_from}")
+        return "null"
+
+    record = meta_list[idx]
+    if not isinstance(record, dict):
+        # Defensive — the loader coerces non-dicts to {} but be explicit
+        record = {}
+
+    # Log summary WITHOUT dumping the image bytes into the log.
+    _ctype = record.get("content_type", "unknown")
+    _has_img = bool(record.get("image_b64"))
+    _has_html = bool(record.get("html"))
+    log.info(
+        f"[get_pattern_meta] {resolved_from} idx={idx} content_type={_ctype} "
+        f"has_image_b64={_has_img} has_html={_has_html}"
+    )
+
+    return _json.dumps(record, ensure_ascii=False)
+
+
 # ============================================================
 # HTTP MIDDLEWARE (auth + rate limiting)
 # ============================================================
