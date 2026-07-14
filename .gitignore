@@ -43,7 +43,9 @@ gutenberg_cache/
 # documentation with Dennis's SAGE fleet) — exception below.
 docs/DEVLOG.md
 docs/DEVLOG-*.md
-!docs/DEVLOG-SAGE-COLLAB.md
+# Note: DEVLOG-SAGE-COLLAB.md exception removed 2026-07-14 after privacy audit
+# flagged 300+ lines of internal strategy incl. third-party financial info.
+# File moved to docs/archived-for-future/ (gitignored per line below).
 docs/*-PRE-SCOPE.md
 docs/*-PLAN.md
 docs/*-SCOPE.md
