@@ -89,7 +89,7 @@ CARTRIDGE_DIRS = [
 ]
 # Mempack storage: per-user writable carts at cartridges/users/<owner_id>/<name>.cart.npz.
 # Walked recursively by find_mempacks() (separate from find_cartridges which only does
-# top-level CARTRIDGE_DIRS). Andy 2026-05-12 — Block F revival as Mempack storage.
+# top-level CARTRIDGE_DIRS). Mempack storage.
 MEMPACK_BASE_DIR = os.path.join(BASE_DIR, "cartridges", "users")
 # UUID format pattern for owner_id directory names (defense in depth — Supabase UUIDs).
 _UUID_RE = re.compile(r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$")
@@ -126,7 +126,7 @@ def compute_fingerprint(embeddings: np.ndarray, n_texts: int) -> str:
     return h.hexdigest()[:16]
 
 
-# Pattern 0 v2 permission helpers (Andy 2026-05-12).
+# Pattern 0 v2 permission helpers.
 # Permission semantics from spec docs/RFC/pattern-0-v2-spec.md:
 #   r = read (search the cart)        bit 0 = 1
 #   w = write (add/edit patterns)     bit 1 = 2
@@ -151,7 +151,7 @@ def format_perms(mask: int) -> str:
     return "".join(ch for ch, bit in _PERM_BITS.items() if mask & bit)
 
 
-# Pattern 0 v2 cart-type marker (Andy 2026-05-12). Mempack-shaped carts have
+# Pattern 0 v2 cart-type marker. Mempack-shaped carts have
 # cart_type="agent-memory" and reserve pattern index 1 ("Pattern I") for the
 # agent's behavioral instructions. Other types are treated as knowledge carts.
 CART_TYPE_KNOWLEDGE = "knowledge"
@@ -170,7 +170,7 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
                   cart_type: str | None = None):
     """Save integrity manifest alongside cartridge.
 
-    Pattern 0 v2 fields (Andy 2026-05-12) — see docs/RFC/pattern-0-v2-spec.md:
+    Pattern 0 v2 fields:
       briefing      — UTF-8 text presented to agents on mount (Phase 1)
       owner_id      — agent or user ID that owns this cart (Phase 2)
       owner_perms   — string of {r,w,d,a} flags for the owner
@@ -4708,7 +4708,7 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
     if not match:
         match = [c for c in carts if clean_name.lower() in c["name"].lower()]
 
-    # Mempack fallback (Andy 2026-05-12): if the standard catalog doesn't have
+    # Mempack fallback: if the standard catalog doesn't have
     # this name, check user-segmented Mempacks. Exact-name match only here —
     # substring matching against Mempacks risks cross-user collision. When
     # owner_id is provided, scope the search to that user only.
@@ -4770,7 +4770,7 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
         state["per_pattern_meta"] = data.get("per_pattern_meta")
         state["modified"] = False
 
-        # Pattern 0 v2 (Andy 2026-05-12): extract briefing + ownership block + cart
+        # Pattern 0 v2: extract briefing + ownership block + cart
         # type. Two sources:
         #   (a) Mempacks: the Supabase row carries briefing + ownership; populated
         #       on the cart dict by find_mempacks. Manifest sidecar doesn't exist
@@ -6702,7 +6702,7 @@ def _setup_http_middleware(api_key: str | None):
 
 
 # ============================================================
-# MEMPACK ENDPOINTS (Andy 2026-05-12)
+# MEMPACK ENDPOINTS
 # ============================================================
 # Per-user writable carts. Pattern 0 in manifest sidecar, Pattern I at idx=1.
 # Storage: cartridges/users/<owner_id>/<name>.cart.npz

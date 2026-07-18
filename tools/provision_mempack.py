@@ -8,10 +8,8 @@ Usage:
     python provision_mempack.py --owner-id <uuid> --name primary --briefing "custom briefing text"
 
 Until auto-provision-on-signup lands (needs Supabase JWT verification on Membot
-side), this script handles per-user Mempack creation manually. Andy or an admin
-script calls it after a new user signs up via Vector+ Studio.
-
-Andy 2026-05-12.
+side), this script handles per-user Mempack creation manually. Called by an
+admin script after a new user signs up via Vector+ Studio.
 """
 import argparse
 import json

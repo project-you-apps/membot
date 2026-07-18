@@ -36,16 +36,10 @@ gutenberg_cache/
 # Logs
 *.log
 
-# Internal docs — strategic positioning, calibration quotes, and
-# pre-scope/planning artifacts. Maintained in the local-only outer
-# project-you tree at docs/membot-internal/ instead. Andy 2026-05-10.
-# DEVLOG-SAGE-COLLAB.md is *intentionally* public (collaborative
-# documentation with Dennis's SAGE fleet) — exception below.
+# Internal docs — devlogs, pre-scope, and planning artifacts. Not intended
+# for the public repo.
 docs/DEVLOG.md
 docs/DEVLOG-*.md
-# Note: DEVLOG-SAGE-COLLAB.md exception removed 2026-07-14 after privacy audit
-# flagged 300+ lines of internal strategy incl. third-party financial info.
-# File moved to docs/archived-for-future/ (gitignored per line below).
 docs/*-PRE-SCOPE.md
 docs/*-PLAN.md
 docs/*-SCOPE.md

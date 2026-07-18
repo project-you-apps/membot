@@ -4,10 +4,8 @@
 Runs a BEIR dataset against Membot's sign-zero hamming + 70/30 cosine blend
 + keyword reranking pipeline. Computes Recall@K and MRR vs the published qrels.
 
-This is the empirical rebuttal to NodeMind's asserted (but not measured)
-claim that standard sign-bit binarization "breaks down on out-of-distribution
-queries." See:
-  memory/concept-clusters/CC_competitive-landscape-nodemind_2026-05.md
+This benchmark validates the sign-zero hamming + 70/30 cosine blend on
+out-of-distribution queries.
 
 USAGE
 -----

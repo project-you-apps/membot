@@ -237,7 +237,7 @@ walk_associate(
 - **`memory_search`** -- direct factual lookup ("what did the user say about X?"). Returns ranked top-K. Use when the query maps to one cluster of closely-related passages and you want the obvious matches.
 - **`walk_associate`** -- exploratory discovery ("what's adjacent to X?", "who else cares about Y?", "find me collaborators around Z"). Returns direct matches PLUS items the substrate's walk discovered through associative re-querying. Use when adjacency matters as much as direct match -- member discovery, brainstorming, cross-cluster connection-finding.
 
-**The `temperature` knob** (see `concept-clusters/CC_associate-temperature-dial_2026-06-08`): controls how exploratory the walk is. Temperature 0.0 is deterministic -- walks each primary item's direct neighborhood. Temperature 0.3-0.5 perturbs walk-hop queries with controlled noise (basin escape) so the walk can hop to adjacent semantic neighborhoods. Temperature 0.7+ is high-exploration / brainstorming mode. Same query, different temperatures, different discovery modes.
+**The `temperature` knob**: controls how exploratory the walk is. Temperature 0.0 is deterministic -- walks each primary item's direct neighborhood. Temperature 0.3-0.5 perturbs walk-hop queries with controlled noise (basin escape) so the walk can hop to adjacent semantic neighborhoods. Temperature 0.7+ is high-exploration / brainstorming mode. Same query, different temperatures, different discovery modes.
 
 **Worked example** (gutenberg-poetry cart, 60k passages):
 
@@ -256,7 +256,7 @@ walk_associate("love and loss", top_k=10, temperature=0.4)
 
 **Calling from your own code:** [`tools/walk_associate_client_example.py`](tools/walk_associate_client_example.py) is a self-contained Python script that mounts a cart, calls `walk_associate` via MCP, and parses the response into a structured `{primary: [...], missed: [...]}` dict. Uses only `requests` (no FastMCP package needed on the client side), so the wire-level JSON-RPC protocol is visible and portable to any language. Run with defaults to hit the live droplet (`https://project-you.app/membot/mcp`) on gutenberg-poetry with "love and loss"; flags let you swap cart, query, or temperature.
 
-The architectural framing (see `concept-clusters/CC_walk-as-mcp-primitive-for-llm-exploration_2026-06-08`): Walk gives every LLM that mounts Membot a *tunable cognitive primitive* on top of standard retrieval. **Attention budget** = `top_k` x `walk_top_k` (how deeply the walk explores). **Goal-orientation** = `temperature` + query (where it points and how exploratory). The bridge from "external memory for LLMs" to "cognition substrate for LLMs."
+The architectural framing: Walk gives every LLM that mounts Membot a *tunable cognitive primitive* on top of standard retrieval. **Attention budget** = `top_k` x `walk_top_k` (how deeply the walk explores). **Goal-orientation** = `temperature` + query (where it points and how exploratory). The bridge from "external memory for LLMs" to "cognition substrate for LLMs."
 
 Mempack agents (`mempack_local_agent.py` SYSTEM_PROMPT_TEMPLATE) gained CORE BEHAVIOR #10 instructing the LLM to choose between `memory_search` and `walk_associate` based on task intent -- direct lookup vs exploratory discovery.
 
@@ -297,8 +297,6 @@ Membot itself does NOT apply these prompts — it's a retrieval substrate. The l
 - **#9 — Temporal anchoring**: use the timestamp field already in the template as the anchor for resolving relative time references ("yesterday", "last week") to absolute dates. Prefer session-date metadata from retrieved passages when present.
 
 Net effect: a typical Mempack agent now handles both factual ("what did I say about X") and recommendation ("what should I get given what you know about me") queries correctly without per-cart Pattern I customization, and is ready to consume server-side temporal metadata projection when it ships.
-
-See `concept-clusters/CC_question-type-reader-posture-mapping_2026-06-07.md` and `CC_metadata-projection-into-reader-context_2026-06-07.md` for the architectural rationale.
 
 ---
 

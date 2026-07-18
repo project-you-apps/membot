@@ -11,11 +11,6 @@ this library optional for typical agent use. Import these explicitly when
 you need a deterministic, single-shot reader prompt (e.g. benchmark runners,
 batch-processing pipelines, integrations with non-agentic readers).
 
-See:
-- memory/concept-clusters/CC_question-type-reader-posture-mapping_2026-06-07.md
-- memory/concept-clusters/CC_reader-tier-aware-top-k_2026-06-07.md
-- Homework/longmemeval/DEVLOG-LONGMEMEVAL.md (2026-06-06 entry)
-
 Variant pairings:
 - restrictive — qwen-14b-class small-tier readers
 - permissive  — same long structure with deduction rules relaxed
