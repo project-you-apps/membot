@@ -2277,8 +2277,13 @@ async def rest_save(request: Request) -> JSONResponse:
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
+        data = await request.json() if await request.body() else {}
+        name = data.get("name", "")
+        session_id = data.get("session_id", "")
         _call = getattr(save_cartridge, 'fn', save_cartridge)
-        result = _call()
+        # save_cartridge(name="", session_id="") — pass the body through so a
+        # REST caller can name a new cartridge (previously ignored). Mirrors rest_mount.
+        result = _call(name=name, session_id=session_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/save error: {e}")
