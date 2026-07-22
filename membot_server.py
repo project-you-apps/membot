@@ -2504,9 +2504,43 @@ async def rest_cartridges(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
 
 
+# Plain-identifier cartridge names only — rest_mount's auto_create is a REST-driven WRITE path,
+# so the name must never reach the filesystem as a traversal (no '/', no leading dot).
+_CART_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _cartridge_exists(name: str) -> bool:
+    """True if a cartridge with this exact name is already on disk (find_cartridges defined below)."""
+    try:
+        return any(c["name"] == name for c in find_cartridges())
+    except Exception:
+        return False
+
+
+def _create_empty_cartridge(name: str) -> str:
+    """Create an empty writable .cart.npz so a new project can mount before storing anything.
+    Format mirrors membot's mcp-v3 empty cart (0×768 embeddings), written to the first
+    CARTRIDGE_DIR. Name is validated to a plain identifier — no path traversal."""
+    if not _CART_NAME_RE.match(name):
+        raise ValueError(f"invalid cartridge name: {name!r}")
+    target_dir = CARTRIDGE_DIRS[0]
+    os.makedirs(target_dir, exist_ok=True)
+    path = os.path.join(target_dir, f"{name}.cart.npz")
+    if not os.path.exists(path):
+        np.savez_compressed(
+            path,
+            embeddings=np.zeros((0, 768), dtype=np.float32),
+            passages=np.array([], dtype=object),
+            compressed_texts=np.array([], dtype=object),
+            version="mcp-v3",
+        )
+    return path
+
+
 @mcp.custom_route("/api/mount", methods=["POST", "OPTIONS"])
 async def rest_mount(request: Request) -> JSONResponse:
-    """Mount a cartridge by name for the app session.
+    """Mount a cartridge by name for the app session. With auto_create=true, initializes an
+    empty knowledge cartridge first if the name is new and the server is writable.
 
     Step 3 multi-tenancy:
     - When the request carries a JWT, derive session_id = "user_<sub>" so each
@@ -2535,9 +2569,18 @@ async def rest_mount(request: Request) -> JSONResponse:
         # Anonymous callers can still mount knowledge carts (no owner_id scope).
         owner_id = user_id or data.get("owner_id", "")
 
+        # auto_create (opt-in): mount refuses a missing cartridge, dead-ending new-project
+        # onboarding over REST. If asked and the server is writable, initialize an empty knowledge
+        # cart in CARTRIDGE_DIRS[0] so the mount succeeds. Opt-in so a typo doesn't silently spawn
+        # a cart; per-user Mempack auto-creation is out of scope here. (Kimi friction #2, 2026-07-21.)
+        created = False
+        if bool(data.get("auto_create", False)) and not _server_config.get("read_only") and not _cartridge_exists(name):
+            _create_empty_cartridge(name)
+            created = True
+
         _call = getattr(mount_cartridge, 'fn', mount_cartridge)
         result = _call(name=name, session_id=session_id, owner_id=owner_id)
-        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+        return JSONResponse({"status": "ok", "result": result, "created": created}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mount error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
