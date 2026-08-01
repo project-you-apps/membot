@@ -1,3 +1,16 @@
+# fastmcp is the STANDALONE distribution, not the `mcp.server.fastmcp` module bundled inside
+# `mcp`. They are different packages with different APIs, and `mcp` does NOT pull fastmcp in
+# transitively — so this line is load-bearing for a clean install.
+#
+# Missing until 2026-08-01. `membot_server.py:45` does `from fastmcp import FastMCP`, so a
+# fresh clone installed by the declared path died on ModuleNotFoundError, while working fine
+# on any machine that had picked fastmcp up from another project — which is why we never saw
+# it and an outside cold-install audit did (pub, 2026-07-22).
+#
+# Floor is 2.0 because `@mcp.custom_route` (27 uses) is a fastmcp 2.x API; the bundled
+# `mcp.server.fastmcp` does not have it, so switching to the bundle is not an option.
+fastmcp>=2.0.0
+
 mcp[cli]>=1.0.0
 numpy>=1.24.0
 sentence-transformers>=2.2.0
@@ -6,3 +19,7 @@ einops>=0.7.0
 # Optional: for cartridge_builder.py document ingestion
 # PyPDF2>=3.0.0
 # python-docx>=0.8.11
+
+# torch: sentence-transformers pulls it, and it defaults to the CUDA wheel — ~5.1 GB on boxes
+# that cannot use it. On non-NVIDIA hosts install the CPU wheel FIRST (~1.4 GB):
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch

@@ -137,7 +137,9 @@ def mount(cart_path: str, cart_id: Optional[str] = None,
         exist, or (when verify_integrity=True) the manifest check fails
     """
     # Lazy import to avoid circular dependency
-    from membot_server import load_cartridge_safe, verify_manifest
+    # cart_io, NOT membot_server — importing the server here is what made MOUNT
+    # require fastmcp in the caller's interpreter (HUB, 2026-07-28).
+    from cart_io import load_cartridge_safe, verify_manifest
 
     if not os.path.exists(cart_path):
         raise ValueError(f"Cart path does not exist: {cart_path}")
@@ -454,7 +456,10 @@ def search(query: str, top_k: int = 10,
             scope_mode: which mode was used
             grouped_results: dict[cart_id → results] (only set for per_cart/diagnostic)
     """
-    from membot_server import embed_text
+    # embed.py, NOT membot_server — importing the server here is what made the
+    # read-only search path require fastmcp in the caller's interpreter (HUB,
+    # 2026-07-28: the documented mount failed on the publishing box itself).
+    from embed import embed_text
 
     if not _mounted_carts:
         return {
@@ -653,7 +658,10 @@ def imprint_with_meta(cart_id: str, text: str,
     import os
     import zlib
     import hashlib
-    from membot_server import embed_text
+    # embed.py, NOT membot_server — importing the server here is what made the
+    # read-only search path require fastmcp in the caller's interpreter (HUB,
+    # 2026-07-28: the documented mount failed on the publishing box itself).
+    from embed import embed_text
 
     if cart_id not in _mounted_carts:
         raise ValueError(f"Cart {cart_id!r} is not mounted")

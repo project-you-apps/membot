@@ -80,13 +80,6 @@ log.addHandler(_file_handler)
 
 # --- Config ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CARTRIDGE_DIRS = [
-    os.path.join(BASE_DIR, "cartridges"),
-    os.path.join(BASE_DIR, "data"),
-    os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "webgpu", "cartridges"),
-    os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "cartridges"),
-    os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "self_contained_cart_test"),
-]
 # Mempack storage: per-user writable carts at cartridges/users/<owner_id>/<name>.cart.npz.
 # Walked recursively by find_mempacks() (separate from find_cartridges which only does
 # top-level CARTRIDGE_DIRS). Mempack storage.
@@ -116,14 +109,6 @@ def sanitize_name(name: str) -> str:
     return name
 
 
-def compute_fingerprint(embeddings: np.ndarray, n_texts: int) -> str:
-    """Compute SHA256 fingerprint from embedding content + count."""
-    h = hashlib.sha256()
-    if embeddings is not None and len(embeddings) > 0:
-        h.update(embeddings[0].tobytes())
-        h.update(embeddings[-1].tobytes())
-    h.update(str(n_texts).encode())
-    return h.hexdigest()[:16]
 
 
 # Pattern 0 v2 permission helpers.
@@ -239,39 +224,8 @@ def load_manifest(cart_path: str) -> dict | None:
         return None
 
 
-def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int) -> tuple[bool, str]:
-    """Verify cartridge against its manifest. Returns (ok, message)."""
-    manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
-    if not os.path.exists(manifest_path):
-        return True, "no manifest (legacy cartridge)"
-
-    try:
-        with open(manifest_path, "r") as f:
-            manifest = json.load(f)
-
-        expected_fp = manifest.get("fingerprint", "")
-        actual_fp = compute_fingerprint(embeddings, n_texts)
-
-        if expected_fp != actual_fp:
-            return False, f"FINGERPRINT MISMATCH: expected {expected_fp}, got {actual_fp}"
-
-        expected_count = manifest.get("count", -1)
-        if expected_count != n_texts:
-            return False, f"COUNT MISMATCH: expected {expected_count}, got {n_texts}"
-
-        return True, f"verified ({actual_fp})"
-    except Exception as e:
-        return False, f"manifest read error: {e}"
 
 
-def is_trusted_directory(path: str) -> bool:
-    """Check if a file is within one of the trusted cartridge directories."""
-    real_path = os.path.realpath(path)
-    for d in CARTRIDGE_DIRS:
-        real_dir = os.path.realpath(d)
-        if real_path.startswith(real_dir + os.sep) or real_path.startswith(real_dir):
-            return True
-    return False
 
 
 # ============================================================
@@ -294,6 +248,21 @@ def _new_session() -> dict:
         "group_perms": "",
         "world_perms": "r",       # legacy carts treated as world-readable
         "group_id": None,
+        # Per-mount write lock, set by mount_cartridge(read_only=True). 2026-08-01.
+        #
+        # Distinct from BOTH existing controls: `_server_config["read_only"]` is
+        # server-wide (all carts), and `.permissions.json` travels with the ARTIFACT.
+        # This one constrains THIS MOUNT of a cart in THIS session — the case pub's
+        # 2026-07-22 audit raised: fleet-memory mounted writable on a box that only ever
+        # reads it, with nothing at the call site saying so.
+        #
+        # Deliberately one-way at mount time: there is no unmount-and-remount-writable
+        # shortcut, because a lock you can clear by re-calling the same function is not a
+        # lock. Remount explicitly without the flag if you mean to write.
+        #
+        # Worth knowing it does NOT need RWX Step 3 (site-wide login) — it constrains the
+        # MOUNT, not the user, so it ships independently of the auth roadmap.
+        "mount_read_only": False,
         "max_patterns": 0,        # 0 = unlimited
         "embeddings": None,       # (N, 768) float32
         "texts": [],              # list[str]
@@ -402,80 +371,79 @@ def _resolve_session_id(session_id: str) -> str:
     return session_id.strip() if session_id.strip() else "default"
 
 
+def _write_blocked(state: dict) -> str | None:
+    """Why this mount may not be written to, or None if it may.
+
+    ONE place, so the two gates cannot drift apart (2026-08-01). Before this, every write
+    site open-coded `_server_config.get("read_only")`, which is exactly the shape that let
+    the server-wide flag and any future per-mount flag disagree.
+
+    Two independent gates, checked most-specific first so the message names the real cause:
+
+    1. **Per-mount** — `mount_cartridge(..., read_only=True)`. Constrains THIS mount in THIS
+       session. Closes the hazard pub's 2026-07-22 cold-install audit raised: a shared cart
+       mounted writable on a box that only ever reads it, with nothing at the call site
+       saying so. Needs no site-wide login, so it is independent of RWX Step 3.
+    2. **Server-wide** — `--writable` / `_server_config["read_only"]`, for public deploys.
+
+    Returns a human-readable reason (callers return it verbatim) rather than a bool, because
+    "you cannot write" without "here is which rule stopped you" is the kind of refusal
+    nobody can debug from the other side of an MCP call.
+    """
+    if state.get("mount_read_only"):
+        name = state.get("cartridge_name") or "this cart"
+        return (f"'{name}' was mounted read-only for this session. Writes are refused "
+                f"regardless of server --writable. Remount without read_only=True to write.")
+    if _server_config.get("read_only"):
+        return "Server is in read-only mode."
+    return None
+
+
 # ============================================================
-# EMBEDDING — Ollama backend (resource-constrained) or SentenceTransformer
+# CARTRIDGE LOADING — moved to membot/cart_io.py on 2026-08-01
 # ============================================================
+#
+# These lived here, so `multi_cart.mount()` importing them dragged this module — and
+# therefore `fastmcp` — into the MOUNT path. HUB, 2026-07-28: the documented mount failed
+# on the box that publishes the cartridge, under every interpreter but one.
+#
+# Re-exported so existing `from membot_server import load_cartridge_safe, ...` callers keep
+# working. New read-path code should import `cart_io` directly and skip the server entirely.
+from cart_io import (          # noqa: F401  (re-exported for backward compatibility)
+    CARTRIDGE_DIRS,
+    compute_fingerprint,
+    verify_manifest,
+    is_trusted_directory,
+    load_cartridge_safe,
+    load_pkl_cartridge,
+    load_npz_cartridge,
+    _unpack_hippocampus,
+    _HIPPO_FORMAT,
+)
 
-_embed_model = None  # lazy-loaded SentenceTransformer (if not using Ollama)
-_embed_backend = os.environ.get("MEMBOT_EMBED_BACKEND", "auto")  # "ollama", "st", or "auto"
-_ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-_ollama_embed_model = os.environ.get("MEMBOT_OLLAMA_EMBED_MODEL", "nomic-embed-text")
-
-def _ollama_available() -> bool:
-    """Check if Ollama is running and has the embedding model."""
-    try:
-        import urllib.request
-        req = urllib.request.Request(f"{_ollama_url}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            data = json.loads(resp.read())
-            models = [m["name"].split(":")[0] for m in data.get("models", [])]
-            return _ollama_embed_model.split(":")[0] in models
-    except Exception:
-        return False
-
-def _embed_via_ollama(text: str) -> np.ndarray:
-    """Get embedding from Ollama API (no extra RAM — reuses running Ollama process)."""
-    import urllib.request
-    payload = json.dumps({"model": _ollama_embed_model, "input": text}).encode()
-    req = urllib.request.Request(
-        f"{_ollama_url}/api/embed",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
-        return np.array(data["embeddings"][0], dtype=np.float32)
-
-def _get_embed_model():
-    """Lazy-load SentenceTransformer (same model Studio uses to build cartridges)."""
-    global _embed_model
-    if _embed_model is None:
-        log.info("Loading SentenceTransformer nomic-embed-text-v1.5 ...")
-        from sentence_transformers import SentenceTransformer
-        _embed_model = SentenceTransformer(
-            "nomic-ai/nomic-embed-text-v1.5", trust_remote_code=True
-        )
-        log.info("SentenceTransformer ready")
-    return _embed_model
-
-def _resolve_embed_backend() -> str:
-    """Resolve which embedding backend to use."""
-    if _embed_backend == "ollama":
-        return "ollama"
-    if _embed_backend == "st":
-        return "st"
-    # auto: prefer Ollama if available (saves ~2GB RAM)
-    if _ollama_available():
-        log.info(f"Embedding backend: Ollama ({_ollama_embed_model}) — saves ~2GB RAM")
-        return "ollama"
-    log.info("Embedding backend: SentenceTransformer (Ollama not available)")
-    return "st"
-
-_resolved_backend = None
-
-def embed_text(text: str, prefix: str = "search_query") -> np.ndarray:
-    """Get 768-dim Nomic embedding via Ollama or SentenceTransformer."""
-    global _resolved_backend
-    if _resolved_backend is None:
-        _resolved_backend = _resolve_embed_backend()
-
-    if _resolved_backend == "ollama":
-        return _embed_via_ollama(f"{prefix}: {text}")
-    else:
-        model = _get_embed_model()
-        vec = model.encode(f"{prefix}: {text}", convert_to_numpy=True)
-        return vec.astype(np.float32)
+# ============================================================
+# EMBEDDING — moved to membot/embed.py on 2026-08-01
+# ============================================================
+#
+# This block used to live here, which meant `multi_cart.py` reaching in for `embed_text`
+# dragged this module — and therefore `fastmcp` — into the READ path. HUB reported
+# 2026-07-28 that the documented mount consequently failed on the box that publishes the
+# cartridge, under every interpreter except the single venv the server was installed into.
+#
+# `embed.py` imports nothing from here and depends only on numpy (plus sentence_transformers
+# lazily, only when Ollama is unavailable). Read paths import `embed` directly.
+#
+# The names are re-exported below so existing `from membot_server import embed_text` callers
+# keep working — fleet code and docs use that path. They still pay the fastmcp cost, because
+# they are importing the SERVER; the point is that they no longer have to.
+from embed import (            # noqa: F401  (re-exported for backward compatibility)
+    embed_text,
+    active_backend,
+    _embed_via_ollama,
+    _get_embed_model,
+    _ollama_available,
+    _resolve_embed_backend,
+)
 
 
 # ============================================================
@@ -1169,223 +1137,10 @@ def find_cartridges() -> list[dict]:
     return carts
 
 
-def load_cartridge_safe(path: str) -> dict:
-    """Load a cartridge using the safest available method.
-
-    NPZ files are always safe (no code execution).
-    PKL files are only loaded from trusted directories.
-    """
-    if path.endswith(".npz"):
-        return load_npz_cartridge(path)
-
-    if path.endswith(".pkl"):
-        if not is_trusted_directory(path):
-            raise PermissionError(
-                f"Refusing to load .pkl from untrusted path: {path}. "
-                f"Only files in {CARTRIDGE_DIRS} are allowed. "
-                f"Convert to .npz format for unrestricted loading."
-            )
-        log.warning(f"Loading legacy .pkl (trusted path): {path}")
-        return load_pkl_cartridge(path)
-
-    raise ValueError(f"Unknown cartridge format: {path}")
 
 
-def load_pkl_cartridge(path: str) -> dict:
-    """Load a legacy .pkl cartridge. ONLY call from trusted directories."""
-    with open(path, "rb") as f:
-        data = pickle.load(f)
-
-    # Handle versioned cartridges (v7.0-8.3) where embeddings are nested in data["data"]
-    version = data.get("version", "legacy")
-    if version in ("7.0", "8.0", "8.1", "8.2", "8.3"):
-        core = data.get("data", data)
-        embeddings = core.get("embeddings", data.get("embeddings", np.array([])))
-        passages = core.get("passages", data.get("passages", []))
-    elif "data" in data and isinstance(data["data"], dict):
-        core = data["data"]
-        embeddings = core.get("embeddings", np.array([]))
-        passages = core.get("passages", [])
-    else:
-        embeddings = data.get("embeddings", np.array([]))
-        passages = data.get("passages", data.get("texts", []))
-
-    if isinstance(embeddings, list):
-        embeddings = np.array(embeddings, dtype=np.float32)
-    elif isinstance(embeddings, np.ndarray) and embeddings.dtype != np.float32:
-        embeddings = embeddings.astype(np.float32)
-
-    result = {
-        "embeddings": embeddings,
-        "texts": list(passages),
-        "version": version,
-        "format": "pkl",
-    }
-    # Pre-computed sign bits (packed uint8, 96 bytes per pattern)
-    if "sign_bits" in data:
-        result["sign_bits"] = data["sign_bits"]
-    # Extra metadata fields
-    for key in ("paper_ids", "titles", "metadata"):
-        if key in data:
-            result[key] = data[key]
-    return result
 
 
-def load_npz_cartridge(path: str) -> dict:
-    """Load an .npz cartridge (safe — no code execution).
-
-    Supports split carts: if the index contains has_sqlite=True,
-    texts are loaded as snippets from the index and full passages
-    are fetched on demand from a SQLite sidecar file.
-    """
-    data = np.load(path, allow_pickle=True)
-
-    result = {"format": "npz", "version": "unknown"}
-
-    # Check for split cart (index + SQLite sidecar)
-    has_sqlite = bool(data["has_sqlite"]) if "has_sqlite" in data else False
-    if has_sqlite:
-        db_name = str(data["text_db"]) if "text_db" in data else None
-        if db_name:
-            db_path = os.path.join(os.path.dirname(path), db_name)
-            if os.path.exists(db_path):
-                result["sqlite_db_path"] = db_path
-                log.info(f"Split cart: SQLite sidecar at {db_path}")
-            else:
-                log.warning(f"Split cart: SQLite sidecar not found at {db_path}")
-
-        # Snippets serve as texts for keyword reranking
-        if "snippets" in data:
-            snippets = data["snippets"]
-            if isinstance(snippets, np.ndarray) and snippets.dtype == object:
-                result["texts"] = list(snippets)
-            else:
-                result["texts"] = list(snippets)
-            count = int(data["count"]) if "count" in data else len(result["texts"])
-            log.info(f"Split cart: {count:,} snippets loaded, full text in SQLite")
-        else:
-            result["texts"] = []
-
-        result["embeddings"] = np.array([])
-        result["is_split_cart"] = True
-
-        # Sign bits
-        if "sign_bits" in data:
-            result["sign_bits"] = data["sign_bits"]
-
-        return result
-
-    # Handle various NPZ layouts (standard carts)
-    if "embeddings" in data:
-        result["embeddings"] = data["embeddings"]
-    elif "embs" in data:
-        embs = data["embs"]
-        if isinstance(embs, np.ndarray) and embs.dtype == object:
-            result["embeddings"] = np.array(list(embs), dtype=np.float32)
-        else:
-            result["embeddings"] = embs
-    else:
-        result["embeddings"] = np.array([])
-
-    if "passages" in data:
-        result["texts"] = list(data["passages"])
-    elif "memories" in data:
-        mems = data["memories"]
-        if isinstance(mems, np.ndarray) and mems.dtype == object:
-            result["texts"] = [m.get("text", str(m)) if isinstance(m, dict) else str(m) for m in mems]
-        else:
-            result["texts"] = list(mems)
-    elif "compressed_texts" in data:
-        texts = []
-        for ct in data["compressed_texts"]:
-            try:
-                texts.append(zlib.decompress(bytes(ct)).decode("utf-8"))
-            except Exception:
-                texts.append("[decompress error]")
-        result["texts"] = texts
-    else:
-        result["texts"] = []
-
-    # Load hippocampus metadata if present (mcp-v4+)
-    if "hippocampus" in data:
-        raw_hippo = data["hippocampus"]
-        log.info(f"[HIPPO] Found hippocampus in NPZ: shape={raw_hippo.shape}, dtype={raw_hippo.dtype}")
-        result["hippocampus"] = _unpack_hippocampus(raw_hippo)
-        log.info(f"[HIPPO] Unpacked {len(result['hippocampus'])} entries. First: {result['hippocampus'][0] if result['hippocampus'] else 'EMPTY'}")
-        # Log a sample entry that should have links
-        for h in result["hippocampus"][:20]:
-            if h["prev"] is not None or h["next"] is not None:
-                log.info(f"[HIPPO] Sample linked entry: {h}")
-                break
-        else:
-            log.warning("[HIPPO] No linked entries found in first 20 hippocampus records!")
-    else:
-        # Expected for Supabase-backed Mempacks (H-block array lives in the
-        # mempack_patterns Postgres rows, not in the NPZ blob) and for legacy
-        # carts that pre-date the hippocampus array. Not an error condition.
-        log.debug(f"[HIPPO] No hippocampus array in NPZ (Mempack-style: H-blocks in Postgres). Keys: {list(data.keys())}")
-        result["hippocampus"] = None
-
-    # Load per-pattern structured metadata (federate-v1+ format; used by
-    # fleet-learning carts where each pattern carries a JSON dict of
-    # game/machine/event/confidence/support_count/beat_dummy_pp/etc.).
-    # Parsed eagerly so the filter API can query fields without re-parsing.
-    #
-    # Storage variants seen in the wild:
-    #   - 1-d object array of dicts (federate-v1 CBP/Nomad/etc.)
-    #   - 0-d object array wrapping a Python list of dicts
-    #   - 0-d object array wrapping a JSON-encoded STRING (heartbeat cart)
-    #   - 0-d object array wrapping None (meta field reserved but empty)
-    # Also tolerate each element being either a dict or a JSON string.
-    if "per_pattern_meta" in data:
-        raw_meta = data["per_pattern_meta"]
-        # Unwrap 0-d scalar
-        if hasattr(raw_meta, "ndim") and raw_meta.ndim == 0:
-            raw_meta = raw_meta.item()
-        # Decode JSON-string-encoded lists
-        if isinstance(raw_meta, (str, bytes)):
-            try:
-                raw_meta = json.loads(raw_meta)
-            except Exception as e:
-                log.warning(f"[META] per_pattern_meta is a string but not valid JSON: {e}")
-                raw_meta = None
-        if raw_meta is None:
-            result["per_pattern_meta"] = None
-        elif isinstance(raw_meta, dict):
-            # Single dict for the whole cart — unusual but tolerate by broadcasting
-            log.info(f"[META] per_pattern_meta is a single dict; not broadcasting (treating as absent)")
-            result["per_pattern_meta"] = None
-        else:
-            try:
-                iterable_meta = list(raw_meta)
-            except TypeError:
-                log.warning(f"[META] per_pattern_meta not iterable after unwrap: type={type(raw_meta).__name__}")
-                result["per_pattern_meta"] = None
-                return result
-            parsed = []
-            for entry in iterable_meta:
-                if isinstance(entry, dict):
-                    parsed.append(entry)
-                elif isinstance(entry, (str, bytes)):
-                    try:
-                        obj = json.loads(entry)
-                        parsed.append(obj if isinstance(obj, dict) else {})
-                    except Exception:
-                        parsed.append({})
-                else:
-                    parsed.append({})
-            result["per_pattern_meta"] = parsed
-            # Find first non-empty dict for log sample
-            sample_keys = []
-            for p in parsed:
-                if p:
-                    sample_keys = list(p.keys())
-                    break
-            log.info(f"[META] Loaded per_pattern_meta: {len(parsed)} entries, sample keys={sample_keys}")
-    else:
-        result["per_pattern_meta"] = None
-
-    return result
 
 
 def load_signatures(path: str) -> dict:
@@ -1415,37 +1170,8 @@ def load_signatures(path: str) -> dict:
 # --- Hippocampus (H-block) metadata struct (matches cartridge_builder.py) ---
 # Canonical 12-field format with perms_byte at offset 29. Migrated from legacy
 # 11-field on 2026-05-13. See docs/PATTERN-ANATOMY.md §3 for spec.
-_HIPPO_FORMAT = '<I B B I I I I H I B B 34s'
 _HIPPO_SIZE = 64
 
-def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
-    """Unpack hippocampus metadata array into list of dicts.
-
-    Args:
-        raw: (N, 64) uint8 array from NPZ 'hippocampus' key
-
-    Returns:
-        List of dicts with: pattern_id, format_version, cartridge_type,
-        prev, next, sibling, source_hash, sequence_num, timestamp, flags,
-        perms_byte (canonical format only)
-    """
-    result = []
-    for row in raw:
-        vals = struct.unpack(_HIPPO_FORMAT, row.tobytes())
-        result.append({
-            "pattern_id":     vals[0],
-            "format_version": vals[1],
-            "cartridge_type": vals[2],
-            "prev":           vals[3] if vals[3] > 0 else None,
-            "next":           vals[4] if vals[4] > 0 else None,
-            "sibling":        vals[5] if vals[5] > 0 else None,
-            "source_hash":    vals[6],
-            "sequence_num":   vals[7],
-            "timestamp":      vals[8],
-            "flags":          vals[9],
-            "perms_byte":     vals[10],
-        })
-    return result
 
 
 def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str]):
@@ -2342,8 +2068,17 @@ async def depot_status(request: Request) -> JSONResponse:
                 cart_refs[cn] = {"name": cn, "agents": 0, "entries": len(s["texts"]) if s["texts"] else 0}
             cart_refs[cn]["agents"] += 1
 
-    # Available cartridges on disk
+    # Available cartridges on disk.
+    #
+    # This was `except Exception: pass`, which returned a SILENTLY TRUNCATED list —
+    # a disk error mid-enumeration produced "no cartridges" (or a partial set) that
+    # was indistinguishable from a genuinely empty depot. Nothing downstream could
+    # tell the difference, so "my cart vanished" had no diagnosable cause.
+    # Audited 2026-07-31 against dev-SAGE PRD v3 §7.2, where the same pattern hid
+    # four dead memory paths for months. Report the failure and say how much of the
+    # listing survived; never present a partial answer as a complete one.
     disk_carts = []
+    disk_error = None
     try:
         for c in find_cartridges():
             disk_carts.append({
@@ -2352,8 +2087,10 @@ async def depot_status(request: Request) -> JSONResponse:
                 "mounted": c["name"] in cart_refs,
                 "agents": cart_refs.get(c["name"], {}).get("agents", 0),
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        disk_error = f"{type(exc).__name__}: {exc}"
+        log.error("depot: cartridge enumeration failed after %d cart(s): %s",
+                  len(disk_carts), disk_error)
 
     # Recent activity (last 50)
     activity_out = []
@@ -2374,6 +2111,9 @@ async def depot_status(request: Request) -> JSONResponse:
         "total_sessions": len(sessions_out),
         "sessions": sessions_out,
         "cartridges": disk_carts,
+        # Present ONLY when enumeration failed, so a partial list can never be
+        # mistaken for a complete one by whatever reads this. Absent = complete.
+        **({"cartridges_error": disk_error} if disk_error else {}),
         "mounted_carts": list(cart_refs.values()),
         "activity": activity_out,
         "gpu": _gpu_state["available"],
@@ -4676,7 +4416,8 @@ def list_cartridges() -> str:
 
 
 @mcp.tool()
-def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
+def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
+                    read_only: bool = False) -> str:
     """Mount a brain cartridge by name (or partial name).
     Loads embeddings and text into memory for searching.
     Verifies integrity against manifest if available.
@@ -4688,10 +4429,17 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
                   user's Mempacks only — disambiguates the case where multiple
                   users have Mempacks with the same name (e.g. each user's "primary").
                   Ignored for non-Mempack carts.
+        read_only: Refuse ALL writes to this mount for the life of the mount, regardless
+                  of whether the server was started `--writable`. Use for carts this
+                  process only consumes — a shared fleet cart, a reference corpus, anything
+                  another box publishes. Mount it again without the flag if you mean to
+                  write; there is deliberately no unlock, because a lock you can clear by
+                  re-calling the same function is not a lock.
     """
     session_id = _resolve_session_id(session_id)
     state = _get_session(session_id)
-    log.info(f"mount_cartridge({name}, session={session_id}, owner_id={owner_id[:8] if owner_id else 'none'})")
+    log.info(f"mount_cartridge({name}, session={session_id}, "
+             f"owner_id={owner_id[:8] if owner_id else 'none'}, read_only={read_only})")
 
     try:
         clean_name = sanitize_name(name)
@@ -4769,6 +4517,9 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
         state["hippocampus"] = data.get("hippocampus")
         state["per_pattern_meta"] = data.get("per_pattern_meta")
         state["modified"] = False
+        # Set from the mount call, not from the artifact. A cart may be writable in
+        # general and still be read-only to THIS consumer.
+        state["mount_read_only"] = bool(read_only)
 
         # Pattern 0 v2: extract briefing + ownership block + cart
         # type. Two sources:
@@ -5617,6 +5368,10 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     # Supabase under the user's own row + bucket folder. Per-user writes
     # to Mempacks should work even on the public read-only port.
     is_mempack = bool(state.get("mempack_id"))
+    # Per-mount read_only applies to Mempacks too — the Mempack carve-out below is about
+    # the SERVER-WIDE flag (public droplet port), not about a lock this caller asked for.
+    if state.get("mount_read_only"):
+        return _write_blocked(state) + " memory_store is disabled."
     if _server_config.get("read_only") and not is_mempack:
         return "Server is in read-only mode. memory_store is disabled for non-Mempack carts."
 
@@ -5698,8 +5453,9 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
     state = _get_session(session_id)
     log.info(f"save_cartridge('{name}', session={session_id})")
 
-    if _server_config.get("read_only"):
-        return "Server is in read-only mode. save_cartridge is disabled."
+    blocked = _write_blocked(state)
+    if blocked:
+        return f"{blocked} save_cartridge is disabled."
 
     if state["cartridge_name"] is None and not name:
         return "No cartridge to save. Mount one first or provide a name."
