@@ -436,6 +436,7 @@ from cart_io import (          # noqa: F401  (re-exported for backward compatibi
 # The names are re-exported below so existing `from membot_server import embed_text` callers
 # keep working — fleet code and docs use that path. They still pay the fastmcp cost, because
 # they are importing the SERVER; the point is that they no longer have to.
+import embed                   # module handle — the startup backend report reads embed.*
 from embed import (            # noqa: F401  (re-exported for backward compatibility)
     embed_text,
     active_backend,
@@ -8414,6 +8415,31 @@ if __name__ == "__main__":
 
     log.info("Starting Membot — Brain Cartridge Server...")
     log.info(f"Transport: {args.transport}")
+
+    # Which embedding backend is active, and WHY — pub's 2026-07-22 audit, §3.
+    #
+    # The Ollama-vs-SentenceTransformer choice was silent. A box that intended to use
+    # Ollama and quietly fell back to SentenceTransformer looked identical at startup to
+    # one that never wanted Ollama, while paying ~2 GB of RAM and a model download for the
+    # difference. A fallback nobody can see is indistinguishable from a misconfiguration.
+    #
+    # Resolving here rather than on first embed also moves the failure earlier: if the
+    # backend cannot be chosen, that is startup news, not first-query news.
+    try:
+        _backend = embed.active_backend()
+        if _backend == "ollama":
+            log.info(f"Embedding backend: OLLAMA ({embed._ollama_embed_model} "
+                     f"@ {embed._ollama_url}) — reuses the running Ollama process")
+        else:
+            log.info("Embedding backend: SENTENCE-TRANSFORMERS (nomic-embed-text-v1.5)")
+            if not embed._ollama_available():
+                log.info("  Ollama not reachable. Running it with the embed model pulled "
+                         "would save ~2 GB RAM and skip the model download.")
+            else:
+                log.info(f"  Ollama IS reachable but MEMBOT_EMBED_BACKEND="
+                         f"{embed._embed_backend!r} selected SentenceTransformer.")
+    except Exception as e:
+        log.warning(f"Embedding backend could not be resolved at startup: {e}")
     if _server_config["read_only"]:
         log.info("READ-ONLY mode (default): memory_store and save_cartridge disabled. Use --writable to enable.")
     else:
