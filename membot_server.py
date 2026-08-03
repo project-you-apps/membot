@@ -371,6 +371,88 @@ def _resolve_session_id(session_id: str) -> str:
     return session_id.strip() if session_id.strip() else "default"
 
 
+# ---------------------------------------------------------------------------
+# Per-seat attention overlays (docs/SPEC-SUBCARTRIDGE-MANIFEST.md)
+# ---------------------------------------------------------------------------
+# Membot tracked NO access counts before this -- zero occurrences of access_count
+# across membot_server / multi_cart / membox. So unlike memory_server, there is no
+# legacy flat counter to dual-write against and no migration: attention arrives
+# here already per-seat.
+#
+# THE SEAT IS THE SESSION ID, which is already `user_<uuid>` for signed-in callers
+# via _session_id_for_user(). Identity plumbing existed; only attention was missing.
+#
+# Guarded import for the same reason memory_server's is: a deployment where these
+# modules are absent must lose per-seat tracking, never fail to boot.
+try:
+    # membot_server does NOT import Path at module level -- verified, it appears nowhere
+    # in the file. Private alias so this cannot collide with function-local imports.
+    from pathlib import Path as _Path
+    import overlay as _ov
+    from overlay_store import OverlayStore
+    from subcart import (
+        build_key_index as _sc_build_key_index,
+        content_key as _subcart_content_key,
+        new_manifest as _sc_new_manifest,
+        resolve as _sc_resolve,
+    )
+    HAS_OVERLAYS = True
+except Exception as _overlay_err:                      # noqa: BLE001
+    HAS_OVERLAYS = False
+    OVERLAY_IMPORT_ERROR = str(_overlay_err)
+
+# One store per cart DIRECTORY, so overlays travel beside the cart they describe.
+_OVERLAY_STORES: dict = {}
+
+
+def _overlay_store_for(state: dict):
+    """Get (or lazily create) the overlay store for this session's mounted cart."""
+    if not HAS_OVERLAYS:
+        return None
+    path = state.get("cartridge_path")
+    if not path:
+        return None
+    try:
+        cart = _Path(path)
+        key = str(cart.parent)
+        store = _OVERLAY_STORES.get(key)
+        if store is None:
+            store = OverlayStore(cart.parent / "overlays", parent_cart=cart.name)
+            _OVERLAY_STORES[key] = store
+        return store
+    except Exception as e:                             # noqa: BLE001
+        # Report the exception TYPE. The first version logged only the message, so a
+        # NameError ('Path' is not defined -- this function had one) surfaced to callers
+        # as a polite "per-seat attention unavailable", which reads as an unsupported
+        # deployment rather than a bug. A programming error must not wear the costume of
+        # a configuration one.
+        log.error("overlay store unavailable for %s: %s: %s",
+                  path, type(e).__name__, e)
+        return None
+
+
+def _overlay_record_hits(state: dict, session_id: str, texts) -> None:
+    """Credit a seat's attention for the passages a search actually returned.
+
+    `texts` MUST be the FULL passage bodies. The search loop truncates to 500 chars
+    for display, and hashing the truncated form would produce content keys that match
+    nothing in the parent -- forever, silently, with every overlay looking populated
+    and resolving to zero.
+
+    Best-effort: attention is additive to a product that worked without it, so a
+    failure here degrades to "this seat's hot stack is slightly behind" and never to
+    a failed search. Errors land in the store's own counters rather than vanishing.
+    """
+    store = _overlay_store_for(state)
+    if store is None or not texts:
+        return
+    try:
+        store.touch_many(session_id, [_subcart_content_key(t) for t in texts])
+        store.flush()                                  # interval-gated; no-op when not due
+    except Exception as e:                             # noqa: BLE001
+        store.stats["last_error"] = f"touch: {e}"
+
+
 def _write_blocked(state: dict) -> str | None:
     """Why this mount may not be written to, or None if it may.
 
@@ -4682,6 +4764,197 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
 
 
 @mcp.tool()
+def subcart_create(name: str, indices: str, title: str = "",
+                   authored_by: str = "user", session_id: str = "") -> str:
+    """Create a sub-cartridge: a NAMED SELECTION of the mounted cart, stored by reference.
+
+    No passages and no embeddings are copied — a sub-cart is a parent pointer plus a list
+    of content keys, so 200 of them cost 200 small key lists rather than 200 copies of the
+    brain.
+
+    `indices` takes the `idx` values from `memory_search` results ("3,7,12"), or the literal
+    "all" for a whole-parent view. Deliberately index-driven rather than query-driven: the
+    caller searches, sees what it got, and selects — instead of a hidden top_k quietly
+    deciding what belongs.
+
+    Selection is by MEANING or by ACCESS or by CURATION — the format does not care and must
+    not. `authored_by` records which, for humans reading it later; nothing branches on it.
+
+    NOT A SECURITY BOUNDARY. A sub-cart scopes what you see. Secrets are separated by CART:
+    a cart someone must not read is one they cannot mount.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Sub-carts unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+    if not name or not name.strip():
+        return "A name is required."
+
+    texts = state["texts"]
+    try:
+        if indices.strip().lower() == "all":
+            keys, mode = None, "all"
+        else:
+            wanted = [int(x) for x in indices.replace(" ", "").split(",") if x]
+            bad = [i for i in wanted if not (0 <= i < len(texts))]
+            if bad:
+                return (f"Out of range for this cart ({len(texts)} passages): {bad}. "
+                        f"Nothing created.")
+            keys, mode = [_subcart_content_key(texts[i]) for i in wanted], "explicit"
+    except ValueError:
+        return f"Could not parse indices {indices!r}. Use \"3,7,12\" or \"all\"."
+
+    try:
+        from subcart_store import SubcartStore
+        store = SubcartStore(state["cartridge_path"], state.get("cartridge_name") or "")
+        manifest = _sc_new_manifest(
+            name.strip(), state.get("cartridge_name") or "", title=title.strip(),
+            mode=mode, authored_by=authored_by, keys=keys,
+            passages_at_authoring=len(texts), created_at=time.time(),
+            writer={"id": session_id, "surface": "MCP"},
+        )
+        store.create(manifest)
+    except ValueError as e:
+        return f"Refused: {e}"
+    except Exception as e:                             # noqa: BLE001
+        log.error("subcart_create failed: %s", e)
+        return f"Failed to create sub-cart: {e}"
+
+    count = len(texts) if mode == "all" else len(keys)
+    return (f"Created sub-cart '{name}' (id {manifest['id']}) over "
+            f"{state.get('cartridge_name')}: {count} passage(s), mode={mode}. "
+            f"Stored by reference — no passages copied.")
+
+
+@mcp.tool()
+def subcart_list(session_id: str = "") -> str:
+    """Sub-cartridges defined over the mounted cart, with how many passages each resolves.
+
+    Reports manifests that fail to parse rather than skipping them: a corrupted sub-cart
+    must not be indistinguishable from one that was never created.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Sub-carts unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+
+    from subcart_store import SubcartStore
+    store = SubcartStore(state["cartridge_path"], state.get("cartridge_name") or "")
+    rows = store.list()
+    if not rows:
+        return f"No sub-carts defined over {state.get('cartridge_name')}."
+
+    texts = state["texts"]
+    index = _sc_build_key_index(texts)
+    lines = [f"Sub-carts over {state.get('cartridge_name')} ({len(rows)}):"]
+    for row in rows:
+        if row.get("problems"):
+            lines.append(f"  ! {row['file']} — INVALID: {'; '.join(row['problems'])}")
+            continue
+        try:
+            resolved = _sc_resolve(store.get(row["id"]), texts, key_index=index)
+            stat = (f"{resolved['stats']['resolved']} resolved"
+                    + (f", {resolved['stats']['unresolved']} unresolved"
+                       if resolved["stats"]["unresolved"] else ""))
+        except Exception as e:                         # noqa: BLE001
+            stat = f"unresolvable: {e}"
+        lines.append(f"  {row['name']}  [{row['mode']}/{row['authored_by']}]  "
+                     f"{stat}  (id {row['id']})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def subcart_delete(name: str, session_id: str = "") -> str:
+    """Delete a sub-cartridge. The manifest MOVES TO TRASH; it is never unlinked.
+
+    Deleting destroys a SELECTION, not any passages — but a hand-curated selection is real
+    work, so recovery is a file move rather than a re-curation. The parent cart is untouched.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Sub-carts unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+
+    from subcart_store import SubcartStore
+    store = SubcartStore(state["cartridge_path"], state.get("cartridge_name") or "")
+    try:
+        out = store.delete(name)
+    except KeyError:
+        return f"No sub-cart named or id'd {name!r} over {state.get('cartridge_name')}."
+    except Exception as e:                             # noqa: BLE001
+        return f"Failed to delete: {e}"
+    return (f"Deleted sub-cart '{out['name']}' (id {out['id']}). "
+            f"Manifest moved to {out['moved_to']} — recoverable. No passages were removed.")
+
+
+@mcp.tool()
+def seat_hot_stack(top_k: int = 8, session_id: str = "") -> str:
+    """What THIS seat has been working on in the mounted cart, ranked by its own attention.
+
+    Not the cart's hot stack -- there is no such thing once a cart has more than one
+    reader. Two people searching the same shared brain build different hierarchies over
+    it, and this returns the caller's. A passage another seat has read forty times is
+    cold here if this seat has never opened it.
+
+    Scored ONLY over passages this seat has actually touched. Untouched passages are
+    cold rather than absent: a thing you could read but never have simply does not rise.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+
+    store = _overlay_store_for(state)
+    if store is None:
+        reason = ("modules not importable" if not HAS_OVERLAYS
+                  else "no cartridge path for this mount")
+        return f"Per-seat attention unavailable ({reason})."
+
+    overlay = store.get_overlay(session_id)
+    if not overlay["entries"]:
+        return (f"Seat '{session_id}' has no recorded attention in "
+                f"{state.get('cartridge_name')} yet. Search a few times and check back.")
+
+    # Rank the seat's own rows, then map back to passages in the mounted cart.
+    scored = sorted(
+        ((k, e) for k, e in overlay["entries"].items() if e.get(_ov._N, 0) > 0),
+        key=lambda kv: (kv[1].get(_ov._N, 0), kv[1].get(_ov._T, 0.0)),
+        reverse=True,
+    )[:top_k]
+
+    index = {}
+    for i, t in enumerate(state["texts"]):
+        index.setdefault(_subcart_content_key(t), i)
+
+    lines = [f"Seat '{session_id}' — top {len(scored)} by this seat's attention "
+             f"({len(overlay['entries'])} passages touched):"]
+    unresolved = 0
+    for rank, (key, entry) in enumerate(scored, 1):
+        i = index.get(key)
+        if i is None:
+            # Attention on something not in THIS cart: a different mount, or a passage
+            # since tombstoned. Reported, never silently dropped.
+            unresolved += 1
+            continue
+        text = state["texts"][i]
+        preview = (text[:180] + "...") if len(text) > 180 else text
+        marks = "".join(f" [{m}]" for m in entry.get(_ov._K, []))
+        agency = f" ({entry[_ov._A]})" if entry.get(_ov._A) else ""
+        lines.append(f"#{rank} (idx:{i}) n={entry.get(_ov._N, 0)}{agency}{marks} "
+                     f"{preview}")
+    if unresolved:
+        lines.append(f"({unresolved} touched passage(s) not present in this cart — "
+                     f"different mount, or tombstoned)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: bool = False) -> str:
     """Search the mounted cartridge using lattice physics + embedding similarity.
 
@@ -4824,6 +5097,7 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
 
         hippo = state.get("hippocampus")
         results = []
+        hit_bodies = []          # FULL texts, for per-seat attention. See below.
         for rank, (i, final_score, kw_boost) in enumerate(boosted[:top_k], 1):
             if final_score < 0.1:
                 continue
@@ -4832,6 +5106,10 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
                 text = full_texts[i]["passage"]
             else:
                 text = state["texts"][i]
+            # Captured BEFORE truncation. content_key() hashes the body, so hashing the
+            # 500-char display form would yield keys that match nothing in the parent --
+            # silently, with every overlay looking populated and resolving to zero.
+            hit_bodies.append(text)
             if len(text) > 500:
                 text = text[:500] + "..."
 
@@ -4854,6 +5132,7 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
                 results.append(f"#{rank} (idx:{i}) [{final_score:.3f}]{nav} {text}")
 
         state["query_count"] = state.get("query_count", 0) + 1
+        _overlay_record_hits(state, session_id, hit_bodies)
         _log_activity(session_id, "search", f"'{query[:40]}' → {len(boosted[:top_k])} results", elapsed_ms)
 
         if not results:
