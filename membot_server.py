@@ -4772,6 +4772,91 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
 
 
 @mcp.tool()
+def seat_hide(indices: str, unhide: bool = False, session_id: str = "") -> str:
+    """Hide passages from YOUR view of the mounted cart. Affects nobody else.
+
+    The lightest thing you can do to a passage: it drops out of your hot stack and your
+    search results, and no one else's view changes at all. Nothing is deleted, nothing is
+    written to the cart, and `unhide=True` puts it straight back.
+
+    This exists because "this is noise TO ME" is the most common thing a person wants to say
+    about a passage in a shared brain — and without it the only options are to live with it
+    or delete it for the whole company. That is the choice that gets shared knowledge
+    deleted.
+
+    `indices` takes the `idx` values from search results ("3,7,12").
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Per-seat views unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+
+    store = _overlay_store_for(state)
+    if store is None:
+        return "Per-seat views unavailable for this mount."
+
+    texts = state["texts"]
+    try:
+        wanted = [int(x) for x in indices.replace(" ", "").split(",") if x]
+    except ValueError:
+        return f"Could not parse indices {indices!r}. Use \"3,7,12\"."
+    bad = [i for i in wanted if not (0 <= i < len(texts))]
+    if bad:
+        return f"Out of range for this cart ({len(texts)} passages): {bad}. Nothing changed."
+
+    for i in wanted:
+        store.set_mark(session_id, _subcart_content_key(texts[i]),
+                       _ov.HIDDEN_MARK, on=not unhide)
+    store.flush()
+
+    verb = "Unhid" if unhide else "Hid"
+    total = len(_ov.hidden_keys(store.get_overlay(session_id)))
+    return (f"{verb} {len(wanted)} passage(s) for seat '{session_id}'. "
+            f"{total} hidden in total. Nothing was deleted and no other seat is affected.")
+
+
+@mcp.tool()
+def seat_hidden(session_id: str = "") -> str:
+    """List what YOU have hidden in the mounted cart, so it can be found and undone."""
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Per-seat views unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+
+    store = _overlay_store_for(state)
+    if store is None:
+        return "Per-seat views unavailable for this mount."
+
+    keys = _ov.hidden_keys(store.get_overlay(session_id))
+    if not keys:
+        return f"Seat '{session_id}' has nothing hidden in {state.get('cartridge_name')}."
+
+    texts = state["texts"]
+    index = {}
+    for i, t in enumerate(texts):
+        index.setdefault(_subcart_content_key(t), i)
+
+    lines = [f"Hidden by seat '{session_id}' ({len(keys)}):"]
+    missing = 0
+    for key in sorted(keys):
+        i = index.get(key)
+        if i is None:
+            missing += 1
+            continue
+        preview = texts[i][:140] + ("..." if len(texts[i]) > 140 else "")
+        lines.append(f"  (idx:{i}) {preview}")
+    if missing:
+        lines.append(f"  ({missing} hidden passage(s) not present in this cart — "
+                     f"a different mount, or since removed)")
+    lines.append("Use seat_hide(indices, unhide=True) to restore any of these.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def subcart_create(name: str, indices: str, title: str = "",
                    authored_by: str = "user", session_id: str = "") -> str:
     """Create a sub-cartridge: a NAMED SELECTION of the mounted cart, stored by reference.
@@ -4930,8 +5015,14 @@ def seat_hot_stack(top_k: int = 8, session_id: str = "") -> str:
                 f"{state.get('cartridge_name')} yet. Search a few times and check back.")
 
     # Rank the seat's own rows, then map back to passages in the mounted cart.
+    # Hidden rows are excluded here TOO, not only in seat_hot_stack.py -- this tool has its
+    # own ranking rather than calling that module, so filtering there alone left hidden
+    # passages showing up in exactly the surface a person would check after hiding them.
+    # Fifth "fixed one call site, missed its sibling" this week; found by a test.
+    hidden = _ov.hidden_keys(overlay)
     scored = sorted(
-        ((k, e) for k, e in overlay["entries"].items() if e.get(_ov._N, 0) > 0),
+        ((k, e) for k, e in overlay["entries"].items()
+         if e.get(_ov._N, 0) > 0 and k not in hidden),
         key=lambda kv: (kv[1].get(_ov._N, 0), kv[1].get(_ov._T, 0.0)),
         reverse=True,
     )[:top_k]
@@ -5106,8 +5197,27 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
         hippo = state.get("hippocampus")
         results = []
         hit_bodies = []          # FULL texts, for per-seat attention. See below.
+
+        # Passages THIS SEAT has hidden. Computed once per search rather than per hit;
+        # for a seat that has hidden nothing this is an empty set and costs nothing.
+        hidden_keys = set()
+        if HAS_OVERLAYS:
+            _store = _overlay_store_for(state)
+            if _store is not None:
+                try:
+                    hidden_keys = _ov.hidden_keys(_store.get_overlay(session_id))
+                except Exception as e:              # noqa: BLE001
+                    log.warning("hidden lookup failed for %s: %s", session_id, e)
+        hidden_hits = 0
+
         for rank, (i, final_score, kw_boost) in enumerate(boosted[:top_k], 1):
             if final_score < 0.1:
+                continue
+            if hidden_keys and _subcart_content_key(state["texts"][i]) in hidden_keys:
+                # Hidden for this seat only. Counted and reported below -- a search that
+                # quietly returns fewer results than it found is indistinguishable from a
+                # search that is broken.
+                hidden_hits += 1
                 continue
             # Use full text from SQLite if available, otherwise snippet from RAM
             if i in full_texts:
@@ -5144,6 +5254,13 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
         _log_activity(session_id, "search", f"'{query[:40]}' → {len(boosted[:top_k])} results", elapsed_ms)
 
         if not results:
+            if hidden_hits:
+                # "Nothing found" and "everything found was hidden by you" are very
+                # different facts, and only one of them means you should change the query.
+                return (f"No visible matches for '{query}' — {hidden_hits} match(es) are "
+                        f"hidden by seat '{session_id}'. Use seat_hidden() to review or "
+                        f"seat_hide(indices, unhide=True) to restore. "
+                        f"(searched {len(state['texts'])} memories, {elapsed_ms:.0f}ms)")
             return f"No relevant matches for '{query}' (searched {len(state['texts'])} memories, {elapsed_ms:.0f}ms)"
 
         kw_label = f"+kw" if keywords else ""
@@ -5154,7 +5271,9 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
             mode_label = f"hamming-only{kw_label}{split_label}"
         else:
             mode_label = f"embedding-only{kw_label}{split_label}"
-        header = f"Search [{mode_label}]: {len(results)} results from '{state['cartridge_name']}' ({elapsed_ms:.0f}ms)\n"
+        hidden_note = (f", {hidden_hits} hidden by this seat" if hidden_hits else "")
+        header = (f"Search [{mode_label}]: {len(results)} results from "
+                  f"'{state['cartridge_name']}'{hidden_note} ({elapsed_ms:.0f}ms)\n")
         return header + "\n\n".join(results)
 
     except Exception as e:

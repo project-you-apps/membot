@@ -79,7 +79,24 @@ def merge_agency(a, b):
 # Of `_reserved.canonical`: truth_status / kind / duplicate_of_key are properties of the
 # CONTENT and stay global. important / urgent / to_consolidate are one person's judgement
 # and belong here.
-ATTENTION_BOOLS = ("important", "urgent", "to_consolidate")
+ATTENTION_BOOLS = ("important", "urgent", "to_consolidate", "hidden")
+
+# `hidden` is the ONLY one of these with no counterpart in the cart's canonical block, and
+# that is the point. It is the first rung of the delete ladder and the only one that is free:
+#
+#   hidden     this seat's view only   costs nothing, reversible, invisible to everyone else
+#   tombstone  everyone, bytes kept    needs a durable tombstone in the cart format
+#   purge      everyone, bytes gone    owner only, irreversible
+#
+# In a shared brain "this is noise TO ME" is the most common thing a person wants to say
+# about a passage, and until now their only options were to live with it or delete it for
+# the whole company. That is a bad choice to force on someone, and it is the reason people
+# delete things they should not.
+#
+# Never seeded from links: no cart carries it, and it must not become a shared property by
+# accident. It also never reaches the scorer's canonical block -- see
+# seat_hot_stack.scoring_link.
+HIDDEN_MARK = "hidden"
 
 # Compact on-disk keys. An overlay is one row per touched passage and is rewritten often;
 # "access_count" costs 6x "n" across tens of thousands of rows for no added clarity on disk.
@@ -201,6 +218,18 @@ def links_for(overlay: dict, keys) -> list:
     return [get(overlay, k) for k in keys]
 
 
+def is_hidden(overlay: dict, key: str) -> bool:
+    """Has this seat hidden this passage from its own view?"""
+    entry = overlay.get("entries", {}).get(key)
+    return bool(entry) and HIDDEN_MARK in (entry.get(_K) or [])
+
+
+def hidden_keys(overlay: dict) -> set:
+    """Every key this seat has hidden. A set, because callers filter with it."""
+    return {k for k, e in overlay.get("entries", {}).items()
+            if HIDDEN_MARK in (e.get(_K) or [])}
+
+
 def stats(overlay: dict) -> dict:
     entries = overlay["entries"]
     agency = {}
@@ -213,6 +242,8 @@ def stats(overlay: dict) -> dict:
         "rows": len(entries),
         "touched": sum(1 for e in entries.values() if e.get(_N, 0) > 0),
         "marked": sum(1 for e in entries.values() if e.get(_K)),
+        "hidden": sum(1 for e in entries.values()
+                      if HIDDEN_MARK in (e.get(_K) or [])),
         "total_accesses": sum(e.get(_N, 0) for e in entries.values()),
         "agency": agency,
     }
@@ -322,7 +353,13 @@ def seed_from_links(seat: str, parent_cart: str, texts, links,
         count = link.get("access_count", 0) or 0
         seen = link.get("accessed_at", 0.0) or 0.0
         agency = (reserved.get("flags") or {}).get("agency")
-        marks = sorted(m for m in ATTENTION_BOOLS if canonical.get(m))
+        # HIDDEN_MARK is deliberately excluded: it is per-seat only and no cart carries it.
+        # Seeding it would make one person's "noise, to me" look like a shared property --
+        # which is exactly what this mark exists to avoid. Caught by
+        # test_hidden_is_never_seeded_from_a_cart, after adding it to ATTENTION_BOOLS made
+        # it seedable by accident.
+        marks = sorted(m for m in ATTENTION_BOOLS
+                       if m != HIDDEN_MARK and canonical.get(m))
 
         # `reflective` is the resting value on 19,788 links and carries no judgement, so it
         # is not on its own evidence that this seat ever engaged with the passage. Treating

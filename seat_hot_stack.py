@@ -85,8 +85,16 @@ def seat_hot_stack(manifest, texts, links, seat_overlay, score_fn, *,
     resolved = _sc.resolve(manifest, texts, salt, key_index)
 
     scored = []
+    hidden = 0
     for idx in resolved["indices"]:
         key = _sc.content_key(texts[idx], salt)
+        # Hidden is this seat saying "noise, to me". Filtered here rather than scored to
+        # zero, because a hidden passage should not merely rank low -- it should be absent.
+        # Counted, never silently dropped: a hot stack that quietly omits things is exactly
+        # as untrustworthy as one that quietly includes them.
+        if _ov.is_hidden(seat_overlay, key):
+            hidden += 1
+            continue
         seat_link = _ov.get(seat_overlay, key)
         # An untouched passage is cold, not absent. Skipping it keeps the seat's view
         # honest: things they could read but never have simply do not rise.
@@ -108,6 +116,7 @@ def seat_hot_stack(manifest, texts, links, seat_overlay, score_fn, *,
             "seat": seat_overlay.get("seat"),
             "resolvable": len(resolved["indices"]),
             "scoreable": len(scored),
+            "hidden": hidden,
             "unresolved": len(resolved["unresolved"]),
             "returned": min(top_k, len(scored)),
         },
