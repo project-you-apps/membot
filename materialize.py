@@ -92,7 +92,8 @@ def _remap_links(links, indices, report):
 
 
 def materialize(manifest: dict, parent: dict, salt: str = "",
-                key_index: dict = None, now: float = 0.0) -> dict:
+                key_index: dict = None, now: float = 0.0,
+                succession: dict = None) -> dict:
     """Resolve a manifest against a loaded cart dict and return a standalone cart dict.
 
     `parent` is the cart as loaded from a PKL: {passages, embeddings, links, metadata, ...}.
@@ -104,11 +105,15 @@ def materialize(manifest: dict, parent: dict, salt: str = "",
     """
     now = now or time.time()
     passages = parent.get("passages") or parent.get("texts") or []
-    resolved = _sc.resolve(manifest, passages, salt, key_index)
+    links = parent.get("links") or []
+    # Follow edits when exporting. A cluster whose members were corrected should ship the
+    # CURRENT text -- exporting the superseded version would hand someone a slice that is
+    # wrong in exactly the way the cart already knows about.
+    resolved = _sc.resolve(manifest, passages, salt, key_index,
+                           succession=succession, links=links)
     indices = resolved["indices"]
 
     report = {"severed": 0}
-    links = parent.get("links") or []
     new_links = _remap_links(links, indices, report) if links else []
 
     embeddings = parent.get("embeddings")
@@ -130,6 +135,7 @@ def materialize(manifest: dict, parent: dict, salt: str = "",
             "parent_passages": len(passages),
             "materialized_at": now,
             "unresolved": len(resolved["unresolved"]),
+            "followed_edits": len(resolved.get("followed") or {}),
             "links_severed": report["severed"],
         },
     }
@@ -144,12 +150,14 @@ def materialize(manifest: dict, parent: dict, salt: str = "",
         "passages": len(out["passages"]),
         "requested": resolved["stats"]["requested"],
         "unresolved": len(resolved["unresolved"]),
+        "followed_edits": len(resolved.get("followed") or {}),
         "links_severed": report["severed"],
     }
     return out
 
 
-def verify(original: dict, materialized: dict, manifest: dict, salt: str = "") -> list:
+def verify(original: dict, materialized: dict, manifest: dict, salt: str = "",
+           succession: dict = None) -> list:
     """Problems with a materialized cart. Empty list means it holds together.
 
     Checked rather than assumed, because every failure mode here is silent: an embedding
@@ -176,13 +184,20 @@ def verify(original: dict, materialized: dict, manifest: dict, salt: str = "") -
             if not (isinstance(value, int) and 0 <= value < n):
                 problems.append(f"link[{i}].related contains {value!r} out of range")
 
-    # Every materialized passage must still hash to a key the manifest asked for.
+    # Every materialized passage must trace back to a key the manifest asked for -- either
+    # directly, or through an edit chain. Without the succession half this check rejects its
+    # own correct output: a followed edit yields the SUCCESSOR, whose key the manifest has
+    # never seen.
     membership = manifest.get("membership") or {}
     if membership.get("mode") == "explicit":
         wanted = set(membership.get("keys") or [])
+        if succession:
+            for key in list(wanted):
+                head, _ = _sc.follow_succession(key, succession)
+                wanted.add(head)
         for i, text in enumerate(passages):
             if _sc.content_key(text, salt) not in wanted:
-                problems.append(f"passage {i} is not in the manifest's key set")
+                problems.append(f"passage {i} traces back to no key in the manifest")
                 break
 
     return problems

@@ -172,7 +172,23 @@ def test_verify_catches_a_passage_that_is_not_in_the_manifest():
     m = man(0, 2)
     out = materialize(m, cart())
     out["passages"][0] = "something else entirely"
-    assert any("not in the manifest" in p for p in verify(cart(), out, m))
+    assert any("traces back to no key" in p for p in verify(cart(), out, m))
+
+
+def test_materialize_follows_edits_and_verify_accepts_the_successor():
+    """An export of a corrected cluster must ship the CURRENT text — and verify must not
+    reject its own correct output just because the successor's key is not in the manifest."""
+    import subcart as _sc
+    texts = ["alpha body", "beta body", "alpha body, corrected"]
+    parent = {"version": 1, "passages": texts, "links": [], "embeddings": None}
+    m = _sc.new_manifest("cluster", "p.pkl",
+                         keys=[_sc.content_key("alpha body")], created_at=1.0)
+    succ = {_sc.content_key("alpha body"): _sc.content_key("alpha body, corrected")}
+
+    out = materialize(m, parent, succession=succ)
+    assert out["passages"] == ["alpha body, corrected"]
+    assert out["stats"]["followed_edits"] == 1
+    assert verify(parent, out, m, succession=succ) == []
 
 
 def test_verify_catches_a_link_count_mismatch():

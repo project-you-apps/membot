@@ -432,6 +432,31 @@ def _overlay_store_for(state: dict):
         return None
 
 
+def _succession_for(state: dict) -> dict:
+    """`old_key -> new_key` for the mounted cart, from its changes sidecar.
+
+    Cross-product on purpose: a cart EDITED in the studio and READ here must have its
+    clusters follow the edit. Membot has no edit path of its own (deliberately — see the
+    2026-08-03 decision that agents propose rather than mutate), so every entry in this log
+    was written somewhere else.
+
+    Empty dict on any problem: succession is an enhancement to resolution, and failing to
+    load it should cost a follow, never a search.
+    """
+    if not HAS_OVERLAYS:
+        return {}
+    path = state.get("cartridge_path")
+    if not path:
+        return {}
+    try:
+        import succession_store as _succ
+        return _succ.build_map(path)
+    except Exception as e:                             # noqa: BLE001
+        log.warning("succession log unavailable for %s: %s: %s",
+                    path, type(e).__name__, e)
+        return {}
+
+
 def _overlay_record_hits(state: dict, session_id: str, texts) -> None:
     """Credit a seat's attention for the passages a search actually returned.
 
@@ -4772,6 +4797,78 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
 
 
 @mcp.tool()
+def firm_hot_stack(top_k: int = 10, session_id: str = "") -> str:
+    """What the ORGANISATION is warm on — not what any one person is.
+
+    Fifty personal hot stacks do not sum to an institutional record unless the roll-up is
+    deliberately kept. Per-seat attention alone silently deletes the firm's memory of itself.
+
+    The signal that exists ONLY here is `seats` — how many distinct people touched a passage.
+    One person reading something forty times and forty people reading it once produce the
+    same access count and mean very different things about a company. Ranked by distinct
+    seats first, volume second, for exactly that reason.
+
+    Andy, 2026-08-02: the company brain "keeps an episodic record of the firm's evolution
+    over time as an emergent property of the Hot Stack system."
+
+    NOTE ON WHAT YOU SEE: this view is computed firm-wide and shows only passages present in
+    the mounted cart. It is the organisation's view, not yours — a passage can appear here
+    that you personally have never opened.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Per-seat attention unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+
+    store = _overlay_store_for(state)
+    if store is None:
+        return "Per-seat attention unavailable for this mount."
+
+    seats = store.seats()
+    if not seats:
+        return (f"No seats have recorded attention in {state.get('cartridge_name')} yet. "
+                f"The firm view needs at least one.")
+
+    overlays = [store.get_overlay(s) for s in seats]
+    texts = state["texts"]
+
+    # CALL the module rather than reimplement it. The first version of this tool inlined the
+    # roll-up, which produced two firm-view implementations that had to agree -- the same
+    # duplication that left `seat_hot_stack.firm_hot_stack` with no callers in the first
+    # place. One implementation, one place to fix.
+    #
+    # `seats` first, then volume: membot has no compute_hot_score (that lives in
+    # memory_server), and for the FIRM view head-count is the right primary key anyway.
+    import seat_hot_stack as _shs
+
+    def firm_score(link, now):
+        return float(link.get("access_count", 0))
+
+    result = _shs.firm_hot_stack(overlays, texts, state.get("links") or [],
+                                 firm_score, top_k=max(top_k, 1))
+    if not result["items"]:
+        return f"{len(seats)} seat(s) present, but none has touched anything in this cart yet."
+
+    lines = [f"Firm view of {state.get('cartridge_name')} — {len(seats)} seat(s), "
+             f"{result['stats']['keys']} passage(s) with recorded attention:"]
+    for rank, item in enumerate(
+            sorted(result["items"], key=lambda r: (r["seats"], r["score"]), reverse=True), 1):
+        i = item.get("index")
+        preview = (texts[i][:150] + ("..." if len(texts[i]) > 150 else "")) if i is not None else ""
+        people = "person" if item["seats"] == 1 else "people"
+        lines.append(f"#{rank} (idx:{i}) {item['seats']} {people}, "
+                     f"{item['link']['access_count']} reads — {preview}")
+
+    absent = result["stats"]["absent_from_cart"]
+    if absent > 0:
+        lines.append(f"({absent} passage(s) with firm attention are not in this cart — "
+                     f"a different mount, or since removed)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def seat_hide(indices: str, unhide: bool = False, session_id: str = "") -> str:
     """Hide passages from YOUR view of the mounted cart. Affects nobody else.
 
@@ -4943,14 +5040,20 @@ def subcart_list(session_id: str = "") -> str:
 
     texts = state["texts"]
     index = _sc_build_key_index(texts)
+    # A cluster whose member was edited elsewhere must still find it. Loaded once per call
+    # rather than per sub-cart — it is the same log for every one of them.
+    succession = _succession_for(state)
     lines = [f"Sub-carts over {state.get('cartridge_name')} ({len(rows)}):"]
     for row in rows:
         if row.get("problems"):
             lines.append(f"  ! {row['file']} — INVALID: {'; '.join(row['problems'])}")
             continue
         try:
-            resolved = _sc_resolve(store.get(row["id"]), texts, key_index=index)
+            resolved = _sc_resolve(store.get(row["id"]), texts, key_index=index,
+                                   succession=succession, links=state.get("links"))
             stat = (f"{resolved['stats']['resolved']} resolved"
+                    + (f", {resolved['stats']['followed']} followed an edit"
+                       if resolved["stats"].get("followed") else "")
                     + (f", {resolved['stats']['unresolved']} unresolved"
                        if resolved["stats"]["unresolved"] else ""))
         except Exception as e:                         # noqa: BLE001
@@ -4958,6 +5061,99 @@ def subcart_list(session_id: str = "") -> str:
         lines.append(f"  {row['name']}  [{row['mode']}/{row['authored_by']}]  "
                      f"{stat}  (id {row['id']})")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def subcart_export(name: str, out_name: str = "", session_id: str = "") -> str:
+    """MATERIALIZE a sub-cartridge into a standalone cart someone else can actually open.
+
+    A sub-cart is stored by reference — a parent pointer plus content keys. That is what
+    makes it cheap and what makes it useless the moment the parent is unreachable. Export
+    resolves the references and copies the passages and embeddings in.
+
+    EXPORT ALWAYS MATERIALIZES. Handing someone a manifest that points at a cart they cannot
+    read is a broken artifact wearing a working one's costume. This is also the operation the
+    marketplace idea needs: sell a slice, ship it standalone.
+
+    Link indices are REMAPPED, not copied. `prev`, `next`, `parent`, `related` and
+    `duplicate_of` are positions, and a materialized cart renumbers everything — on a real
+    300-passage slice of the session cart, 453 references pointed outside it. Copying them
+    verbatim would silently point every one at a stranger.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Sub-carts unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+
+    blocked = _write_blocked(state)
+    if blocked:
+        return f"{blocked} subcart_export writes a new cart file, so it is disabled."
+
+    from subcart_store import SubcartStore
+    store = SubcartStore(state["cartridge_path"], state.get("cartridge_name") or "")
+    try:
+        manifest = store.get(name)
+    except KeyError:
+        return f"No sub-cart named or id'd {name!r} over {state.get('cartridge_name')}."
+
+    try:
+        import materialize as _mat
+        parent = {
+            "version": 1,
+            "passages": state["texts"],
+            "embeddings": state.get("embeddings"),
+            "links": state.get("links") or [],
+            "metadata": {"parent_cart": state.get("cartridge_name")},
+        }
+        succession = _succession_for(state)
+        result = _mat.materialize(manifest, parent, succession=succession)
+        problems = _mat.verify(parent, result, manifest, succession=succession)
+    except Exception as e:                             # noqa: BLE001
+        log.error("subcart_export failed for %s: %s", name, e)
+        return f"Export failed: {type(e).__name__}: {e}"
+
+    if problems:
+        # Refuse rather than ship a cart that does not hold together. A broken export is
+        # worse than none, because the recipient has no way to tell.
+        return ("Export REFUSED — the materialized cart failed verification:\n  "
+                + "\n  ".join(problems[:5]))
+
+    if not result["passages"]:
+        return (f"Sub-cart '{name}' resolved to 0 passages in this cart; nothing to export. "
+                f"({result['stats']['unresolved']} key(s) unresolved.)")
+
+    save_dir = os.path.join(BASE_DIR, "cartridges")
+    os.makedirs(save_dir, exist_ok=True)
+    try:
+        safe = sanitize_name(out_name or f"{manifest['name']}-export")
+    except ValueError as e:
+        return str(e)
+    out_path = os.path.join(save_dir, f"{safe}.cart.npz")
+    if os.path.exists(out_path):
+        return (f"Refusing to overwrite {safe}.cart.npz — choose another out_name. "
+                f"Nothing was written.")
+
+    try:
+        save_as_npz(out_path, result["embeddings"], result["passages"])
+        size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    except Exception as e:                             # noqa: BLE001
+        log.error("subcart_export save failed: %s", e)
+        return f"Materialized cleanly but could not write {out_path}: {e}"
+
+    stats = result["stats"]
+    notes = []
+    if stats.get("unresolved"):
+        notes.append(f"{stats['unresolved']} key(s) did not resolve and were NOT exported")
+    if stats.get("links_severed"):
+        notes.append(f"{stats['links_severed']} link(s) pointed outside the slice and were "
+                     f"severed rather than left pointing at the wrong passage")
+    tail = ("\n  " + "\n  ".join(notes)) if notes else ""
+
+    return (f"Exported '{manifest['name']}' -> {safe}.cart.npz "
+            f"({stats['passages']} passages, {size_mb:.1f} MB). "
+            f"Standalone: it no longer needs {state.get('cartridge_name')}.{tail}")
 
 
 @mcp.tool()

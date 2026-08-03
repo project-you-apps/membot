@@ -75,6 +75,24 @@ class OverlayStore:
 
     # ------------------------------------------------------------------ access
 
+    def seats(self) -> list:
+        """Every seat with an overlay on disk, plus any loaded but not yet flushed.
+
+        Needed by the FIRM view: rolling up "what is this organisation warm on" requires
+        enumerating seats, and until now the store only ever loaded one on demand. That gap
+        is why `firm_hot_stack` shipped with no possible caller — the function existed but
+        nothing could assemble its argument.
+        """
+        found = set()
+        try:
+            for path in self.dir.glob(f"*{'.overlay.json'}"):
+                found.add(path.name[: -len(".overlay.json")])
+        except OSError as e:
+            self.stats["last_error"] = f"seats: {e}"
+        with self._lock:
+            found.update(self._overlays)
+        return sorted(found)
+
     def get_overlay(self, seat: str) -> dict:
         """Load from disk on first use, create if absent. Never raises on a missing file."""
         with self._lock:

@@ -163,7 +163,14 @@ def firm_hot_stack(overlays, texts, links, score_fn, *, top_k: int = 8, salt: st
         if not seat_link["access_count"] and not seat_link["accessed_at"]:
             continue
         hits = key_index.get(key) or []
-        cart_link = links[hits[0]] if hits and isinstance(links[hits[0]], dict) else {}
+        # Bounds BEFORE subscript. The first version read `links[hits[0]]` inside the guard
+        # that was supposed to protect it, so a cart with no links at all (membot's npz
+        # carts have none) raised IndexError on a valid passage index. Never caught because
+        # this function had no callers for two days -- every test handed it a links list as
+        # long as its passages.
+        cart_link = {}
+        if hits and hits[0] < len(links) and isinstance(links[hits[0]], dict):
+            cart_link = links[hits[0]]
         scored.append({
             "content_key": key,
             "index": hits[0] if hits else None,
@@ -173,12 +180,17 @@ def firm_hot_stack(overlays, texts, links, score_fn, *, top_k: int = 8, salt: st
         })
 
     scored.sort(key=lambda r: (r["score"], r["seats"]), reverse=True)
+    # Firm attention on passages that are NOT in this cart -- touched under a different
+    # mount, or since removed. Counted here rather than left for the caller to infer,
+    # because `items` is truncated to top_k and a caller cannot see past it.
+    absent = sum(1 for r in scored if r["index"] is None)
     return {
         "items": scored[:top_k],
         "stats": {
             "seats_rolled_up": len(overlays),
             "keys": len(firm["entries"]),
             "visible": len(scored),
+            "absent_from_cart": absent,
             "masked": viewer_manifest is not None,
             "returned": min(top_k, len(scored)),
         },

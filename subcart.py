@@ -77,38 +77,6 @@ SUCCESSION_FIELD = "superseded_by_key"
 MAX_SUCCESSION_HOPS = 16
 
 
-def build_succession(texts, links, salt: str = "") -> dict:
-    """`old content_key -> new content_key`, read off the cart's own passages and links.
-
-    The OLD key is derived from the passage body, not stored on the link -- links carry no
-    content key of their own, and adding one would be a second copy of a value that is
-    already computable and must never disagree with itself.
-
-    WHY THIS HAS TO EXIST. Passages are never edited in place -- an edit appends a new
-    passage and tombstones the old one. Those are two independent operations (in the studio,
-    literally `POST /api/patterns` then `DELETE /api/patterns/{idx}`), so nothing recorded
-    that they were related.
-
-    The consequence was silent and total: an edit changes the body, which changes the
-    content key, so every sub-cart manifest pointing at the old key held a dangling
-    reference and every seat's overlay row for it went unresolved. A curated cluster would
-    quietly shed passages as they were edited, and someone's attention history would lose
-    the very passages they had worked on hardest. Nothing raised.
-    """
-    succession = {}
-    for text, link in zip(texts or [], links or []):
-        if not isinstance(link, dict):
-            continue
-        canonical = (link.get("_reserved") or {}).get("canonical") or {}
-        new_key = canonical.get(SUCCESSION_FIELD)
-        if not isinstance(new_key, str) or not new_key:
-            continue
-        old_key = content_key(text, salt)
-        if old_key != new_key:
-            succession[old_key] = new_key
-    return succession
-
-
 def follow_succession(key: str, succession: dict, max_hops: int = MAX_SUCCESSION_HOPS):
     """Walk an edit chain to its current head. Returns `(final_key, hops)`.
 
@@ -129,31 +97,6 @@ def follow_succession(key: str, succession: dict, max_hops: int = MAX_SUCCESSION
         current = nxt
         hops += 1
     return current, hops
-
-
-def record_succession(link: dict, new_text: str, salt: str = "",
-                      now: float = 0.0) -> dict:
-    """Mark a link's passage as superseded by `new_text`. Returns the updated link.
-
-    Call this on the OLD passage's link at the moment an edit is committed -- i.e. wherever
-    the tombstone is set. Direction matters: the pointer runs OLD -> NEW, because the party
-    who needs it is a reader holding the old key (a manifest, an overlay row) trying to find
-    where that content went. NEW -> OLD would be a nice audit trail and would help nobody
-    resolve anything.
-
-    Does not tombstone. Supersession and deletion are separate facts, and a caller that
-    wants both should say both.
-    """
-    if not isinstance(link, dict):
-        raise ValueError("link must be a dict")
-    updated = dict(link)
-    reserved = dict(updated.get("_reserved") or {})
-    canonical = dict(reserved.get("canonical") or {})
-    canonical[SUCCESSION_FIELD] = content_key(new_text, salt)
-    canonical["superseded_at"] = now or time.time()
-    reserved["canonical"] = canonical
-    updated["_reserved"] = reserved
-    return updated
 
 
 def build_key_index(texts, salt: str = "") -> dict:
@@ -338,11 +281,19 @@ def resolve(manifest: dict, texts, salt: str = "", key_index: dict = None,
         lookup = key
         hits = key_index.get(lookup)
 
-        # Follow the edit chain when the key is dead or points only at tombstones.
-        # NEVER a silent substitution: the follow is recorded in `followed` so a caller
-        # can say "this is the current version of what you selected" rather than quietly
-        # handing back different content than was asked for.
-        if succession and (not hits or all(_is_tombstoned(i) for i in hits)):
+        # Follow the edit chain whenever a succession entry EXISTS for this key.
+        #
+        # The first version only followed when the key was dead or pointed at tombstones,
+        # which coupled resolution to each product's private tombstone bookkeeping -- and
+        # the studio's tombstone is `deleted_ids`, an index set with no link representation
+        # at all. So the one product that actually edits passages could never trigger a
+        # follow, and succession stayed inert in exactly the place it was built for.
+        #
+        # A recorded supersession is a DELIBERATE ASSERTION that the old text is no longer
+        # current. That is stronger evidence than a tombstone flag and it is representation-
+        # independent. NEVER a silent substitution: the follow is reported in `followed` so
+        # a caller can say "this is the current version of what you selected".
+        if succession and key in succession:
             head, hops = follow_succession(key, succession)
             if hops and head != key:
                 head_hits = key_index.get(head)
