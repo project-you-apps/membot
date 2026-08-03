@@ -150,6 +150,9 @@ If `session_id` is omitted, all calls go to the `"default"` session (backward-co
 - Maximum **50 concurrent sessions** (oldest evicted when limit hit)
 - The embedding model and GPU are shared across all sessions — only the mounted cartridge state is per-session
 
+Sessions isolate *what you have mounted*. As of August 2026 they also isolate *what you have
+paid attention to* — see [Per-Seat Memory](#per-seat-memory) below.
+
 ### Agent Configuration
 
 **OpenClaw** (`~/.openclaw/openclaw.json`):
@@ -213,6 +216,67 @@ mcporter call membot.memory_search query="your query" top_k=5
 ```
 
 See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working example.
+
+## What's New (August 2026)
+
+### Per-Seat Memory
+
+**A cart with two readers has no single hot list.** Two people searching the same shared brain
+are not doing the same thing, and until now Membot recorded as if they were — it tracked no
+access counts at all, so "what matters here" was a property of the cart rather than of the
+person asking.
+
+Now every seat carries its own attention: what it has read, how often, what it marked, and
+what it decided to do about it. A passage another seat has opened forty times is cold in yours
+if you have never touched it.
+
+```python
+# Each signed-in caller is already a distinct seat (session_id = user_<uuid>)
+memory_search("frustration policy", session_id="user_a")
+
+# ...and gets their own hierarchy over the shared cart
+seat_hot_stack(top_k=8, session_id="user_a")
+```
+
+The split is deliberate and worth knowing if you build on it:
+
+| lives with the CART (shared) | lives with the SEAT (private) |
+|---|---|
+| text, embeddings, `kind`, `truth_status`, duplicate marks | access counts, last-accessed, important/urgent, disposition |
+
+Attention is keyed by **content hash**, not passage index — so it survives a cart rebuild, and
+a seat's history cannot silently reattach itself to different passages. Overlays are sparse
+(one row per passage that seat has actually touched) and live in `<cart dir>/overlays/`, so
+they travel with the cart they describe.
+
+Counter-intuitively this makes writes *cheaper*: N seats write N separate files and never
+contend for the cart.
+
+### Sub-Cartridges
+
+**A named selection of a cart, stored by reference.** No passages and no embeddings are
+copied — a sub-cartridge is a parent pointer plus a list of content keys, so one cart can
+carry many views for the cost of a small key list each.
+
+```python
+# Search, see what you got, then select — indices come from memory_search results
+subcart_create("q3-invoices", indices="3,7,12,40", authored_by="user")
+subcart_list()
+subcart_delete("q3-invoices")     # manifest moves to trash; no passages removed
+```
+
+Membership can be chosen by **meaning** (a curated cluster), by **access** (what a seat may
+see), or by **curation** (a slice you intend to hand someone). The format is indifferent to
+which — it records *why* for humans reading it later, and nothing branches on it.
+
+Keys that no longer resolve are **reported, never dropped**. A passage that was tombstoned, or
+that belongs to a different mount, shows up as unresolved rather than quietly vanishing from
+someone's curated set.
+
+> **Sub-cartridges scope what you see. They are not a secrecy boundary.** A resolved
+> sub-cartridge is a mask over the parent's in-memory arrays — enough to keep payroll out of
+> your hot list, not enough to stop someone reading payroll. **Secrecy is separated by cart:**
+> a cart someone must not read is one they cannot mount.
 
 ## What's New (June 2026)
 
