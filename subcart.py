@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 FORMAT = "vps-subcart"
@@ -65,6 +66,94 @@ def content_key(passage: str, salt: str = "") -> str:
 def salt_id(salt: str) -> str:
     """Public fingerprint OF a salt. Safe to put in a manifest; useless for making keys."""
     return "sha1:" + hashlib.sha1(("salt-id\x00" + (salt or "")).encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------- succession
+
+# Where an edit records what replaced it. Lives beside `duplicate_of_key` in
+# `_reserved.canonical` and is content-keyed for the same reason: an index-keyed
+# pointer stops meaning anything the moment a cart is rebuilt or copied.
+SUCCESSION_FIELD = "superseded_by_key"
+MAX_SUCCESSION_HOPS = 16
+
+
+def build_succession(texts, links, salt: str = "") -> dict:
+    """`old content_key -> new content_key`, read off the cart's own passages and links.
+
+    The OLD key is derived from the passage body, not stored on the link -- links carry no
+    content key of their own, and adding one would be a second copy of a value that is
+    already computable and must never disagree with itself.
+
+    WHY THIS HAS TO EXIST. Passages are never edited in place -- an edit appends a new
+    passage and tombstones the old one. Those are two independent operations (in the studio,
+    literally `POST /api/patterns` then `DELETE /api/patterns/{idx}`), so nothing recorded
+    that they were related.
+
+    The consequence was silent and total: an edit changes the body, which changes the
+    content key, so every sub-cart manifest pointing at the old key held a dangling
+    reference and every seat's overlay row for it went unresolved. A curated cluster would
+    quietly shed passages as they were edited, and someone's attention history would lose
+    the very passages they had worked on hardest. Nothing raised.
+    """
+    succession = {}
+    for text, link in zip(texts or [], links or []):
+        if not isinstance(link, dict):
+            continue
+        canonical = (link.get("_reserved") or {}).get("canonical") or {}
+        new_key = canonical.get(SUCCESSION_FIELD)
+        if not isinstance(new_key, str) or not new_key:
+            continue
+        old_key = content_key(text, salt)
+        if old_key != new_key:
+            succession[old_key] = new_key
+    return succession
+
+
+def follow_succession(key: str, succession: dict, max_hops: int = MAX_SUCCESSION_HOPS):
+    """Walk an edit chain to its current head. Returns `(final_key, hops)`.
+
+    CYCLE-SAFE BY CONSTRUCTION. A -> B -> A is not hypothetical once edits can be reverted,
+    and an unguarded walk would hang the search path rather than fail visibly. Visited keys
+    are tracked and the walk also stops at `max_hops`, so a pathological chain degrades to
+    "stopped early" rather than to a wedged server.
+    """
+    if not succession or not isinstance(key, str):
+        return key, 0
+    seen = {key}
+    current, hops = key, 0
+    while hops < max_hops:
+        nxt = succession.get(current)
+        if not nxt or nxt in seen:
+            break
+        seen.add(nxt)
+        current = nxt
+        hops += 1
+    return current, hops
+
+
+def record_succession(link: dict, new_text: str, salt: str = "",
+                      now: float = 0.0) -> dict:
+    """Mark a link's passage as superseded by `new_text`. Returns the updated link.
+
+    Call this on the OLD passage's link at the moment an edit is committed -- i.e. wherever
+    the tombstone is set. Direction matters: the pointer runs OLD -> NEW, because the party
+    who needs it is a reader holding the old key (a manifest, an overlay row) trying to find
+    where that content went. NEW -> OLD would be a nice audit trail and would help nobody
+    resolve anything.
+
+    Does not tombstone. Supersession and deletion are separate facts, and a caller that
+    wants both should say both.
+    """
+    if not isinstance(link, dict):
+        raise ValueError("link must be a dict")
+    updated = dict(link)
+    reserved = dict(updated.get("_reserved") or {})
+    canonical = dict(reserved.get("canonical") or {})
+    canonical[SUCCESSION_FIELD] = content_key(new_text, salt)
+    canonical["superseded_at"] = now or time.time()
+    reserved["canonical"] = canonical
+    updated["_reserved"] = reserved
+    return updated
 
 
 def build_key_index(texts, salt: str = "") -> dict:
@@ -181,7 +270,8 @@ def save_manifest(manifest: dict, path) -> None:
 
 # --------------------------------------------------------------------- resolution
 
-def resolve(manifest: dict, texts, salt: str = "", key_index: dict = None) -> dict:
+def resolve(manifest: dict, texts, salt: str = "", key_index: dict = None,
+            succession: dict = None, links=None) -> dict:
     """Map a manifest onto a parent's passages.
 
     Returns {indices, unresolved, stats}. `indices` is ordered by the manifest's key order
@@ -210,8 +300,17 @@ def resolve(manifest: dict, texts, salt: str = "", key_index: dict = None) -> di
         return {
             "indices": list(range(n)),
             "unresolved": [],
+            "followed": {},
+            "tombstoned": [i for i in range(n)
+                           if links and i < len(links) and isinstance(links[i], dict)
+                           and links[i].get("tombstone")],
             "stats": {"mode": "all", "requested": n, "resolved": n,
-                      "unresolved": 0, "duplicate_keys": 0, "dropped_repeats": 0},
+                      "unresolved": 0, "followed": 0, "duplicate_keys": 0,
+                      "dropped_repeats": 0,
+                      "tombstoned": sum(1 for i in range(n)
+                                        if links and i < len(links)
+                                        and isinstance(links[i], dict)
+                                        and links[i].get("tombstone"))},
         }
 
     if key_index is None:
@@ -219,9 +318,16 @@ def resolve(manifest: dict, texts, salt: str = "", key_index: dict = None) -> di
 
     indices: list = []
     unresolved: list = []
+    followed: dict = {}
+    tombstoned: list = []
     seen_keys = set()
     duplicate_keys = 0
     dropped_repeats = 0
+
+    def _is_tombstoned(i):
+        if not links or i >= len(links) or not isinstance(links[i], dict):
+            return False
+        return bool(links[i].get("tombstone"))
 
     for key in membership.get("keys", []):
         if key in seen_keys:
@@ -229,22 +335,46 @@ def resolve(manifest: dict, texts, salt: str = "", key_index: dict = None) -> di
             continue
         seen_keys.add(key)
 
-        hits = key_index.get(key)
+        lookup = key
+        hits = key_index.get(lookup)
+
+        # Follow the edit chain when the key is dead or points only at tombstones.
+        # NEVER a silent substitution: the follow is recorded in `followed` so a caller
+        # can say "this is the current version of what you selected" rather than quietly
+        # handing back different content than was asked for.
+        if succession and (not hits or all(_is_tombstoned(i) for i in hits)):
+            head, hops = follow_succession(key, succession)
+            if hops and head != key:
+                head_hits = key_index.get(head)
+                if head_hits:
+                    followed[key] = head
+                    lookup, hits = head, head_hits
+
         if not hits:
             unresolved.append(key)
             continue
         if len(hits) > 1:
             duplicate_keys += 1
+        for i in hits:
+            if _is_tombstoned(i):
+                # Resolved, but to deleted content. Reported rather than dropped: a curated
+                # cluster silently shedding members is the failure this whole design exists
+                # to avoid, and silently KEEPING deleted ones is the mirror of it.
+                tombstoned.append(i)
         indices.extend(hits)
 
     return {
         "indices": indices,
         "unresolved": unresolved,
+        "followed": followed,
+        "tombstoned": tombstoned,
         "stats": {
             "mode": "explicit",
             "requested": len(membership.get("keys", [])),
             "resolved": len(indices),
             "unresolved": len(unresolved),
+            "followed": len(followed),
+            "tombstoned": len(tombstoned),
             "duplicate_keys": duplicate_keys,
             "dropped_repeats": dropped_repeats,
         },

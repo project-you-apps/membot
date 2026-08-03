@@ -388,6 +388,7 @@ try:
     # membot_server does NOT import Path at module level -- verified, it appears nowhere
     # in the file. Private alias so this cannot collide with function-local imports.
     from pathlib import Path as _Path
+    import cart_generation as _cart_generation
     import overlay as _ov
     from overlay_store import OverlayStore
     from subcart import (
@@ -4596,6 +4597,13 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
         state["texts"] = texts
         state["cartridge_name"] = cart["name"]
         state["cartridge_path"] = cart["path"]
+        # Remember WHICH VERSION of the cart this session loaded. Mounts are per-session
+        # RAM copies, so two people holding one cart hold two independent arrays -- and
+        # without this, the second save silently writes back whatever the first deleted.
+        state["cart_generation"] = (
+            _cart_generation.read_generation(cart["path"])["generation"]
+            if HAS_OVERLAYS else 0
+        )
         state["signatures"] = None
         state["hippocampus"] = data.get("hippocampus")
         state["per_pattern_meta"] = data.get("per_pattern_meta")
@@ -5750,6 +5758,20 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
 
     save_path = os.path.join(save_dir, f"{save_name}.cart.npz")
 
+    # REFUSE A STALE WRITE. Mounts are per-session RAM copies, so if someone else saved
+    # this cart since we mounted it, writing our arrays would silently revert their work --
+    # whole-cart, last-writer-wins. Checked ONLY when saving back over the cart we mounted;
+    # "save as a new name" is a copy, not a conflict.
+    if HAS_OVERLAYS and state.get("cartridge_path") and \
+            os.path.abspath(save_path) == os.path.abspath(state["cartridge_path"]):
+        try:
+            _cart_generation.assert_writable(
+                save_path, state.get("cart_generation", 0), seat=session_id)
+        except _cart_generation.StaleCartError as e:
+            return (f"SAVE REFUSED — {e}\n"
+                    f"Nothing was written. Your in-memory changes are intact; remount "
+                    f"to pick up generation {e.status['current']}, then reapply them.")
+
     try:
         save_as_npz(save_path, state["embeddings"], state["texts"])
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
@@ -5757,6 +5779,21 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
         # Save integrity manifest
         manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]))
         state["modified"] = False
+
+        # Bump AFTER a successful write, never before: bumping first and then failing
+        # would leave every other session believing it is behind something that never
+        # happened.
+        if HAS_OVERLAYS:
+            try:
+                bumped = _cart_generation.bump_generation(save_path, seat=session_id)
+                state["cart_generation"] = bumped["generation"]
+                state["cartridge_path"] = save_path
+            except Exception as gen_err:               # noqa: BLE001
+                # A cart that saved but whose generation did not is a REAL risk (the next
+                # save will look current when it is not), so this is loud rather than
+                # swallowed -- but it must not make the successful save look failed.
+                log.error("cart saved but generation bump FAILED for %s: %s",
+                          save_path, gen_err)
 
         # Also save brain weights if GPU is active
         brain_msg = ""
@@ -6441,8 +6478,24 @@ def get_status(session_id: str = "") -> str:
         n_linked = sum(1 for h in hippo if h.get("prev") or h.get("next"))
         hippo_str = f"Yes ({n_linked} linked)"
 
+    # Whether this session's view is still the current one. Staleness is NEWS, not a
+    # decision -- most of the time the right response is "reload", so it reads as a
+    # statement rather than a prompt.
+    freshness = ""
+    if HAS_OVERLAYS and state.get("cartridge_path"):
+        try:
+            status = _cart_generation.check_stale(
+                state["cartridge_path"], state.get("cart_generation", 0))
+            if status["stale"]:
+                freshness = f" | View: STALE — {_cart_generation.describe_stale(status)}"
+            else:
+                freshness = f" | View: current (gen {status['current']})"
+        except Exception as e:                          # noqa: BLE001
+            log.warning("generation check failed for %s: %s",
+                        state.get("cartridge_path"), e)
+
     return (
-        f"Cartridge: {cart}{modified} | "
+        f"Cartridge: {cart}{modified}{freshness} | "
         f"Memories: {n}/{MAX_ENTRIES} | "
         f"Embedding dim: {dim} | "
         f"Hamming index: {'Yes' if has_hamming else 'No'} ({ham_bytes}) | "
