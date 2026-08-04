@@ -278,6 +278,112 @@ someone's curated set.
 > your hot list, not enough to stop someone reading payroll. **Secrecy is separated by cart:**
 > a cart someone must not read is one they cannot mount.
 
+`subcart_export` materializes one into a standalone `.cart.npz`. **Export always
+materializes** — handing someone a manifest that points at a cart they cannot read is a
+broken artifact wearing a working one's costume. Link indices are remapped, not copied: on a
+real 300-passage slice, 453 references pointed outside it, and copying them verbatim would
+have pointed every one at a stranger.
+
+### The Firm View
+
+`seat_hot_stack` is what *you* are working on. `firm_hot_stack` is what the **organisation**
+is warm on — and they are not the same question.
+
+Fifty personal hot stacks do not sum to an institutional record unless the roll-up is
+deliberately kept. The signal that exists only here is **distinct seats**: one person reading
+something forty times and forty people reading it once produce the same access count and mean
+very different things about a company. Ranked by head-count first, volume second.
+
+Hiding a passage does **not** remove it from the firm view. One person should not be able to
+edit institutional memory by tidying their own list.
+
+### Hide — the free rung of the delete ladder
+
+```
+hidden     your view only      free, reversible, invisible to others
+tombstone  everyone, kept      not built yet
+purge      everyone, gone      not built yet
+```
+
+`seat_hide(indices)` drops passages out of *your* hot stack and *your* search results.
+Nothing is written to the cart; `unhide=True` puts it straight back; nobody else is affected.
+
+It exists because "this is noise TO ME" is the most common thing a person wants to say about
+a passage in a shared brain — and without it, the only options are to live with it or delete
+it for the whole company. **That is how shared knowledge gets destroyed by someone who only
+wanted a tidier list.**
+
+Hidden passages are *absent*, not ranked low, and every surface that filters them **counts
+what it filtered**. A search that quietly returns fewer results than it found is
+indistinguishable from a broken one.
+
+### Proposals — agents flag, humans decide
+
+**Membot has no destructive verbs, on purpose.** There is no edit, no delete, no purge, and a
+test asserts none exists so adding one has to be argued for rather than slipped in.
+
+Three reasons, in ascending importance:
+
+1. Appending is recoverable; deleting is not. The surface with the least human oversight
+   should get only the recoverable verb.
+2. **Agents are steerable by their inputs.** A poisoned document in a shared brain can
+   instruct an agent reading it to delete other documents. A capability that cannot be
+   reached cannot be abused.
+3. A capability whose safety only one person can verify is a single point of failure.
+
+So an agent files a proposal instead:
+
+```python
+propose_correction(idx=42, kind="outdated",
+                   body="Rotation changed to fortnightly in June; this says weekly.",
+                   suggested_text="Rotation is fortnightly.")   # never auto-applied
+
+proposals(status="open")     # read the queue; accepting is an OWNER action in the studio
+```
+
+Kinds are `correction` / `outdated` / `duplicate` / `context` / `question` — deliberately
+small, each mapping to something an owner can judge in one look. `rewrite` is **not** among
+them: a proposal that replaces a whole passage is indistinguishable from an edit, and
+reviewing it is as much work as doing it.
+
+**Open proposals ride back with search results**, so an agent needs no separate channel:
+
+```
+Search [hamming+embedding 70/30]: 5 results from 'redwood.pkl' (34ms)
+…
+⚑ 3 open proposal(s) on 2 of these passages — someone has flagged them as wrong,
+  outdated or incomplete. Run proposals() before relying on them.
+```
+
+**A comment is still a write, and that is fine.** The line is not read-vs-write, it is
+*destructive vs additive*. A proposal only appends to a sidecar, is fully reversible, and
+changes no passage — which is exactly what the `commenter` access level has always meant.
+
+> **What an agent MAY write to:** its own Mempack. That is what Mempacks are for — an agent
+> carrying its own memories. On a cart it does not own, it proposes.
+
+### Edits follow, so clusters do not break
+
+Passages are never edited in place — an edit appends and tombstones. That changes the body,
+which changes the content key, so without a recorded link every curated cluster would quietly
+shed that member and every seat's attention on it would go unresolved.
+
+Membot reads a **changes sidecar** (`<cart>.succession.json`) written by whichever product
+made the edit, and resolution follows the chain automatically — reporting that it followed,
+never silently substituting. Attention is read *through* the chain rather than migrated, so
+your forty reads survive someone fixing a typo at no write cost.
+
+### Stale writes are refused
+
+Mounts are per-session RAM copies, so two people holding one cart hold two independent
+arrays — and the second to save would silently write back whatever the first deleted.
+`save_cartridge` now checks a generation counter and refuses, naming who changed it and by
+how much. It refuses rather than merges: a refused save costs a reload, a silent one costs
+whatever the other person deleted.
+
+**See [`docs/GUIDE-MULTI-SEAT.md`](../docs/GUIDE-MULTI-SEAT.md)** for the full model,
+vocabulary, and an honest table of what is enforced where.
+
 ## What's New (June 2026)
 
 ### `walk_associate` -- substrate-walk MCP tool
