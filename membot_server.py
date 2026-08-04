@@ -4797,6 +4797,94 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
 
 
 @mcp.tool()
+def propose_correction(idx: int, kind: str, body: str, suggested_text: str = "",
+                       session_id: str = "") -> str:
+    """Flag something wrong with a passage. FILES A PROPOSAL; changes nothing.
+
+    Use this instead of trying to edit or delete. Membot has no destructive verbs on
+    purpose: an agent's corpus can be poisoned into instructing it to delete things, and a
+    capability that cannot be reached cannot be abused. What you file here is reviewed by a
+    human who can act on it.
+
+    `kind` is one of: correction (it is wrong), outdated (it was right, now is not),
+    duplicate (this repeats another passage), context (something important is missing),
+    question (you are unsure and want a human to look).
+
+    `body` should say what is wrong AND why you think so — an owner reading a queue of these
+    needs to judge without re-deriving your reasoning. `suggested_text` is optional and is
+    never applied automatically.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Proposals unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+    if not state.get("cartridge_path"):
+        return "Proposals need a cart on disk; this mount has no path."
+
+    texts = state["texts"]
+    if not (0 <= idx < len(texts)):
+        return f"Out of range for this cart ({len(texts)} passages): {idx}."
+
+    try:
+        import proposal_store as _ps
+        entry = _ps.propose(state["cartridge_path"], _subcart_content_key(texts[idx]),
+                            kind, body, by=session_id, suggested_text=suggested_text)
+    except ValueError as e:
+        return f"Refused: {e}"
+    except Exception as e:                             # noqa: BLE001
+        log.error("propose_correction failed: %s", e)
+        return f"Could not file the proposal: {type(e).__name__}: {e}"
+
+    return (f"Filed proposal {entry['id']} ({kind}) against passage {idx}. "
+            f"Nothing was changed — an owner reviews it in the studio. "
+            f"It will also ride along with future search results that return this passage.")
+
+
+@mcp.tool()
+def proposals(status: str = "open", session_id: str = "") -> str:
+    """Proposals filed against the mounted cart. `status`: open / accepted / rejected / all.
+
+    Read-only here. Accepting or rejecting is an OWNER action in the studio, deliberately
+    not reachable from the agent surface.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts") or not state.get("cartridge_path"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Proposals unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+
+    import proposal_store as _ps
+    data = _ps.load(state["cartridge_path"])
+    if not data.get("readable", True):
+        return (f"The proposal file for {state.get('cartridge_name')} is UNREADABLE "
+                f"({data.get('error')}). That is not the same as having none — do not "
+                f"assume the queue is empty.")
+
+    rows = _ps.list_proposals(state["cartridge_path"],
+                              status="" if status == "all" else status)
+    if not rows:
+        return f"No {status} proposals on {state.get('cartridge_name')}."
+
+    texts = state["texts"]
+    index = {}
+    for i, t in enumerate(texts):
+        index.setdefault(_subcart_content_key(t), i)
+
+    lines = [f"{len(rows)} {status} proposal(s) on {state.get('cartridge_name')}:"]
+    for p in rows[:25]:
+        where = index.get(p["target_key"])
+        where_s = f"idx:{where}" if where is not None else "passage not in this cart"
+        lines.append(f"  [{p['id']}] {p['kind']} ({where_s}) by {p['by'] or 'unknown'}"
+                     f"\n      {p['body'][:200]}")
+    s = _ps.stats(state["cartridge_path"])
+    lines.append(f"  — totals: {s['by_status']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def firm_hot_stack(top_k: int = 10, session_id: str = "") -> str:
     """What the ORGANISATION is warm on — not what any one person is.
 
@@ -5467,10 +5555,30 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
             mode_label = f"hamming-only{kw_label}{split_label}"
         else:
             mode_label = f"embedding-only{kw_label}{split_label}"
+        # Open proposals RIDE BACK WITH THE RESULTS. Andy's shape: an agent needs no write
+        # path and no separate channel -- whatever renders the answer renders the flags on
+        # the passages the answer came from, at no extra round trip. Costs one sidecar read
+        # per search, and nothing at all when the file does not exist.
+        proposal_note = ""
+        if HAS_OVERLAYS and hit_bodies and state.get("cartridge_path"):
+            try:
+                import proposal_store as _ps
+                flagged = _ps.for_results(
+                    state["cartridge_path"],
+                    [_subcart_content_key(b) for b in hit_bodies])
+                if flagged:
+                    n = sum(len(v) for v in flagged.values())
+                    proposal_note = (
+                        f"\n\n⚑ {n} open proposal(s) on {len(flagged)} of these passages — "
+                        f"someone has flagged them as wrong, outdated or incomplete. "
+                        f"Run proposals() before relying on them.")
+            except Exception as e:                     # noqa: BLE001
+                log.warning("proposal lookup failed: %s", e)
+
         hidden_note = (f", {hidden_hits} hidden by this seat" if hidden_hits else "")
         header = (f"Search [{mode_label}]: {len(results)} results from "
                   f"'{state['cartridge_name']}'{hidden_note} ({elapsed_ms:.0f}ms)\n")
-        return header + "\n\n".join(results)
+        return header + "\n\n".join(results) + proposal_note
 
     except Exception as e:
         log.error(f"Search error: {e}")
