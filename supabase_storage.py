@@ -14,7 +14,8 @@ JWTs are verified separately in the REST handler layer.
 
 Required env vars in /opt/membot/.env:
   SUPABASE_URL                  e.g. https://uikdknfxcqklldmfshug.supabase.co
-  SUPABASE_SERVICE_ROLE_KEY     JWT with service_role claim (from Supabase Studio)
+  SUPABASE_SECRET_KEY           privileged key from Supabase Studio -> API Keys
+                                (legacy name SUPABASE_SERVICE_ROLE_KEY still accepted)
 
 See docs/PATTERN-ANATOMY.md §3 for H-block field semantics, and
 vector-plus-studio-repo/db/002_mempacks_schema.sql for the table definitions
@@ -73,18 +74,29 @@ _client: Optional["Client"] = None
 def get_client() -> "Client":
     """Lazy-init the supabase client. Reads creds from env on first call.
 
-    Raises RuntimeError if SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing —
-    a clear failure mode rather than a confusing client-init crash later.
+    Raises RuntimeError if the URL or the privileged key is missing — a clear failure
+    mode rather than a confusing client-init crash later.
+
+    Accepts SUPABASE_SECRET_KEY (Supabase's asymmetric-key migration) or the legacy
+    SUPABASE_SERVICE_ROLE_KEY, so the droplet's .env can be updated before or after this
+    code lands. See docs/RUNBOOK-jwt-migration-and-key-revoke-2026-08-04.md.
+
+    This module holding a privileged key is CORRECT and stays that way: membot is a
+    server process acting on behalf of any user at mount/store time, scoped by owner_id.
+    The 2026-08-03 problem was a browser extension holding one, which is a different
+    thing entirely — extension source ships to whoever installs it.
     """
     global _client
     if _client is None:
         url = os.environ.get("SUPABASE_URL")
-        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        key = (os.environ.get("SUPABASE_SECRET_KEY")
+               or os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
         if not url or not key:
             raise RuntimeError(
-                "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in env. "
+                "SUPABASE_URL and SUPABASE_SECRET_KEY (or legacy "
+                "SUPABASE_SERVICE_ROLE_KEY) must be set in env. "
                 "See /opt/membot/.env on the droplet. "
-                "Service role key comes from Supabase Studio -> Project Settings -> API."
+                "The key comes from Supabase Studio -> Project Settings -> API Keys."
             )
         _client = create_client(url, key)
     return _client

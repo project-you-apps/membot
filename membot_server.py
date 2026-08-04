@@ -592,8 +592,18 @@ os.makedirs(MEMPACK_CACHE_DIR, exist_ok=True)
 
 
 def _supabase_available() -> bool:
-    """Cheap check: is Supabase configured? Caches result to avoid repeated env hits."""
-    return bool(os.environ.get("SUPABASE_URL")) and bool(os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
+    """Cheap check: is Supabase configured? Caches result to avoid repeated env hits.
+
+    Must accept the SAME key names as supabase_storage.get_client(). If this gated only on
+    the legacy SUPABASE_SERVICE_ROLE_KEY, renaming it to SUPABASE_SECRET_KEY during the
+    2026-08-04 migration would make membot quietly conclude Supabase is unconfigured and
+    drop every Mempack feature -- with no error, because "not configured" is a legitimate
+    state. Sibling call sites that disagree about a key name is how a rename becomes an
+    outage.
+    """
+    key = (os.environ.get("SUPABASE_SECRET_KEY")
+           or os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
+    return bool(os.environ.get("SUPABASE_URL")) and bool(key)
 
 
 # ============================================================
