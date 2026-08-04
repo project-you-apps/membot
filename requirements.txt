@@ -23,3 +23,21 @@ einops>=0.7.0
 # torch: sentence-transformers pulls it, and it defaults to the CUDA wheel — ~5.1 GB on boxes
 # that cannot use it. On non-NVIDIA hosts install the CPU wheel FIRST (~1.4 GB):
 #   pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+# --- TLS ---
+# REQUIRED on any machine whose security software intercepts HTTPS. membot_server.py and
+# cartridge_builder.py both call inject_into_ssl() at import; without the package they fall
+# back to the certifi bundle, which does not know about an intercepting root, and every
+# HTTPS call dies with
+#   CERTIFICATE_VERIFY_FAILED: Basic Constraints of CA cert not marked critical
+#
+# Verification stays fully ON -- this changes the SOURCE of trust to the OS store, which is
+# the same decision the machine's browser already makes. Chosen over an unverified
+# SSLContext on 2026-07-30 precisely so no disabled-security line could be copied into a
+# shipped client and forgotten.
+#
+# Imported but undeclared until 2026-08-04. Third time this week: `fastmcp` was missing
+# until 08-01 (found by an outside cold-install audit) and `supabase` in the studio until
+# today. Each worked on machines that happened to have the package already, which is why
+# our own testing never caught any of them.
+truststore>=0.10.4

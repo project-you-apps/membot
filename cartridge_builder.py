@@ -27,6 +27,29 @@ Output:
   cartridges/my-knowledge_manifest.json     # SHA256 integrity manifest
 """
 
+# Verify TLS against the OS certificate store, before anything opens a connection.
+#
+# This module fetches the embedding model from huggingface.co on first use, which fails on
+# any machine whose HTTPS is intercepted by security software. Norton Web/Mail Shield
+# presents a CA certificate whose Basic Constraints extension is not marked critical;
+# OpenSSL 3.x rejects it, browsers accept it via the OS verifier. Symptom:
+#
+#     SSLError: CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate
+#
+# Decided 2026-07-30 (Andy: "go with truststore if any of this code is going to touch VPS,
+# Membot, or any of our future apps"). It reached droplet_sync.py and membot_server.py and
+# was logged as a follow-up here -- then on 2026-08-04 this exact module failed a cart build
+# for exactly this reason, and the workaround was HF_HUB_OFFLINE=1. Closing it properly.
+#
+# Verification stays ON. This changes the SOURCE of trust, not whether trust is checked.
+try:
+    import truststore as _truststore
+    _truststore.inject_into_ssl()
+except Exception as _e:                                  # noqa: BLE001
+    print(f"[cartridge_builder] truststore unavailable ({type(_e).__name__}); using the "
+          f"certifi bundle. If model downloads fail with CERTIFICATE_VERIFY_FAILED, your "
+          f"machine is likely intercepting TLS: pip install truststore")
+
 import os
 import sys
 import time
