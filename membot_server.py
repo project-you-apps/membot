@@ -618,8 +618,66 @@ def _supabase_available() -> bool:
 # Pattern mirrors vector-plus-studio-repo/api/auth.py.
 # ============================================================
 
-_JWT_ALG = "HS256"
+_JWT_ALG = "HS256"                       # legacy shared secret; retired at revoke
+_JWT_ASYM_ALGS = ("RS256", "ES256")      # Supabase asymmetric signing keys
 _JWT_AUD = "authenticated"
+_JWKS_PATH = "/auth/v1/.well-known/jwks.json"
+_jwks_cache: tuple = ()                  # (url, PyJWKClient)
+
+
+def _jwks_client_for(url: str):
+    """Memoized PyJWKClient for the project's published signing keys."""
+    global _jwks_cache
+    if _jwks_cache and _jwks_cache[0] == url:
+        return _jwks_cache[1]
+    from jwt import PyJWKClient
+    client = PyJWKClient(url, cache_keys=True, lifespan=300)
+    _jwks_cache = (url, client)
+    return client
+
+
+def _decode_supabase_jwt(token: str):
+    """Verify a Supabase JWT, choosing the verifier by the token's own algorithm.
+
+    WHY TWO PATHS (2026-08-04)
+    ---------------------------
+    Supabase is moving this project off one shared HS256 secret onto asymmetric signing
+    keys with a published JWKS. During the move BOTH kinds circulate: tokens already issued
+    stay HS256 while new ones are signed with the standby key. A server that understands
+    only one forces a flag-day cutover and signs everyone out at the switch.
+
+        HS256         -> SUPABASE_JWT_SECRET   (legacy; unset it after revoke)
+        RS256 / ES256 -> JWKS at SUPABASE_URL  (the destination)
+
+    This function is why the legacy secret can be revoked at all. membot verifies user
+    tokens fail-closed, so without it, revoking would stop membot authenticating anyone and
+    every Mempack operation would refuse. Mirrors vector-plus-studio-repo/api/auth.py.
+
+    ALGORITHM CONFUSION: the unverified header picks the BRANCH only; each branch then
+    verifies with its own fixed algorithm list and its own key. A JWKS is public, so a
+    forged token signed HS256 with the published public key as the HMAC secret must not
+    verify -- and does not, because the HS256 branch consults the legacy secret alone.
+    """
+    import jwt as _pyjwt
+
+    alg = (_pyjwt.get_unverified_header(token) or {}).get("alg")
+
+    if alg == _JWT_ALG:
+        secret = os.environ.get("SUPABASE_JWT_SECRET")
+        if not secret:
+            raise _pyjwt.InvalidKeyError(
+                "HS256 token but SUPABASE_JWT_SECRET is unset (revoked?)")
+        return _pyjwt.decode(token, secret, algorithms=[_JWT_ALG], audience=_JWT_AUD)
+
+    if alg in _JWT_ASYM_ALGS:
+        base = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+        if not base:
+            raise _pyjwt.InvalidKeyError("asymmetric token but SUPABASE_URL is unset")
+        key = _jwks_client_for(f"{base}{_JWKS_PATH}").get_signing_key_from_jwt(token).key
+        return _pyjwt.decode(token, key, algorithms=list(_JWT_ASYM_ALGS),
+                             audience=_JWT_AUD)
+
+    raise _pyjwt.InvalidAlgorithmError(f"unsupported JWT algorithm: {alg!r}")
 
 
 def _read_jwt_from_request(request) -> str | None:
@@ -742,21 +800,26 @@ def _get_user_claims_from_request(request) -> dict | None:
       - app_metadata           : {provider, providers, ...}
       - aud / exp / iat / iss  : standard JWT
     """
-    secret = os.environ.get("SUPABASE_JWT_SECRET")
-    if not secret:
+    # Either verification path is sufficient: a project mid-migration has both, a fully
+    # migrated one has only SUPABASE_URL, a legacy one only the secret. Requiring both would
+    # refuse to authenticate a correctly configured server at each end of the move.
+    if not (os.environ.get("SUPABASE_JWT_SECRET") or os.environ.get("SUPABASE_URL")):
         return None
     token = _read_jwt_from_request(request)
     if not token:
         return None
     try:
-        import jwt as _pyjwt
+        import jwt as _pyjwt  # noqa: F401
     except ImportError:
         log.error("PyJWT not installed; cannot verify Supabase tokens")
         return None
     try:
-        decoded = _pyjwt.decode(token, secret, algorithms=[_JWT_ALG], audience=_JWT_AUD)
+        decoded = _decode_supabase_jwt(token)
         return decoded if isinstance(decoded, dict) else None
     except Exception as e:
+        # Type as well as message: during the migration a failure is usually a
+        # configuration fact (wrong branch, JWKS unreachable) rather than a bad token,
+        # and the class name is what tells those apart at a glance.
         log.warning(f"JWT decode failed: {type(e).__name__}: {e}")
         return None
 
