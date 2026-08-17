@@ -181,6 +181,49 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]
         passages = [p.strip() for p in text.split("---PASSAGE_BREAK---")]
         return [p for p in passages if p]
 
+    # ⚠ LINE-AWARE. Boundaries fall BETWEEN lines so markdown survives -- headings, bullets
+    # and GFM tables are all line-based, and the passage viewer renders with react-markdown +
+    # remark-gfm. The previous `" ".join(text.split())` flattened every newline, which is why
+    # the redwood demo carts came out as a wall of text: 1709 of 1712 passages with zero
+    # newlines (2026-08-16). `build_office.py` puts this directory on sys.path and imports
+    # THIS module, not the studio's.
+    #
+    # ⚠ INLINE COPY. The canonical implementation is
+    # `vector-plus-studio-repo/api/cartbuilder/parsers.py::chunk_lines`; membot has no
+    # parsers.py to import from. There are NINE cartridge_builder.py files in this tree and
+    # four live ones carried the flattening version -- if you change the algorithm, grep for
+    # the others rather than assuming this is the only one.
+    if len(text.split()) <= chunk_size:
+        return [text.strip()]
+
+    lines = text.split("\n")
+    line_wc = [len(l.split()) for l in lines]
+    n = len(lines)
+    chunks = []
+    i = 0
+    while i < n:
+        j = i
+        budget = 0
+        while j < n and (budget == 0 or budget + line_wc[j] <= chunk_size):
+            budget += line_wc[j]
+            j += 1
+        chunk = "\n".join(lines[i:j]).strip()
+        if chunk:
+            chunks.append(chunk)
+        if j >= n:
+            break
+        back = j
+        overlap_wc = 0
+        while back > i + 1 and overlap_wc < overlap:
+            back -= 1
+            overlap_wc += line_wc[back]
+        i = back
+    return chunks
+
+
+def _chunk_text_legacy_word_based(text, chunk_size=300, overlap=50):
+    """The pre-2026-08-16 word-flattening chunker. Kept only for A/B measurement of the
+    embedding impact -- delete once that question is settled."""
     words = text.split()
     if len(words) <= chunk_size:
         return [text.strip()]
