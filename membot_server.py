@@ -6913,7 +6913,37 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
         elapsed_ms = (time.time() - t0) * 1000
         n = len(state["texts"])
 
-        return f"Stored memory #{n}{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)"
+        # SAY THE HANDLE THE READER WILL ACTUALLY USE.
+        #
+        # `#{n}` is the count AFTER appending, so it is effectively 1-based, while `search`
+        # reports `"index": int(i)` — the 0-based position in `state["texts"]`. The memory
+        # reported as "#338" is therefore addressable as `idx:337`, and the two numbers have
+        # never agreed.
+        #
+        # That was harmless while memories were read-only: nothing took a number and acted on
+        # it. cbp-being is about to get a supersede verb, and then "correct #338" would
+        # silently correct the memory stored AFTER the one it meant — wrong, in the one place
+        # where being wrong is worst, and invisible because both numbers look plausible.
+        # Found by GPT reviewing that verb before it shipped, and confirmed here in source.
+        #
+        # ADDITIVE ON PURPOSE. `#{n}` stays exactly as it was: every being's journal already
+        # cites these numbers ("Stored memory #140 (supersedes #138)" in legion-being's, for
+        # one), and renumbering would silently invalidate those back-references. The only
+        # programmatic consumer is a prefix check (`_STORED_NEW` in SAGE's hestia_dispatch)
+        # which never parses the number. So the receipt now also carries the addressable
+        # handle, printed in `search`'s own vocabulary so the two are visibly the same thing.
+        #
+        # A RANGE, NOT A NUMBER, because one store is not always one passage. Open PR #4
+        # (chunk-on-store) splits a long memory into several passages at CONSECUTIVE indices.
+        # Reporting `n - 1` would then name only the LAST chunk, and a supersede verb given
+        # that handle would retract the tail of a belief and leave its head standing — a
+        # subtler wrong than the off-by-one this fixes. `n_current` is the count before this
+        # store, so the span is derived rather than assumed and is correct both today (one
+        # passage: start == end) and after #4 lands.
+        first = n_current if n > n_current else max(0, n - 1)
+        handle = f"idx:{first}" if n - first <= 1 else f"idx:{first}-{n - 1}"
+        return (f"Stored memory #{n} ({handle})"
+                f"{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)")
 
     except Exception as e:
         log.error(f"Store error: {e}")
