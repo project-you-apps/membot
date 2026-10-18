@@ -351,6 +351,9 @@ def _get_session(session_id: str) -> dict:
                if now - s["last_access"] > SESSION_TIMEOUT_SEC]
     for sid in expired:
         log.info(f"Session expired: {sid} (idle {now - _sessions[sid]['last_access']:.0f}s)")
+        # Release BEFORE the dict entry goes, or the shared payload is pinned by a
+        # reference no live session holds and the pool never shrinks.
+        _shared_release(_sessions[sid], sid)
         del _sessions[sid]
 
     if session_id not in _sessions:
@@ -358,6 +361,7 @@ def _get_session(session_id: str) -> dict:
             # Evict oldest session
             oldest = min(_sessions, key=lambda sid: _sessions[sid]["last_access"])
             log.info(f"Session evicted (max reached): {oldest}")
+            _shared_release(_sessions[oldest], oldest)
             del _sessions[oldest]
         _sessions[session_id] = _new_session()
         log.info(f"New session created: {session_id}")
@@ -369,6 +373,148 @@ def _get_session(session_id: str) -> dict:
 def _resolve_session_id(session_id: str) -> str:
     """Resolve empty session_id to 'default', return as-is otherwise."""
     return session_id.strip() if session_id.strip() else "default"
+
+
+# ============================================================
+# SHARED CART PAYLOADS — load once per PATH, not once per SESSION
+# ============================================================
+#
+# Step 2 of the demo-session work (2026-10-18). Step 1 (per-tab anonymous sessions,
+# commit f496684) made every visitor their own session, which is what Andy asked for
+# and, on its own, makes RAM strictly WORSE: `mount_cartridge` calls
+# load_cartridge_safe() per session, so N tabs mounting gutenberg-poetry meant N
+# independent 190 MB arrays. The old single shared "default" slot held exactly one
+# copy and was accidentally safe. 50 x 190 MB does not fit a 4 GB droplet.
+#
+# THE FIX IS NOT A REWRITE. multi_cart._new_cart_state() already carries the comment
+# "Same shape as _new_session in membot_server" -- the two structures were built to
+# match and never joined. The duplication was never structural; it was one disk load
+# per mount. So sessions now SHARE the loaded arrays by reference and nothing
+# downstream changes: memory_search, get_passage, hippocampus nav, the per-seat
+# overlay filter and split-cart SQLite all keep reading state["..."] as before.
+#
+# ⛔ SHARING BY REFERENCE IS ONLY SAFE IF NOTHING WRITES IN PLACE, and three sites do.
+#    memory_store appends to state["texts"] in place while REBINDING embeddings via
+#    vstack -- which under sharing would grow the shared text list without growing the
+#    shared embedding matrix. A silent length mismatch across every other session.
+#    Hence copy-on-write: _detach_for_write() must run before any payload mutation.
+#
+# ⭐ Copy-on-write also PRESERVES the cart_generation invariant rather than breaking
+#    it. That field exists (see mount_cartridge) because "mounts are per-session RAM
+#    copies, so two people holding one cart hold two independent arrays." Under CoW the
+#    only sessions sharing are ones that have never written, and the moment a session
+#    can write it owns private arrays again. The generation check means exactly what it
+#    meant before.
+#
+# ⚠ sqlite_conn is deliberately NOT shared. unmount() closes it, and one session
+#   unmounting must not close the sidecar out from under every other reader. Each
+#   session opens its own connection to the same file; SQLite handles concurrent
+#   readers, and a connection is cheap where a 190 MB array is not.
+
+# cart_path -> the dict load_cartridge_safe() returned, loaded ONCE.
+# mount_cartridge then assigns state["embeddings"] = data["embeddings"] exactly as it
+# always did; because `data` is now shared, those assignments are references rather
+# than per-session loads. No downstream reader changes.
+_shared_cart_data: dict[str, dict] = {}
+# cart_path -> set of session_ids currently holding a reference
+_shared_refs: dict[str, set] = {}
+
+
+def _shared_load(cart_path: str) -> tuple[dict, bool]:
+    """Return (cart data, was_already_loaded) for this path.
+
+    The first caller pays the disk read; every later session attaches to the same
+    arrays. Integrity verification runs on the fresh load only -- re-verifying a
+    payload already in RAM checks a manifest against arrays that came from the same
+    manifest, which proves nothing and costs a full hash of 190 MB per visitor.
+    """
+    cached = _shared_cart_data.get(cart_path)
+    if cached is not None:
+        return cached, True
+    data = load_cartridge_safe(cart_path)
+    _shared_cart_data[cart_path] = data
+    _shared_refs.setdefault(cart_path, set())
+    return data, False
+
+
+def _shared_register(state: dict, session_id: str, cart_path: str) -> None:
+    """Record that this session is holding the shared payload for cart_path."""
+    state["_shared_path"] = cart_path
+    _shared_refs.setdefault(cart_path, set()).add(session_id)
+    log.info(f"[shared] session {session_id} holds '{cart_path}' "
+             f"(refs={len(_shared_refs[cart_path])})")
+
+
+def _shared_release(state: dict, session_id: str) -> None:
+    """Drop this session's reference, evicting the payload when the last one goes.
+
+    Safe to call when the session holds nothing -- unmount, expiry and eviction all
+    call it unconditionally rather than each deciding for itself whether it applies.
+    """
+    cart_path = state.pop("_shared_path", None)
+    if not cart_path:
+        return
+    holders = _shared_refs.get(cart_path)
+    if holders is None:
+        return
+    holders.discard(session_id)
+    if not holders:
+        _shared_refs.pop(cart_path, None)
+        _shared_cart_data.pop(cart_path, None)
+        log.info(f"[shared] evicted '{cart_path}' — last holder released")
+    else:
+        log.info(f"[shared] session {session_id} released '{cart_path}' "
+                 f"(refs={len(holders)})")
+
+
+def _detach_for_write(state: dict, session_id: str) -> None:
+    """Give this session PRIVATE copies of the payload before it mutates them.
+
+    ⛔ Call this at the top of every path that writes embeddings / texts /
+    binary_corpus / hippocampus, in place OR by rebinding. Rebinding alone does not
+    corrupt the shared pool, but a path that rebinds SOME fields and mutates others
+    (memory_store does exactly this) leaves the session half-shared, which is worse
+    than either.
+
+    A no-op for a session that was never sharing, so write paths can call it
+    unconditionally instead of testing first.
+    """
+    if not state.get("_shared_path"):
+        return
+    cart_path = state["_shared_path"]
+    texts = state.get("texts")
+    emb = state.get("embeddings")
+    binc = state.get("binary_corpus")
+    hippo = state.get("hippocampus")
+    ppm = state.get("per_pattern_meta")
+
+    state["texts"] = list(texts) if texts is not None else []
+    state["embeddings"] = emb.copy() if emb is not None else None
+    state["binary_corpus"] = binc.copy() if binc is not None else None
+    # Lists of dicts: the list is copied so appends/reorders are private. The dicts
+    # themselves are treated as read-only by every consumer (nav hints, meta display).
+    state["hippocampus"] = list(hippo) if hippo is not None else None
+    state["per_pattern_meta"] = list(ppm) if ppm is not None else None
+
+    n = len(state["texts"])
+    log.info(f"[shared] session {session_id} COPY-ON-WRITE detached from "
+             f"'{cart_path}' ({n} patterns now private)")
+    _shared_release(state, session_id)
+
+
+def shared_payload_stats() -> dict:
+    """What the shared pool is holding. For /api/status and for tests."""
+    return {
+        "paths": len(_shared_cart_data),
+        "carts": [
+            {
+                "cart_path": p,
+                "holders": sorted(_shared_refs.get(p, set())),
+                "n_patterns": len(d.get("texts") or []),
+            }
+            for p, d in _shared_cart_data.items()
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2018,6 +2164,13 @@ async def rest_status(request: Request) -> JSONResponse:
             "session_id": sid,
             "read_only": _server_config.get("read_only", False),
             "hostname": socket.gethostname(),
+            # Shared cart pool (2026-10-18). Reported so the saving is OBSERVABLE in
+            # production rather than inferred: sessions climbing while shared_carts
+            # stays at 1 is the whole point, and a pool that silently stopped sharing
+            # would otherwise look identical from outside.
+            "sessions": len(_sessions),
+            "shared_carts": len(_shared_cart_data),
+            "shared_holders": sum(len(h) for h in _shared_refs.values()),
         }, headers=_cors_headers())
     except Exception as e:
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
@@ -4759,12 +4912,21 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
 
     try:
         t0 = time.time()
-        data = load_cartridge_safe(cart["path"])
+
+        # ⭐ SHARED POOL (2026-10-18). A previous mount in THIS session must release
+        # its reference before we take another, or that payload is pinned by a holder
+        # that has moved on and the pool never shrinks.
+        _shared_release(state, session_id)
+
+        # One disk load per PATH. The second session to mount a cart attaches to the
+        # arrays the first one loaded, instead of reading 190 MB off disk again.
+        data, _was_cached = _shared_load(cart["path"])
 
         embeddings = data["embeddings"]
         texts = data["texts"]
 
         if len(texts) > MAX_ENTRIES:
+            _shared_release(state, session_id)
             return f"Cartridge too large: {len(texts)} entries exceeds limit of {MAX_ENTRIES}."
 
         # Verify integrity — Mempacks skip the sidecar-based check since the
@@ -4772,11 +4934,23 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
         # exists on disk for Supabase-backed Mempacks; cold-cut 2026-05-13).
         if cart.get("mempack_id"):
             verify_msg = "mempack (Supabase row authoritative)"
+        elif _was_cached:
+            # Already verified when this payload was first loaded. Re-hashing arrays
+            # that are still in RAM re-checks them against the same manifest that
+            # admitted them -- no new information, and a full hash per visitor.
+            verify_msg = "shared payload (verified at first load)"
         else:
             ok, verify_msg = verify_manifest(cart["path"], embeddings, len(texts))
             if not ok:
                 log.error(f"INTEGRITY CHECK FAILED for {cart['name']}: {verify_msg}")
+                # ⛔ Drop the bad payload from the pool, or the next session to ask
+                # for this path gets a cache HIT on a cart we just refused and skips
+                # the check entirely.
+                _shared_cart_data.pop(cart["path"], None)
+                _shared_refs.pop(cart["path"], None)
                 return f"SECURITY: Cartridge '{cart['name']}' failed integrity check: {verify_msg}. Refusing to mount."
+
+        _shared_register(state, session_id, cart["path"])
 
         state["embeddings"] = embeddings
         state["texts"] = texts
@@ -4844,7 +5018,13 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
             state["binary_corpus"] = data["sign_bits"]
             log.info(f"Loaded pre-computed sign bits: {data['sign_bits'].shape}")
         elif len(embeddings) > 0:
-            state["binary_corpus"] = (embeddings > 0).astype(np.uint8)
+            # Memoized into the SHARED data dict. Derived from shared embeddings, so
+            # it is the same array for every holder -- computing it per session would
+            # hand back the per-visitor allocation the shared pool just removed
+            # (another N x 768 uint8 on top of the embeddings).
+            if data.get("_derived_sign_bits") is None:
+                data["_derived_sign_bits"] = (embeddings > 0).astype(np.uint8)
+            state["binary_corpus"] = data["_derived_sign_bits"]
         else:
             state["binary_corpus"] = None
 
@@ -6161,6 +6341,12 @@ def mempack_update_pattern_i(text: str, session_id: str = "") -> str:
         # 1. Re-embed the new Pattern I text
         emb = embed_text(text, prefix="search_document")
 
+        # ⛔ COPY-ON-WRITE, before the locals below alias the shared arrays. This path
+        # writes texts[i], embeddings[i] and binary_corpus[i] IN PLACE, and unlike
+        # memory_store it is deliberately NOT gated by _write_blocked (Mempacks bypass
+        # read-only), so the shared pool has no other protection here.
+        _detach_for_write(state, session_id)
+
         # 2. Update in-memory state at PATTERN_I_IDX, growing arrays if Pattern I
         # didn't exist yet (cart had only the header at idx=0).
         texts = state["texts"] or []
@@ -6257,6 +6443,12 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
 
         # 1. Embed via Nomic
         emb = embed_text(content, prefix="search_document")
+
+        # ⛔ COPY-ON-WRITE. This path rebinds embeddings/binary_corpus via vstack but
+        # appends to state["texts"] IN PLACE. Under a shared payload that grows the
+        # shared text list without growing the shared embedding matrix — a silent
+        # length mismatch in every other session holding this cart.
+        _detach_for_write(state, session_id)
 
         # 2. Add to embedding matrix
         if state["embeddings"] is None or len(state["embeddings"]) == 0:
@@ -6417,7 +6609,12 @@ def unmount(session_id: str = "") -> str:
     if state["modified"]:
         warning = " WARNING: Unsaved changes were discarded."
 
-    # Close SQLite sidecar if open
+    # Release the shared payload BEFORE clearing the fields below, so the pool can
+    # evict when this was the last holder. Clearing first would orphan the reference.
+    _shared_release(state, session_id)
+
+    # Close SQLite sidecar if open. Per-session by design — see _shared_cart_data:
+    # one visitor unmounting must not close the sidecar out from under the others.
     if state.get("sqlite_conn"):
         try: state["sqlite_conn"].close()
         except: pass
@@ -9391,17 +9588,26 @@ if __name__ == "__main__":
         mount_match = [c for c in mount_carts if cart_name.lower() in c["name"].lower()]
         if mount_match:
             cart = mount_match[0]
-            data = load_cartridge_safe(cart["path"])
+            # Goes through the SHARED pool like any other mount (2026-10-18). Without
+            # this the boot cart sits in `default` as a private copy and the FIRST
+            # visitor to mount the same cart loads a second one — the duplication the
+            # pool exists to remove, reappearing at the one mount we control.
+            data, _ = _shared_load(cart["path"])
             state["embeddings"] = data["embeddings"]
             state["texts"] = data["texts"]
             state["cartridge_name"] = cart["name"]
             state["cartridge_path"] = cart["path"]
             state["signatures"] = None
+            state["hippocampus"] = data.get("hippocampus")
+            state["per_pattern_meta"] = data.get("per_pattern_meta")
             state["modified"] = False
             if len(data["embeddings"]) > 0:
-                state["binary_corpus"] = (data["embeddings"] > 0).astype(np.uint8)
+                if data.get("_derived_sign_bits") is None:
+                    data["_derived_sign_bits"] = (data["embeddings"] > 0).astype(np.uint8)
+                state["binary_corpus"] = data["_derived_sign_bits"]
             else:
                 state["binary_corpus"] = None
+            _shared_register(state, sid, cart["path"])
             ok, verify_msg = verify_manifest(cart["path"], data["embeddings"], len(data["texts"]))
             log.info(f"Auto-mounted '{cart['name']}': {len(data['texts'])} memories, integrity={verify_msg}")
         else:
