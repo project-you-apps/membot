@@ -190,7 +190,17 @@ def mount(cart_path: str, cart_id: Optional[str] = None,
     if "sign_bits" in data and data["sign_bits"] is not None:
         state["binary_corpus"] = data["sign_bits"]
     elif state["has_embeddings"]:
-        state["binary_corpus"] = (embeddings > 0).astype(np.uint8)
+        # PACKED (N, 96) rather than one byte per bit. _hamming_scores below already
+        # reads the packed form (`is_packed = corpus_bin.shape[1] <= 96`) and
+        # imprint_with_meta already appends packed rows when the corpus is packed --
+        # only this derivation was still producing the 8x-larger unpacked form.
+        # ⚠ 96 bytes assumes 768 bits; anything else stays unpacked because the
+        # scorer hardcodes n_bits=768 for a packed corpus.
+        state["binary_corpus"] = (
+            np.packbits((embeddings > 0).astype(np.uint8), axis=1)
+            if embeddings.shape[1] == 768
+            else (embeddings > 0).astype(np.uint8)
+        )
     else:
         state["binary_corpus"] = None
 

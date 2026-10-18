@@ -46,6 +46,8 @@ from fastmcp import FastMCP
 import os
 import sys
 import re
+import threading      # search concurrency ceiling (S7)
+import contextlib     # search_slot context manager
 import struct
 import hashlib
 import pickle
@@ -544,6 +546,120 @@ def _pool_admits(cart_path: str) -> tuple[bool, str]:
         f"Resident: {resident}. "
         f"Unmount a cart you are not using, or raise --max-cart-ram-mb."
     )
+
+
+# ============================================================
+# SEARCH CONCURRENCY (S7)
+# ============================================================
+#
+# Nothing bounded how many searches ran at once. Each one is a transformer forward
+# pass (CPU-bound) plus an argsort over every pattern, and that argsort allocates
+# 8 bytes per pattern per caller -- 272 MB on a 34M-pattern corpus, counted by no
+# budget. Ten concurrent searches is 4 GB of transient memory the pool cannot see.
+# On a rented host it is also where the CPU bill actually goes.
+#
+# ⚠ THIS GUARDS THE SYNCHRONOUS PATHS ONLY (the MCP tools), because those are the
+#   ones FastMCP runs in a threadpool and are therefore genuinely unbounded.
+#
+# ⛔ /api/search is a DIFFERENT problem and must not be "fixed" by adding this.
+#   It is `async def` and calls embed_text() straight on the event loop, so REST
+#   searches are already serialized -- at a concurrency of exactly 1, and in the
+#   worst way, since a slow search also stalls /api/status, mounts and every other
+#   request. Moving it to a thread is correct and is filed as S9, but it RAISES
+#   concurrency from 1 to many, so it must land holding this semaphore, never
+#   before it. Adding throughput to an unbounded path is how you turn a latency
+#   complaint into an OOM.
+_SEARCH_BUSY_MSG = (
+    "Server is busy: too many searches in flight. Retry in a moment."
+)
+
+
+def _default_search_slots() -> int:
+    """Concurrency ceiling for CPU-bound search.
+
+    Derived from cores rather than fixed, same reasoning as the RAM budget: the
+    droplet and this desktop are not the same machine. Beyond core count a
+    transformer forward pass gets slower, not faster, so more slots buy nothing and
+    cost memory.
+    """
+    try:
+        cores = os.cpu_count() or 2
+    except Exception:
+        cores = 2
+    return max(2, min(8, cores // 2))
+
+
+_search_slots = threading.BoundedSemaphore(_default_search_slots())
+_search_stats = {"limit": _default_search_slots(), "inflight": 0, "rejected": 0,
+                 "peak_inflight": 0}
+_search_stats_lock = threading.Lock()
+
+
+class SearchBusy(Exception):
+    """Raised when no search slot frees up within the wait budget."""
+
+
+@contextlib.contextmanager
+def search_slot(timeout: float = 20.0):
+    """Hold one search slot, or raise SearchBusy.
+
+    ⚠ Bounded WAIT, not an unbounded queue. A queue that grows without limit under
+    load converts a fast failure into a slow one and holds every waiter's request
+    object in memory while it does -- which is the same resource problem one layer
+    up. Better to say no in 20 seconds than to accept work the box cannot finish.
+    """
+    if not _search_slots.acquire(timeout=timeout):
+        with _search_stats_lock:
+            _search_stats["rejected"] += 1
+        raise SearchBusy(_SEARCH_BUSY_MSG)
+    with _search_stats_lock:
+        _search_stats["inflight"] += 1
+        if _search_stats["inflight"] > _search_stats["peak_inflight"]:
+            _search_stats["peak_inflight"] = _search_stats["inflight"]
+    try:
+        yield
+    finally:
+        with _search_stats_lock:
+            _search_stats["inflight"] -= 1
+        _search_slots.release()
+
+
+def _set_search_slots(n: int) -> None:
+    """Resize the ceiling at startup, before any request is served."""
+    global _search_slots
+    n = max(1, int(n))
+    _search_slots = threading.BoundedSemaphore(n)
+    _search_stats["limit"] = n
+
+
+def pack_sign_bits(embeddings: "np.ndarray") -> "np.ndarray":
+    """Sign-zero bits for Hamming search, PACKED: (N, 768) bits -> (N, 96) bytes.
+
+    ⛔ The derived path used to produce (N, 768) uint8 — one byte per bit — while both
+    scorers here and in multi_cart have always read the packed form too
+    (`is_packed = corpus_bin.shape[1] <= 96`, popcount lookup). None of our carts ship
+    precomputed sign_bits, so EVERY mount paid 8x on this component: 768 B/pattern
+    where 96 would do. On a 34M-pattern corpus that is 26 GB against 3.3 GB.
+
+    ⚠ Packed is 96 bytes ONLY for 768-dim embeddings. The scorers hardcode
+    `n_bits = 768` when they see a packed corpus, so anything else must stay unpacked;
+    the caller checks dimensionality before using this.
+    """
+    return np.packbits((embeddings > 0).astype(np.uint8), axis=1)
+
+
+def sign_row_matching(corpus: "np.ndarray | None", emb: "np.ndarray") -> "np.ndarray":
+    """One sign-bit row in whatever format `corpus` already uses.
+
+    ⛔ Append paths must MATCH the resident format, not assume one. A packed corpus
+    growing by an unpacked row produces a ragged vstack or, worse, a silently wrong
+    popcount. multi_cart.py:697 already does exactly this check; this is the same
+    discipline, named once so the two cannot drift.
+    """
+    row2d = emb.reshape(1, -1)
+    if corpus is not None and len(corpus) and corpus.shape[1] <= 96:
+        return pack_sign_bits(row2d)
+    return (row2d > 0).astype(np.uint8)
 
 
 def _shared_load(cart_path: str) -> tuple[dict, bool]:
@@ -2301,6 +2417,13 @@ async def rest_status(request: Request) -> JSONResponse:
             "shared_budget_mb": round(
                 (_server_config.get("max_pool_bytes") or _default_pool_bytes())
                 / (1024 * 1024), 1),
+            # S7. peak_inflight and rejected are the ones worth watching: a ceiling
+            # never reached is a ceiling that proves nothing, and rejections are the
+            # signal that the box needs more cores or fewer seats.
+            "search_limit": _search_stats["limit"],
+            "search_inflight": _search_stats["inflight"],
+            "search_peak_inflight": _search_stats["peak_inflight"],
+            "search_rejected": _search_stats["rejected"],
         }, headers=_cors_headers())
     except Exception as e:
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
@@ -5161,7 +5284,12 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
             # hand back the per-visitor allocation the shared pool just removed
             # (another N x 768 uint8 on top of the embeddings).
             if data.get("_derived_sign_bits") is None:
-                data["_derived_sign_bits"] = (embeddings > 0).astype(np.uint8)
+                # PACKED when the scorers can read it (768-dim -> 96 bytes). 8x less
+                # than the one-byte-per-bit form this used to produce.
+                data["_derived_sign_bits"] = (
+                    pack_sign_bits(embeddings) if embeddings.shape[1] == 768
+                    else (embeddings > 0).astype(np.uint8)
+                )
             state["binary_corpus"] = data["_derived_sign_bits"]
         else:
             state["binary_corpus"] = None
@@ -5858,6 +5986,16 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
     if not has_embeddings and not has_hamming:
         return "Cartridge is empty (no embeddings or sign bits)."
 
+    # S7: bound concurrent CPU-bound searches. Taken BEFORE the embed, because the
+    # transformer pass is half the cost; taking it after would leave the expensive
+    # part unguarded and measure nothing.
+    try:
+        _slot = search_slot()
+        _slot.__enter__()
+    except SearchBusy as e:
+        log.warning(f"search rejected (no slot): session={session_id}")
+        return str(e)
+
     try:
         t0 = time.time()
 
@@ -6061,6 +6199,12 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
     except Exception as e:
         log.error(f"Search error: {e}")
         return f"Search error: {e}"
+    finally:
+        # S7: release the slot on EVERY exit — success, error, or an early return
+        # from one of the branches above. A slot leaked on the error path would
+        # shrink the ceiling silently until the server refused every search, and
+        # the symptom would look like load rather than a bug.
+        _slot.__exit__(None, None, None)
 
 
 def walk_associate_core(
@@ -6491,7 +6635,10 @@ def mempack_update_pattern_i(text: str, session_id: str = "") -> str:
         embeddings = state["embeddings"]
         binary_corpus = state["binary_corpus"]
 
-        new_bin_row = (emb > 0).astype(np.uint8).reshape(1, -1)
+        # ⛔ MATCH the resident format. Writing an unpacked row into a packed corpus
+        # either raises on the vstack or, in the in-place branch below, silently
+        # corrupts one row's popcount — a wrong score with no error.
+        new_bin_row = sign_row_matching(binary_corpus, emb)
 
         # Capture previous Pattern I body BEFORE mutating state, so we can
         # pass it to the persist function for the activity log (Fix A —
@@ -6594,8 +6741,13 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
         else:
             state["embeddings"] = np.vstack([state["embeddings"], emb.reshape(1, -1)])
 
-        # 3. Extend binary corpus (sign_zero for Hamming search)
-        new_bin = (emb > 0).astype(np.uint8).reshape(1, -1)
+        # 3. Extend binary corpus (sign_zero for Hamming search).
+        # ⛔ MATCH the resident format — an unpacked row appended to a packed corpus
+        # is a ragged vstack. On an EMPTY corpus start packed, since that is now what
+        # a fresh mount produces.
+        new_bin = (sign_row_matching(state["binary_corpus"], emb)
+                   if state["binary_corpus"] is not None and len(state["binary_corpus"])
+                   else pack_sign_bits(emb.reshape(1, -1)))
         if state["binary_corpus"] is None or len(state["binary_corpus"]) == 0:
             state["binary_corpus"] = new_bin
         else:
@@ -6910,13 +7062,20 @@ def multi_search(query: str, top_k: int = 10, scope: str = "all",
     log.info(f"multi_search('{query[:60]}', top_k={top_k}, scope={scope!r}, role_filter={role_filter!r}, scope_mode={scope_mode!r})")
 
     try:
-        result = _mc.search(
-            query,
-            top_k=top_k,
-            scope=scope,
-            role_filter=role_filter or None,
-            scope_mode=scope_mode,
-        )
+        # S7: same ceiling as memory_search, and this path can be WORSE — it fans
+        # out across every cart in scope, so one call is several corpora's worth of
+        # scoring. The slot wraps the whole fan-out, not each cart.
+        with search_slot():
+            result = _mc.search(
+                query,
+                top_k=top_k,
+                scope=scope,
+                role_filter=role_filter or None,
+                scope_mode=scope_mode,
+            )
+    except SearchBusy as e:
+        log.warning("multi_search rejected (no slot)")
+        return str(e)
     except ValueError as e:
         return f"multi_search error: {e}"
     except Exception as e:
@@ -9659,6 +9818,12 @@ if __name__ == "__main__":
                         help="Enable memory_store and save_cartridge (override read-only)")
     parser.add_argument("--mount", type=str, default=None,
                         help="Auto-mount a cartridge on startup (creates empty cart if not found)")
+    parser.add_argument("--max-concurrent-searches", type=int, default=None,
+                        help="Ceiling on simultaneous CPU-bound searches. Each one is "
+                             "a transformer pass plus an argsort over every pattern "
+                             "(8 bytes/pattern of transient memory per caller). "
+                             "Default: half the core count, 2-8. Callers past the "
+                             "ceiling wait up to 20s, then are told the server is busy.")
     parser.add_argument("--max-cart-ram-mb", type=int, default=None,
                         help="Ceiling on TOTAL RAM the shared cartridge pool may hold. "
                              "Mounts that would exceed it are refused. Default: half "
@@ -9679,6 +9844,10 @@ if __name__ == "__main__":
     log.info(f"Cartridge pool budget: "
              f"{_server_config['max_pool_bytes'] / (1024*1024):.0f} MB"
              f"{' (--max-cart-ram-mb)' if args.max_cart_ram_mb else ' (half of RAM)'}")
+    if args.max_concurrent_searches:
+        _set_search_slots(args.max_concurrent_searches)
+    log.info(f"Search concurrency ceiling: {_search_stats['limit']}"
+             f"{' (--max-concurrent-searches)' if args.max_concurrent_searches else ' (from core count)'}")
 
     log.info("Starting Membot — Brain Cartridge Server...")
     log.info(f"Transport: {args.transport}")
@@ -9800,7 +9969,11 @@ if __name__ == "__main__":
             state["modified"] = False
             if len(data["embeddings"]) > 0:
                 if data.get("_derived_sign_bits") is None:
-                    data["_derived_sign_bits"] = (data["embeddings"] > 0).astype(np.uint8)
+                    data["_derived_sign_bits"] = (
+                        pack_sign_bits(data["embeddings"])
+                        if data["embeddings"].shape[1] == 768
+                        else (data["embeddings"] > 0).astype(np.uint8)
+                    )
                 state["binary_corpus"] = data["_derived_sign_bits"]
             else:
                 state["binary_corpus"] = None
