@@ -904,6 +904,43 @@ def _session_id_for_user(user_id: str | None, fallback: str = "") -> str:
     return fallback.strip() if fallback and fallback.strip() else "default"
 
 
+def _anon_session_from_request(request, body_fallback: str = "") -> str:
+    """Per-browser-TAB session id for ANONYMOUS callers, from X-Membot-Session.
+
+    ⭐ WHY (Andy, 2026-10-17): "any user that goes to the demo and messes with it is
+      loading their own personal session. The demo state stays unchanged globally on
+      the server." He first asked for this on 2026-02-01 ("if another user shows up
+      and my clawbot is using it, then the mounted cart will be the loaded one and
+      who knows what collisions will occur"), and again on 08-12.
+
+    Signed-in callers already get `user_<uuid>` from _session_id_for_user. Anonymous
+    ones all collapsed to the single "default" slot, so every visitor to the public
+    demo shared one mount and could change what everyone else saw. The server side
+    was ready; the demo page simply never sent an id.
+
+    ⛔⛔ THIS IS HALF A FIX AND MUST NOT REACH THE DROPLET ALONE. A session owns its
+      OWN COPY of the embeddings (see _new_session: "embeddings", "texts",
+      "binary_corpus" all live in the session dict). One shared "default" slot means
+      exactly one copy in RAM -- accidentally safe. Give every tab its own session
+      and N visitors who mount cost N copies: 50 x 190 MB of gutenberg-poetry does
+      not fit in the droplet's 4 GB.
+      ⇒ The companion change is routing mounts through multi_cart's SHARED
+        module-global `_mounted_carts` pool, so a session holds a SCOPE (a list of
+        cart_ids) rather than a payload. `multi_cart.search(scope=[...])` already
+        accepts exactly that. Until then this is a localhost-only improvement.
+
+    ⚠ The header is attacker-controlled and becomes a dict key and a log field, so it
+      is sanitised to [A-Za-z0-9_-] and capped. The `anon_` prefix keeps it in a
+      namespace that can never collide with a `user_<uuid>` slot.
+    """
+    hdr = (request.headers.get("X-Membot-Session") or "").strip()
+    if hdr:
+        safe = re.sub(r"[^A-Za-z0-9_-]", "", hdr)[:64]
+        if safe:
+            return f"anon_{safe}"
+    return body_fallback
+
+
 def _owner_id_to_uuid_bytes(owner_id: str | None) -> np.ndarray:
     """Convert a Supabase user-UUID string to a 16-byte numpy array.
 
@@ -1417,7 +1454,9 @@ async def rest_store(request: Request) -> JSONResponse:
         tags = data.get("tags", "")
         _log_rest(request, "STORE", f"tags={tags} len={len(content)}")
         user_id = _get_user_id_from_request(request)
-        session_id = _session_id_for_user(user_id, fallback=data.get("session_id", ""))
+        session_id = _session_id_for_user(
+            user_id,
+            fallback=_anon_session_from_request(request, data.get("session_id", "")))
         _call = getattr(memory_store, 'fn', memory_store)  # FastMCP 2.x vs 3.x
         result = _call(content=content, tags=tags, session_id=session_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
@@ -1442,7 +1481,9 @@ async def rest_search(request: Request) -> JSONResponse:
         top_k = data.get("top_k", 5)
         _log_rest(request, "SEARCH", f"q=\"{query[:60]}\" top_k={top_k}")
         user_id = _get_user_id_from_request(request)
-        session_id = _session_id_for_user(user_id, fallback=data.get("session_id", ""))
+        session_id = _session_id_for_user(
+            user_id,
+            fallback=_anon_session_from_request(request, data.get("session_id", "")))
         state = _get_session(session_id)
         # Defense-in-depth: if the slot somehow holds another user's Mempack,
         # refuse the read. Belt + suspenders.
@@ -2070,7 +2111,9 @@ async def rest_mount(request: Request) -> JSONResponse:
         # Identify caller via JWT (cookie or Bearer). None for anonymous.
         user_id = _get_user_id_from_request(request)
         # Per-user session slot when authenticated; per-body or default otherwise.
-        session_id = _session_id_for_user(user_id, fallback=data.get("session_id", ""))
+        session_id = _session_id_for_user(
+            user_id,
+            fallback=_anon_session_from_request(request, data.get("session_id", "")))
         # Mempack scoping: a signed-in caller can only see THEIR Mempacks.
         # Anonymous callers can still mount knowledge carts (no owner_id scope).
         owner_id = user_id or data.get("owner_id", "")
@@ -2094,7 +2137,10 @@ async def rest_passage(request: Request) -> JSONResponse:
     try:
         idx = int(request.query_params.get("idx", -1))
         user_id = _get_user_id_from_request(request)
-        session_id = _session_id_for_user(user_id, fallback=request.query_params.get("session_id", ""))
+        session_id = _session_id_for_user(
+            user_id,
+            fallback=_anon_session_from_request(
+                request, request.query_params.get("session_id", "")))
         state = _get_session(session_id)
 
         if state["cartridge_name"] is None:
@@ -3270,10 +3316,51 @@ const BASE=()=>{
   const loc=location.pathname.replace(/\\/app\\/?$/,'');
   return location.protocol==='file:'?'http://137.184.227.79:8000':location.origin+loc;
 };
+/* ---------------------------------------------------------------------------
+ * PER-TAB ANONYMOUS SESSION  (Andy, 2026-10-17; first asked 2026-02-01)
+ *
+ * "any user that goes to the demo and messes with it is loading their own
+ *  personal session. The demo state stays unchanged globally on the server."
+ *
+ * The server has supported per-session state for months -- mount_cartridge
+ * takes a session_id and each session has its own mounted cartridge. The demo
+ * page just never sent one, so every anonymous visitor collapsed into the
+ * single "default" slot and could change what every other visitor saw.
+ *
+ * sessionStorage, NOT localStorage, and that is the whole point: sessionStorage
+ * dies when the tab closes. That delivers Andy's 2026-08-12 ask -- "carts simply
+ * unmount when access ends" -- with no heartbeat and no TTL machinery, because
+ * the id is simply gone and the orphaned server session ages out on its own.
+ *
+ * Signed-in users are unaffected: the server prefers the JWT-derived
+ * user_<uuid> slot and ignores this header.
+ * ------------------------------------------------------------------------- */
+const SID=(()=>{
+  try{
+    let s=sessionStorage.getItem('membot-sid');
+    if(!s){
+      s=(crypto&&crypto.randomUUID)?crypto.randomUUID()
+        :String(Date.now())+'-'+Math.random().toString(36).slice(2);
+      sessionStorage.setItem('membot-sid',s);
+    }
+    return s;
+  }catch(_){
+    /* private mode / storage blocked: fall back to a per-page-load id. Still
+       isolates this visitor from others, just not across their own reloads. */
+    return 'nostore-'+Math.random().toString(36).slice(2);
+  }
+})();
+/* Every call to the server goes through here so the header cannot be forgotten
+ * on a new endpoint -- the reason it is a wrapper and not 10 edited call sites. */
+function jfetch(url,opts){
+  opts=opts||{};
+  opts.headers=Object.assign({},opts.headers||{},{'X-Membot-Session':SID});
+  return fetch(url,opts);
+}
 async function checkStatus(){
   const dot=$('#statusDot'),txt=$('#statusText');
   try{
-    const r=await fetch(BASE()+'/api/status',{signal:AbortSignal.timeout(5000)});
+    const r=await jfetch(BASE()+'/api/status',{signal:AbortSignal.timeout(5000)});
     const d=await r.json();
     dot.className='status-dot connected';
     _mounted=d.cartridge; _memories=d.memories||0;
@@ -3285,8 +3372,8 @@ async function loadCartridges(){
   const bar=$('#cartBar');
   try{
     const [cr,sr]=await Promise.all([
-      fetch(BASE()+'/api/cartridges',{signal:AbortSignal.timeout(5000)}).then(r=>r.json()),
-      fetch(BASE()+'/api/status',{signal:AbortSignal.timeout(5000)}).then(r=>r.json())
+      jfetch(BASE()+'/api/cartridges',{signal:AbortSignal.timeout(5000)}).then(r=>r.json()),
+      jfetch(BASE()+'/api/status',{signal:AbortSignal.timeout(5000)}).then(r=>r.json())
     ]);
     _mounted=sr.cartridge; _memories=sr.memories||0;
     const dot=$('#statusDot'),txt=$('#statusText');
@@ -3312,7 +3399,7 @@ async function mountCart(name){
   chips.forEach(c=>{if(c.dataset.name===name)c.classList.add('mounting');});
   toast('Mounting '+name+'...');
   try{
-    const r=await fetch(BASE()+'/api/mount',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+    const r=await jfetch(BASE()+'/api/mount',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
     const d=await r.json();
     if(d.error){toast(d.error,'error');}
     else{toast('Mounted '+name,'success');}
@@ -3328,7 +3415,7 @@ async function doSearch(){
   el.innerHTML=''; loading.className='loading active'; meta.textContent='';
   const t0=performance.now();
   try{
-    const r=await fetch(BASE()+'/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,top_k:8})});
+    const r=await jfetch(BASE()+'/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,top_k:8})});
     const data=await r.json();
     const elapsed=Math.round(performance.now()-t0);
     loading.className='loading';
@@ -3407,7 +3494,7 @@ async function loadSource(){
   const cta=$('#modalCta'),idx=_currentPassage.index;
   if(cta)cta.innerHTML='<span class="modal-cta-loading">Loading from source database&hellip;</span>';
   try{
-    const r=await fetch(BASE()+'/api/passage?idx='+idx);
+    const r=await jfetch(BASE()+'/api/passage?idx='+idx);
     const data=await r.json();
     if(data.error){toast(data.error,'error');return;}
     const p=data.passage;
@@ -3419,7 +3506,7 @@ async function loadSource(){
 }
 async function navigatePassage(idx){
   try{
-    const r=await fetch(BASE()+'/api/passage?idx='+idx);
+    const r=await jfetch(BASE()+'/api/passage?idx='+idx);
     const data=await r.json();
     if(data.error){toast(data.error,'error');return;}
     const p=data.passage;
@@ -3441,7 +3528,7 @@ async function doStore(){
   const tags=$('#storeTags').value.trim();
   if(!content){toast('Enter content to store','error');return;}
   try{
-    const r=await fetch(BASE()+'/api/store',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,tags})});
+    const r=await jfetch(BASE()+'/api/store',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,tags})});
     const data=await r.json();
     if(data.error){toast(data.error,'error');}
     else{toast('Memory stored','success');$('#storeContent').value='';$('#storeTags').value='';checkStatus();}
@@ -3538,7 +3625,7 @@ async function getWhoami(){
   const now = Date.now();
   if (now - _whoamiCache.ts < _WHOAMI_CACHE_MS) return _whoamiCache.whoami;
   try {
-    const r = await fetch(BASE() + '/api/whoami', { credentials: 'same-origin' });
+    const r = await jfetch(BASE() +'/api/whoami', { credentials: 'same-origin' });
     const d = await r.json();
     _whoamiCache = { ts: now, whoami: d };
     if (!d || !d.user_id) console.warn('[membot] getWhoami: server reports no signed-in user (cookie missing or invalid JWT)');
@@ -3703,7 +3790,7 @@ function doSignIn(){
 async function doSignOut(){
   _authMenuOpen = false;
   try {
-    const r = await fetch(BASE() + '/api/auth/signout', {
+    const r = await jfetch(BASE() +'/api/auth/signout', {
       method: 'POST', credentials: 'same-origin',
     });
     const d = await r.json();
@@ -3764,7 +3851,7 @@ async function loadMempacks(){
   }
   list.innerHTML = '<div class="dash-empty"><div class="spinner"></div> Loading Mempacks...</div>';
   try {
-    const r = await fetch(BASE() + '/api/mempacks?owner_id=' + encodeURIComponent(uuid));
+    const r = await jfetch(BASE() +'/api/mempacks?owner_id=' + encodeURIComponent(uuid));
     const d = await r.json();
     if (d.error || d.status === 'error') { list.innerHTML = '<div class="dash-empty"><div class="icon">&#x26A0;</div>' + esc(d.error || 'Load failed') + '</div>'; return; }
     const items = d.mempacks || [];
@@ -3953,7 +4040,7 @@ async function savePatternI(){
   status.textContent = 'Saving...';
   status.className = 'saved-msg';
   try {
-    const r = await fetch(BASE() + '/api/mempack/' + _currentMempack.id + '/pattern-i', {
+    const r = await jfetch(BASE() +'/api/mempack/' + _currentMempack.id + '/pattern-i', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({text})
     });
@@ -3975,7 +4062,7 @@ let _templatesCache = null;  // [{id, label, description, body, disabled}, ...]
 async function loadTemplates(){
   if (_templatesCache) return _templatesCache;
   try {
-    const r = await fetch(BASE() + '/api/mempack/templates');
+    const r = await jfetch(BASE() +'/api/mempack/templates');
     const d = await r.json();
     if (d.status !== 'ok') return null;
     _templatesCache = d.templates || [];
@@ -4063,7 +4150,7 @@ async function prefillDispatchFromMempack(mempackId){
   const status = $('#dispatchStatus');
   if (!ta) return;
   try {
-    const r = await fetch(BASE() + '/api/mempack/' + mempackId + '/patterns?tag=DISPATCH&limit=1', { credentials: 'same-origin' });
+    const r = await jfetch(BASE() +'/api/mempack/' + mempackId + '/patterns?tag=DISPATCH&limit=1', { credentials: 'same-origin' });
     const d = await r.json();
     if (d.status !== 'ok' || !d.patterns || d.patterns.length === 0) {
       // No DISPATCH in this Mempack — leave textbox in whatever state it had
@@ -4105,7 +4192,7 @@ async function doDispatch(){
   status.textContent = 'Sending...';
   status.className = 'saved-msg';
   try {
-    const r = await fetch(BASE() + '/api/mempack/' + _currentMempack.id + '/dispatch', {
+    const r = await jfetch(BASE() +'/api/mempack/' + _currentMempack.id + '/dispatch', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({text})
     });
@@ -4135,7 +4222,7 @@ async function doDispatch(){
 async function toggleLogging(enabled){
   if (!_currentMempack) return;
   try {
-    const r = await fetch(BASE() + '/api/mempack/' + _currentMempack.id, {
+    const r = await jfetch(BASE() +'/api/mempack/' + _currentMempack.id, {
       method: 'PATCH', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({activity_logging_enabled: !!enabled})
     });
@@ -4152,7 +4239,7 @@ async function loadActivity(reset){
   let url = BASE() + '/api/mempack/' + _currentMempack.id + '/activity?limit=100';
   if (!reset && _activitySinceTs) url += '&since=' + encodeURIComponent(_activitySinceTs);
   try {
-    const r = await fetch(url);
+    const r = await jfetch(url);
     const d = await r.json();
     if (d.status !== 'ok') { feed.innerHTML = '<div class="dash-empty">' + esc(d.error || 'Failed to load activity') + '</div>'; return; }
     _activitySinceTs = d.server_time;
@@ -4296,7 +4383,7 @@ async function loadPatterns(reset){
   if (_patternsCurrentQ)   params.set('q',   _patternsCurrentQ);
   const url = BASE() + '/api/mempack/' + _currentMempack.id + '/patterns?' + params.toString();
   try {
-    const r = await fetch(url);
+    const r = await jfetch(url);
     const d = await r.json();
     if (d.status !== 'ok') {
       list.innerHTML = '<div class="dash-empty"><div class="icon">&#x26A0;</div>' + esc(d.error || 'Load failed') + '</div>';
@@ -4476,7 +4563,7 @@ async function downloadPatterns(format, idx){
   }
 
   try {
-    const r = await fetch(url, { credentials: 'same-origin' });
+    const r = await jfetch(url, { credentials: 'same-origin' });
     if (!r.ok) {
       let detail = 'HTTP ' + r.status;
       try { const errd = await r.json(); if (errd && errd.error) detail = errd.error; } catch(_) {}
