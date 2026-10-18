@@ -9521,6 +9521,11 @@ if __name__ == "__main__":
                         help="Enable memory_store and save_cartridge (override read-only)")
     parser.add_argument("--mount", type=str, default=None,
                         help="Auto-mount a cartridge on startup (creates empty cart if not found)")
+    parser.add_argument("--allow-unverified-mount", action="store_true",
+                        help="Start even if the --mount cartridge fails its manifest "
+                             "integrity check. For a KNOWN-STALE manifest on a cart you "
+                             "trust; the failure is still logged at ERROR. Without this, "
+                             "a failed check refuses to start (exit 3).")
     args = parser.parse_args()
 
     _server_config["read_only"] = not args.writable
@@ -9593,6 +9598,48 @@ if __name__ == "__main__":
             # visitor to mount the same cart loads a second one — the duplication the
             # pool exists to remove, reappearing at the one mount we control.
             data, _ = _shared_load(cart["path"])
+
+            # ⛔ VERIFY BEFORE MOUNTING, AND ACT ON THE ANSWER (2026-10-18).
+            #
+            # This computed `ok` and then never read it — it logged integrity=<msg>
+            # and mounted regardless, so a cart that failed its fingerprint check was
+            # served anyway, with the evidence sitting in a log nobody reads. Andy,
+            # today: "if it doesn't see if it's ok what's the point of checking in the
+            # first place?" A check whose result nothing reads is a comment.
+            #
+            # ⚠ NOT a retry. A manifest mismatch is deterministic — the file's content
+            # does not hash to its recorded fingerprint, which means corrupted on disk,
+            # edited without regenerating the manifest, or tampered with. A second read
+            # returns the same answer, so a retry loop spins on a permanent condition.
+            #
+            # ⇒ Refuse, and EXIT NON-ZERO. Booting "successfully" while silently
+            # dropping the cart the operator asked for is the failure mode that already
+            # cost us weeks: the droplet served an empty store since August and nobody
+            # noticed, because from outside a server with no cart looks like a server
+            # that is fine. A non-zero exit is the only variant systemd and the fleet
+            # monitor can actually see.
+            ok, verify_msg = verify_manifest(cart["path"], data["embeddings"],
+                                             len(data["texts"]))
+            if not ok and not args.allow_unverified_mount:
+                _shared_release(state, sid)
+                _shared_cart_data.pop(cart["path"], None)
+                _shared_refs.pop(cart["path"], None)
+                log.error(
+                    f"INTEGRITY CHECK FAILED for auto-mount '{cart['name']}': {verify_msg}"
+                )
+                log.error(f"  path: {cart['path']}")
+                log.error("  Refusing to start. The cart does not match its manifest — "
+                          "it is corrupted, was edited without regenerating the manifest, "
+                          "or was tampered with.")
+                log.error("  If the manifest is merely stale, re-save it, or start with "
+                          "--allow-unverified-mount to accept the risk explicitly.")
+                sys.exit(3)
+            if not ok:
+                # Explicitly accepted. Say so at ERROR so it cannot be mistaken for a
+                # clean boot in the log.
+                log.error(f"INTEGRITY CHECK FAILED for '{cart['name']}': {verify_msg} — "
+                          f"mounting anyway because --allow-unverified-mount was passed.")
+
             state["embeddings"] = data["embeddings"]
             state["texts"] = data["texts"]
             state["cartridge_name"] = cart["name"]
@@ -9608,10 +9655,17 @@ if __name__ == "__main__":
             else:
                 state["binary_corpus"] = None
             _shared_register(state, sid, cart["path"])
-            ok, verify_msg = verify_manifest(cart["path"], data["embeddings"], len(data["texts"]))
-            log.info(f"Auto-mounted '{cart['name']}': {len(data['texts'])} memories, integrity={verify_msg}")
+            # Verified above, before any of this was assigned.
+            log.info(f"Auto-mounted '{cart['name']}': {len(data['texts'])} memories, "
+                     f"integrity={verify_msg}")
         else:
+            # Same reasoning as the integrity failure: --mount is an instruction, and
+            # a process that starts while silently ignoring it reports health it does
+            # not have. Creation was already attempted above, so reaching here means
+            # the cart could be neither found nor made.
             log.error(f"Auto-mount failed: '{cart_name}' still not found after creation")
+            log.error("  Refusing to start. Remove --mount to run without a cartridge.")
+            sys.exit(4)
 
     # Setup HTTP middleware if not in stdio mode
     if args.transport != "stdio":
