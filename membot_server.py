@@ -430,26 +430,51 @@ _shared_refs: dict[str, set] = {}
 # Admission control, not eviction: every payload in the pool has at least one live
 # holder (release evicts immediately when the last one goes), so there is nothing
 # safe to throw away. An over-budget mount is REFUSED and says so.
-_DEFAULT_POOL_FRACTION = 0.5     # of physical RAM, when we can read it
-_FALLBACK_POOL_MB = 2048         # when we cannot
+_DEFAULT_POOL_FRACTION = 0.5     # of TOTAL physical RAM
+_AVAILABLE_FRACTION = 0.7        # of what is ACTUALLY FREE right now
+_FALLBACK_POOL_MB = 512          # when we can read neither
+_MIN_POOL_MB = 128               # never size ourselves out of mounting anything
 
 
 def _default_pool_bytes() -> int:
-    """Half of physical RAM, or a conservative constant if that is unreadable.
+    """A budget the box can actually honor: the LOWER of half total RAM and 70% of
+    what is free right now.
 
-    Sized from the box rather than hardcoded, because the same code runs on a 4 GB
-    droplet and on a desktop with far more.
+    ⛔ Total RAM alone is the wrong basis, and the droplet is why. Measured
+    2026-10-18 before deploying: 3,949 MB total but only 755 MB AVAILABLE, with 2.5
+    GB already in swap, because session-memory holds 2,089 MB and vector-plus-studio
+    another 529. Half of total would have promised 1,974 MB that does not exist —
+    a budget whose only effect is to let the box OOM while the check says yes.
+
+    ⚠ This is a snapshot taken at startup. It is deliberately conservative rather
+    than adaptive: a ceiling that moves under you is worse than one that is wrong in
+    the safe direction, and --max-cart-ram-mb overrides it when an operator knows
+    better than the snapshot does.
     """
+    total = available = 0
     try:
         import psutil
-        return int(psutil.virtual_memory().total * _DEFAULT_POOL_FRACTION)
+        vm = psutil.virtual_memory()
+        total, available = vm.total, vm.available
     except Exception:
-        pass
-    try:                                  # Linux without psutil
-        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-                   * _DEFAULT_POOL_FRACTION)
-    except (ValueError, OSError, AttributeError):
+        try:                              # Linux without psutil
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        available = int(line.split()[1]) * 1024
+                        break
+        except (ValueError, OSError, AttributeError):
+            pass
+
+    candidates = []
+    if total:
+        candidates.append(int(total * _DEFAULT_POOL_FRACTION))
+    if available:
+        candidates.append(int(available * _AVAILABLE_FRACTION))
+    if not candidates:
         return _FALLBACK_POOL_MB * 1024 * 1024
+    return max(min(candidates), _MIN_POOL_MB * 1024 * 1024)
 
 
 def _cart_ram_estimate(cart_path: str) -> int:
