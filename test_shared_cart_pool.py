@@ -224,6 +224,43 @@ out2 = mount_cartridge("pool-test-bad", session_id="v2")
 check("SECOND mount also refused (no cache-hit bypass)", "SECURITY" in out2, out2[:50])
 M.verify_manifest = _good_verify
 
+# ---------------------------------------------------------------- §8 budget
+print("\n§8 · RAM BUDGET — the pool shares duplicates but must also bound DISTINCT carts")
+reset()
+M.find_cartridges = lambda: [CART_A, CART_B]
+M._server_config["max_pool_bytes"] = None
+
+est_a = M._cart_ram_estimate(CART_A["path"])
+check("estimate is non-zero and read without loading", est_a > 0, f"{est_a/1024:.0f} KB")
+
+# A budget that fits exactly one cart. Not a round number pulled from the air: it is
+# derived from the measured estimate, so the test still discriminates if cart sizes
+# change.
+M._server_config["max_pool_bytes"] = int(est_a * 1.5)
+mount_cartridge("pool-test-alpha", session_id="b1")
+check("first cart admitted", M._sessions["b1"]["cartridge_name"] == "pool-test-alpha")
+out = mount_cartridge("pool-test-beta", session_id="b2")
+check("SECOND, DIFFERENT cart refused", "Not enough cartridge memory" in out, out[:52])
+check("refusal names the resident cart", "alpha" in out)
+check("refused cart did not enter the pool", len(M._shared_cart_data) == 1)
+check("refused session has no cartridge", M._sessions["b2"]["cartridge_name"] is None)
+
+# ⭐ The case the whole design turns on: a cart ALREADY resident must still admit,
+# however tight the budget, because another holder costs nothing.
+M._server_config["max_pool_bytes"] = 1
+out2 = mount_cartridge("pool-test-alpha", session_id="b3")
+check("resident cart admits even at a 1-byte budget",
+      M._sessions["b3"]["cartridge_name"] == "pool-test-alpha", out2[:40])
+check("still one payload for three holders", len(M._shared_cart_data) == 1)
+
+# Control: with the budget lifted, the same second mount must SUCCEED. Without this,
+# "refused" could mean the mount was broken rather than bounded.
+M._server_config["max_pool_bytes"] = est_a * 50
+out3 = mount_cartridge("pool-test-beta", session_id="b4")
+check("CONTROL — same mount succeeds once the budget allows it",
+      M._sessions["b4"]["cartridge_name"] == "pool-test-beta", out3[:52])
+M._server_config["max_pool_bytes"] = None
+
 # ---------------------------------------------------------------- verdict
 passed = sum(1 for _, ok, _ in RESULTS if ok)
 total = len(RESULTS)

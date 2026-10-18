@@ -420,6 +420,107 @@ _shared_cart_data: dict[str, dict] = {}
 _shared_refs: dict[str, set] = {}
 
 
+# ⛔ THE POOL SHARES DUPLICATES. IT DOES NOT BOUND DISTINCT CARTS. (Andy, 2026-10-18:
+# "The server could crash if too many carts are loaded then. Or at least run out of
+# RAM, couldn't it?") Fifty visitors mounting fifty DIFFERENT corpora is still fifty
+# payloads, and nothing above caps that — MAX_SESSIONS bounds sessions, not bytes.
+# Local cartridges/ currently holds 6.1 GB, with a single cart at 701 MB, so TWO of
+# the big ones exhaust a 4 GB droplet.
+#
+# Admission control, not eviction: every payload in the pool has at least one live
+# holder (release evicts immediately when the last one goes), so there is nothing
+# safe to throw away. An over-budget mount is REFUSED and says so.
+_DEFAULT_POOL_FRACTION = 0.5     # of physical RAM, when we can read it
+_FALLBACK_POOL_MB = 2048         # when we cannot
+
+
+def _default_pool_bytes() -> int:
+    """Half of physical RAM, or a conservative constant if that is unreadable.
+
+    Sized from the box rather than hardcoded, because the same code runs on a 4 GB
+    droplet and on a desktop with far more.
+    """
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total * _DEFAULT_POOL_FRACTION)
+    except Exception:
+        pass
+    try:                                  # Linux without psutil
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                   * _DEFAULT_POOL_FRACTION)
+    except (ValueError, OSError, AttributeError):
+        return _FALLBACK_POOL_MB * 1024 * 1024
+
+
+def _cart_ram_estimate(cart_path: str) -> int:
+    """Conservative estimate of the RAM a cart will occupy, WITHOUT loading it.
+
+    An .npz is a zip, and the central directory records each member's UNCOMPRESSED
+    size, so this reads the real decompressed footprint for free.
+
+    ⭐ Measured 2026-10-18 against three real carts: the zip figure is 1.23-1.32x
+    what actually lands in RAM, because the npz stores texts twice (`passages` and
+    `compressed_texts`) and only one survives the load. Overestimating is the SAFE
+    direction for an admission check — it refuses slightly early instead of OOMing.
+    ⚠ File size on disk is NOT usable here: these are savez_compressed, and for
+    heartbeat disk/loaded is 0.75, wrong in the dangerous direction.
+    """
+    try:
+        import zipfile
+        with zipfile.ZipFile(cart_path) as z:
+            total = sum(i.file_size for i in z.infolist())
+        if total > 0:
+            return total
+    except Exception:
+        pass
+    try:
+        # Non-npz (.pkl and friends): assume it expands, erring high.
+        return os.path.getsize(cart_path) * 2
+    except OSError:
+        return 0
+
+
+def _pool_bytes() -> int:
+    """Bytes the shared pool is currently holding."""
+    total = 0
+    for data in _shared_cart_data.values():
+        for key in ("embeddings", "sign_bits", "_derived_sign_bits"):
+            a = data.get(key)
+            if a is not None and hasattr(a, "nbytes"):
+                total += a.nbytes
+        texts = data.get("texts")
+        if texts:
+            total += sum(len(t) for t in texts)
+    return total
+
+
+def _pool_admits(cart_path: str) -> tuple[bool, str]:
+    """May this cart be loaded into the pool? Returns (ok, reason-if-not).
+
+    A cart already resident always admits — a second holder costs nothing, which is
+    the entire point of the pool.
+    """
+    if cart_path in _shared_cart_data:
+        return True, ""
+    budget = _server_config.get("max_pool_bytes") or _default_pool_bytes()
+    current = _pool_bytes()
+    est = _cart_ram_estimate(cart_path)
+    if current + est <= budget:
+        return True, ""
+    mb = 1024 * 1024
+    resident = ", ".join(
+        f"{os.path.basename(p)} ({len(_shared_refs.get(p, set()))} holder"
+        f"{'s' if len(_shared_refs.get(p, set())) != 1 else ''})"
+        for p in _shared_cart_data
+    ) or "nothing"
+    return False, (
+        f"Not enough cartridge memory. This cart needs about {est/mb:.0f} MB; "
+        f"{current/mb:.0f} MB of the {budget/mb:.0f} MB budget is already in use. "
+        f"Resident: {resident}. "
+        f"Unmount a cart you are not using, or raise --max-cart-ram-mb."
+    )
+
+
 def _shared_load(cart_path: str) -> tuple[dict, bool]:
     """Return (cart data, was_already_loaded) for this path.
 
@@ -2171,6 +2272,10 @@ async def rest_status(request: Request) -> JSONResponse:
             "sessions": len(_sessions),
             "shared_carts": len(_shared_cart_data),
             "shared_holders": sum(len(h) for h in _shared_refs.values()),
+            "shared_mb": round(_pool_bytes() / (1024 * 1024), 1),
+            "shared_budget_mb": round(
+                (_server_config.get("max_pool_bytes") or _default_pool_bytes())
+                / (1024 * 1024), 1),
         }, headers=_cors_headers())
     except Exception as e:
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
@@ -4917,6 +5022,14 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
         # its reference before we take another, or that payload is pinned by a holder
         # that has moved on and the pool never shrinks.
         _shared_release(state, session_id)
+
+        # ⛔ Admission check BEFORE the load, not after. Measuring a cart's footprint
+        # by loading it and then deciding is how you OOM on the cart you were trying
+        # to protect against.
+        admit, why = _pool_admits(cart["path"])
+        if not admit:
+            log.warning(f"mount refused (pool budget): {cart['name']} — {why}")
+            return why
 
         # One disk load per PATH. The second session to mount a cart attaches to the
         # arrays the first one loaded, instead of reading 190 MB off disk again.
@@ -9521,6 +9634,11 @@ if __name__ == "__main__":
                         help="Enable memory_store and save_cartridge (override read-only)")
     parser.add_argument("--mount", type=str, default=None,
                         help="Auto-mount a cartridge on startup (creates empty cart if not found)")
+    parser.add_argument("--max-cart-ram-mb", type=int, default=None,
+                        help="Ceiling on TOTAL RAM the shared cartridge pool may hold. "
+                             "Mounts that would exceed it are refused. Default: half "
+                             "of physical RAM. Carts already resident always mount, "
+                             "since an extra holder costs nothing.")
     parser.add_argument("--allow-unverified-mount", action="store_true",
                         help="Start even if the --mount cartridge fails its manifest "
                              "integrity check. For a KNOWN-STALE manifest on a cart you "
@@ -9529,6 +9647,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     _server_config["read_only"] = not args.writable
+    _server_config["max_pool_bytes"] = (
+        args.max_cart_ram_mb * 1024 * 1024 if args.max_cart_ram_mb
+        else _default_pool_bytes()
+    )
+    log.info(f"Cartridge pool budget: "
+             f"{_server_config['max_pool_bytes'] / (1024*1024):.0f} MB"
+             f"{' (--max-cart-ram-mb)' if args.max_cart_ram_mb else ' (half of RAM)'}")
 
     log.info("Starting Membot — Brain Cartridge Server...")
     log.info(f"Transport: {args.transport}")
