@@ -2376,7 +2376,18 @@ async def rest_status(request: Request) -> JSONResponse:
         return JSONResponse({}, headers=_cors_headers())
     _log_rest(request, "STATUS")
     try:
-        sid = request.query_params.get("session_id", "")
+        # ⛔ This read query_params ONLY — no JWT, no X-Membot-Session — so it always
+        # fell back to "default" and reported the SERVER's boot cart to every caller.
+        # The route that step 1 (f496684) missed, and it is the one the demo page uses
+        # to decide whether a cart is mounted: a fresh visitor saw cartridge=heartbeat,
+        # got the mount prompt suppressed and the search box enabled, then got "No
+        # cartridge mounted" from /api/search. Two routes, same header, different
+        # answers. Derived here exactly as rest_search derives it.
+        user_id = _get_user_id_from_request(request)
+        sid = _session_id_for_user(
+            user_id,
+            fallback=_anon_session_from_request(
+                request, request.query_params.get("session_id", "")))
         sid = _resolve_session_id(sid)
         state = _get_session(sid)
         n = len(state["texts"]) if state["texts"] else 0
@@ -3532,7 +3543,10 @@ _APP_HTML = """\
   <div class="search-meta" id="searchMeta"></div>
   <div class="loading" id="loadingEl"><div class="spinner"></div> Searching...</div>
   <div class="results" id="resultsEl">
-    <div class="empty-state"><div class="icon">&#x1F9E0;</div><p>Search your brain cartridge</p><div class="hint" style="font-size:12px;margin-top:8px">Type a query to find memories by meaning</div></div>
+    <!-- Server-rendered first paint. Every visitor now starts with NO cart, so this
+         must not invite a search; loadCartridges() replaces it via emptyStateHTML()
+         once it knows the session's actual mount state. -->
+    <div class="empty-state"><div class="icon">&#x1F4DA;</div><p>Pick a cartridge to explore</p><div class="hint" style="font-size:12px;margin-top:8px">Choose one from the bar above. It loads into <strong>your session only</strong> &mdash; nothing you mount changes what anyone else sees.</div></div>
   </div>
   <div class="passage-overlay" id="passageOverlay" onclick="if(event.target===this)closePassage()">
     <div class="passage-modal">
@@ -3784,8 +3798,15 @@ async function loadCartridges(){
     _mounted=sr.cartridge; _memories=sr.memories||0;
     const dot=$('#statusDot'),txt=$('#statusText');
     dot.className='status-dot connected';
-    txt.textContent=(_mounted||'No cart')+' ('+_memories.toLocaleString()+' memories)';
+    txt.textContent=(_mounted||'No cart mounted')+(_mounted?' ('+_memories.toLocaleString()+' memories)':'');
     applyReadOnly(sr.read_only);
+    applyMountGate();
+    // Refresh the resting panel whenever mount state changes, but never clobber
+    // results the visitor is reading: only while the panel IS a resting panel.
+    const _res=$('#resultsEl');
+    if(_res && _res.querySelector('.empty-state') && !_res.querySelector('.result-card')){
+      _res.innerHTML=emptyStateHTML();
+    }
     const carts=cr.cartridges||[];
     if(carts.length===0){bar.innerHTML='<div class="cart-chip"><div class="name" style="color:var(--text-dim)">No cartridges found</div></div>';return;}
     bar.innerHTML=carts.map(c=>{
@@ -3797,9 +3818,42 @@ async function loadCartridges(){
     bar.querySelectorAll('.cart-chip').forEach(el=>el.addEventListener('click',()=>mountCart(el.dataset.name)));
   }catch(e){bar.innerHTML='<div class="cart-chip"><div class="name" style="color:var(--red)">Connection failed</div></div>';}
 }
+// The resting panel, which depends on whether THIS session has a cart.
+// ONE function because there were three copies of this markup and the no-cart case
+// was wrong in all of them: the page invited a search that cannot succeed, and when
+// the search came back empty it said "No results found" -- blaming the query for a
+// cart that was never mounted. Carts are per-session now (2026-10-18), so "nothing
+// mounted" is the state EVERY new visitor starts in, not an edge case.
+function emptyStateHTML(){
+  if(!_mounted){
+    return '<div class="empty-state"><div class="icon">&#x1F4DA;</div>'
+      + '<p>Pick a cartridge to explore</p>'
+      + '<div class="hint" style="font-size:12px;margin-top:8px">'
+      + 'Choose one from the bar above. It loads into <strong>your session only</strong> '
+      + '&mdash; nothing you mount changes what anyone else sees.</div></div>';
+  }
+  return '<div class="empty-state"><div class="icon">&#x1F9E0;</div>'
+    + '<p>Search ' + esc(_mounted) + '</p>'
+    + '<div class="hint" style="font-size:12px;margin-top:8px">'
+    + 'Type a query to find memories by meaning</div></div>';
+}
+
+// Keep the search box honest about whether it can do anything.
+function applyMountGate(){
+  const inp=$('#searchInput');
+  if(!inp)return;
+  if(_mounted){
+    inp.disabled=false;
+    inp.placeholder='Search '+_mounted+'…';
+  }else{
+    inp.disabled=true;
+    inp.placeholder='Pick a cartridge above to start searching';
+  }
+}
+
 async function mountCart(name){
   if(name===_mounted)return;
-  $('#resultsEl').innerHTML='<div class="empty-state"><div class="icon">&#x1F9E0;</div><p>Search your brain cartridge</p><div class="hint" style="font-size:12px;margin-top:8px">Type a query to find memories by meaning</div></div>';
+  $('#resultsEl').innerHTML=emptyStateHTML();
   $('#searchMeta').textContent=''; _lastResults=[]; _lastQuery='';
   const chips=document.querySelectorAll('.cart-chip');
   chips.forEach(c=>{if(c.dataset.name===name)c.classList.add('mounting');});
@@ -3816,6 +3870,14 @@ var _lastResults=[], _lastQuery='';
 async function doSearch(){
   const query=$('#searchInput').value.trim();
   if(!query)return;
+  // The input is disabled with no cart, but the Search button and the Enter
+  // handler can still fire. Guard here rather than relying on the input's state --
+  // a disabled field is a hint to the user, not an enforcement point.
+  if(!_mounted){
+    $('#resultsEl').innerHTML=emptyStateHTML();
+    toast('Pick a cartridge first','error');
+    return;
+  }
   _lastQuery=query;
   const el=$('#resultsEl'),loading=$('#loadingEl'),meta=$('#searchMeta');
   el.innerHTML=''; loading.className='loading active'; meta.textContent='';
@@ -3838,7 +3900,24 @@ async function doSearch(){
     console.log('[HIPPO] Search results:', JSON.stringify(items?.map(r=>({idx:r.index,prev:r.prev_idx,next:r.next_idx}))));
     const haystack=_memories?' of '+_memories.toLocaleString():'';
     if(!items||items.length===0){
-      el.innerHTML='<div class="empty-state"><div class="icon">&#x1F914;</div><p>No results found</p></div>';
+      // ⛔ An empty result set has at least three causes and they are not the same
+      // answer. "No results found" blamed the query for all of them -- including
+      // the one where no cart was ever mounted, which is now every new visitor's
+      // starting state, and including a server that refused the search under load.
+      if(data.error){
+        const busy=/busy/i.test(data.error);
+        const nocart=/no cartridge/i.test(data.error);
+        el.innerHTML='<div class="empty-state"><div class="icon">'
+          + (nocart?'&#x1F4DA;':busy?'&#x23F3;':'&#x26A0;')+'</div><p>'
+          + esc(nocart?'No cartridge mounted':busy?'Server is busy':'Search could not run')
+          + '</p><div class="hint" style="font-size:12px;margin-top:8px">'
+          + esc(nocart?'Pick one from the bar above — it loads into your session only.'
+                      :data.error)+'</div></div>';
+        meta.textContent=''; return;
+      }
+      el.innerHTML='<div class="empty-state"><div class="icon">&#x1F914;</div>'
+        + '<p>No results found</p><div class="hint" style="font-size:12px;margin-top:8px">'
+        + 'Nothing in '+esc(_mounted||'this cartridge')+' matched that query.</div></div>';
       meta.textContent='0 results'+haystack+' in '+elapsed+'ms'; return;
     }
     meta.textContent=items.length+haystack+' results in '+elapsed+'ms';
