@@ -287,7 +287,10 @@ if CONTROL:
     if ok_control:
         print("VERDICT: CONTROL PASSED — the suite detects this mechanism's absence")
     else:
-        print("VERDICT: ⛔ CONTROL FAILED — these still PASSED with the mechanism "
+        # ASCII only: this is the FAILURE branch, so it has never run, and a
+        # UnicodeEncodeError here would replace the diagnosis with a stack trace at
+        # exactly the moment the diagnosis mattered.
+        print("VERDICT: CONTROL FAILED - these still PASSED with the mechanism "
               "removed, so they are not measuring it:")
         for label in sorted(missed):
             print(f"   not discriminating: {label}")

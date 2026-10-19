@@ -9887,8 +9887,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Membot — Brain Cartridge Server")
     parser.add_argument("--transport", default="stdio", choices=["stdio", "http", "sse"],
                         help="Transport mode (default: stdio)")
-    parser.add_argument("--host", default="0.0.0.0",
-                        help="HTTP bind address (default: 0.0.0.0)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="HTTP bind address (default: 127.0.0.1, loopback only). "
+                             "Pass 0.0.0.0 to accept connections from the network — "
+                             "and if you also pass --writable, set MEMBOT_API_KEY or "
+                             "the server will refuse to start.")
     parser.add_argument("--port", type=int, default=8000,
                         help="HTTP port (default: 8000)")
     parser.add_argument("--read-only", action="store_true", default=True,
@@ -10072,8 +10075,49 @@ if __name__ == "__main__":
     # Setup HTTP middleware if not in stdio mode
     if args.transport != "stdio":
         api_key = os.environ.get("MEMBOT_API_KEY")
+
+        # ⛔ A1 (FINDING-A1-membot-faces-the-network-2026-10-17): port 8200 ran
+        # --transport http --writable on 0.0.0.0 with auth opt-in and no key set,
+        # so anyone who could reach it could call writable tools as any seat.
+        # Identity is self-asserted. Only the Windows firewall was stopping it —
+        # incidental, not architectural.
+        #
+        # ⚠ THE CONDITION IS NETWORK-REACHABLE + WRITABLE + NO KEY, not merely
+        # "writable + no key". Three real configurations have to keep working and
+        # each one rules out a simpler rule:
+        #   - the public demo is --read-only on 0.0.0.0 with no key, deliberately,
+        #     serving public-domain carts. "Require a key for HTTP" would break it.
+        #   - the local sidecar is --writable with no key, and now binds loopback.
+        #     "Require a key when writable" would refuse to start it.
+        #   - the dangerous one is writable AND reachable AND unauthenticated.
+        # On loopback the OS is the auth boundary; off it, nothing is.
+        #
+        # ⭐ Composes with the --host default, which is now 127.0.0.1: reaching the
+        # refused state takes TWO deliberate acts, typing --host 0.0.0.0 and
+        # --writable. Exposure is no longer something you get by default.
+        _LOOPBACK = {"127.0.0.1", "::1", "localhost", "127.0.0.0/8"}
+        _is_loopback = args.host in _LOOPBACK or args.host.startswith("127.")
+        _writable = not _server_config["read_only"]
+        if _writable and not _is_loopback and not api_key:
+            log.error("REFUSING TO START: writable + reachable from the network + no key.")
+            log.error(f"  --host {args.host} accepts connections from other machines,")
+            log.error("  --writable enables memory_store and save_cartridge,")
+            log.error("  and MEMBOT_API_KEY is not set, so callers are unauthenticated.")
+            log.error("  Identity is self-asserted here: anyone who reaches this port")
+            log.error("  could write as any seat. Pick one:")
+            log.error("    set MEMBOT_API_KEY=<secret>   (authenticate callers)")
+            log.error("    --host 127.0.0.1              (loopback only; the default)")
+            log.error("    drop --writable               (read-only, like the public demo)")
+            sys.exit(5)
+
         _setup_http_middleware(api_key)
         log.info(f"HTTP server starting on {args.host}:{args.port}")
+        if _is_loopback:
+            log.info("Bound to loopback — not reachable from other machines.")
+        elif api_key:
+            log.info("Bound to a public interface, API key required.")
+        else:
+            log.info("Bound to a public interface, read-only, no key (public demo mode).")
         if _server_config["read_only"]:
             log.info("Public server mode: write operations blocked")
 
