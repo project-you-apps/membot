@@ -6894,6 +6894,28 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     if n_current >= MAX_ENTRIES:
         return f"Cartridge full ({n_current}/{MAX_ENTRIES}). Save and start a new cartridge."
 
+    # EXACT-DEDUP: refuse byte-identical re-stores (dp, bfce6ab 2026-06-27). Clients that
+    # re-emit recurring patterns every session -- snarc's bridge was the case that found it --
+    # otherwise bloat the cartridge and pollute recall. A no-op skip, not an error.
+    #
+    # ⚠ NOT dp's IMPLEMENTATION. His was `stored_text in state["texts"]`, an O(n) LINEAR SCAN
+    # ON EVERY STORE. Correct at fleet cart sizes; our arXiv cart is 2.4M passages, and a
+    # full-list scan per write is the kind of cost that only shows up on the biggest corpus
+    # and is invisible in testing on a small one.
+    # ⇒ Build the index ONCE per session, then keep it incrementally (see the append below).
+    #   `_dedup_n` guards against another path having appended behind our back: if the count
+    #   no longer matches, the index is stale and gets rebuilt rather than silently missing
+    #   duplicates. Memory lands only on carts actually being WRITTEN to -- the big public
+    #   carts are served --read-only, so this never builds for them.
+    stored_text = f"[{tags}] {content}" if tags else content
+    _dedup = state.get("_dedup_set")
+    if _dedup is None or state.get("_dedup_n") != n_current:
+        _dedup = set(state["texts"]) if state["texts"] else set()
+        state["_dedup_set"] = _dedup
+        state["_dedup_n"] = n_current
+    if stored_text in _dedup:
+        return f"Duplicate — already stored, skipped: \"{content[:60]}\""
+
     log.info(f"memory_store('{content[:60]}...', is_mempack={is_mempack})")
 
     try:
@@ -6926,10 +6948,12 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
         else:
             state["binary_corpus"] = np.vstack([state["binary_corpus"], new_bin])
 
-        # 4. Store text
-        stored_text = f"[{tags}] {content}" if tags else content
+        # 4. Store text (stored_text was built above, for the dedup check)
         state["texts"].append(stored_text)
         state["modified"] = True
+        # Keep the dedup index incremental so it is never rebuilt per store.
+        _dedup.add(stored_text)
+        state["_dedup_n"] = len(state["texts"])
 
         # 5. GPU lattice imprint (if available)
         gpu_msg = ""

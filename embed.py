@@ -63,10 +63,39 @@ def _ollama_available() -> bool:
         return False
 
 
+# WHERE THE EMBEDDER RUNS, AND HOW LONG IT STAYS. Both absorbed from dp-web4/membot
+# (c31c3c6 2026-09-30, 75cc47c 2026-10-12), where the fleet hit them first: on Legion the
+# being's model holds 14.9 GB of a 16 GB card, and an embed without `num_gpu` loads
+# nomic-embed-text into the remaining ~1.1 GB beside it — a contention class that already
+# cost that machine a swap stall and a watchdog kill. On Sprout, nomic stays resident for
+# Ollama's default 5 minutes after every recall, taking room the being could use.
+#
+# ⚠ WE DO NOT TAKE THEIR num_gpu DEFAULT. dp set it to 0 (force CPU) "because that is the
+# fleet's decision" — correct for a box whose GPU belongs to a being, wrong as a product
+# default. Membot ships to hosts whose hardware we do not know, and here the 4080 has
+# nothing else on it, so forcing CPU would be a silent regression on every store and search.
+# ⇒ UNSET MEANS DO NOT SEND THE FIELD, so Ollama keeps deciding and nothing changes for
+#   anyone who has not asked. That is exactly the pattern dp's own LATER commit used for
+#   keep_alive ("Unset: the field is not sent and Ollama's default applies, so nothing
+#   changes for other hosts") — we are applying his second lesson to his first commit.
+_ollama_embed_num_gpu = (os.getenv("MEMBOT_OLLAMA_EMBED_NUM_GPU") or "").strip() or None
+_ollama_embed_keep_alive = (os.getenv("MEMBOT_OLLAMA_EMBED_KEEP_ALIVE") or "").strip() or None
+
+
 def _embed_via_ollama(text: str) -> np.ndarray:
-    """Get embedding from Ollama API (no extra RAM — reuses running Ollama process)."""
+    """Get embedding from Ollama API (no extra RAM — reuses running Ollama process).
+
+    MEMBOT_OLLAMA_EMBED_NUM_GPU pins the layer count (0 = CPU); MEMBOT_OLLAMA_EMBED_KEEP_ALIVE
+    is Ollama's keep_alive ("0" unloads immediately, "30s", "5m", ...). Unset, neither field
+    is sent and Ollama's own defaults apply.
+    """
     import urllib.request
-    payload = json.dumps({"model": _ollama_embed_model, "input": text}).encode()
+    body = {"model": _ollama_embed_model, "input": text}
+    if _ollama_embed_num_gpu is not None:
+        body["options"] = {"num_gpu": int(_ollama_embed_num_gpu)}
+    if _ollama_embed_keep_alive is not None:
+        body["keep_alive"] = _ollama_embed_keep_alive
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{_ollama_url}/api/embed",
         data=payload,
