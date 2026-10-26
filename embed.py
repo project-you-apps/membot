@@ -70,29 +70,36 @@ def _ollama_available() -> bool:
 # cost that machine a swap stall and a watchdog kill. On Sprout, nomic stays resident for
 # Ollama's default 5 minutes after every recall, taking room the being could use.
 #
-# ⚠ WE DO NOT TAKE THEIR num_gpu DEFAULT. dp set it to 0 (force CPU) "because that is the
-# fleet's decision" — correct for a box whose GPU belongs to a being, wrong as a product
-# default. Membot ships to hosts whose hardware we do not know, and here the 4080 has
-# nothing else on it, so forcing CPU would be a silent regression on every store and search.
-# ⇒ UNSET MEANS DO NOT SEND THE FIELD, so Ollama keeps deciding and nothing changes for
-#   anyone who has not asked. That is exactly the pattern dp's own LATER commit used for
-#   keep_alive ("Unset: the field is not sent and Ollama's default applies, so nothing
-#   changes for other hosts") — we are applying his second lesson to his first commit.
-_ollama_embed_num_gpu = (os.getenv("MEMBOT_OLLAMA_EMBED_NUM_GPU") or "").strip() or None
+# ⭐ CPU IS THE DEFAULT, and dp's reasoning generalizes past his hardware (Andy, 2026-10-25).
+# A first pass here kept Ollama's own placement on the grounds that "membot ships to hosts
+# whose hardware we do not know." That was wrong twice:
+#   - "let Ollama decide" is not neutral. Ollama's auto-placement TAKES the GPU when one
+#     exists, so the no-opinion default is really the most aggressive one.
+#   - membot embeds ONE text per operation — one per store, one per query; corpus vectors are
+#     precomputed in the cart. The accelerator saves tens of ms on a call that already does
+#     disk and scoring, and costs a resident ~300 MB-1 GB of VRAM for five minutes after it.
+#     On this box that card runs the lattice CUDA work, which is exactly the contention dp
+#     describes on Legion.
+# ⇒ A background memory layer should not claim the accelerator; the thing doing the THINKING
+#   should. Opt in with a layer count on a host where the GPU is genuinely free, or pass
+#   "auto" to restore Ollama's own placement.
+_num_gpu_raw = (os.getenv("MEMBOT_OLLAMA_EMBED_NUM_GPU") or "").strip().lower()
+_ollama_embed_num_gpu = None if _num_gpu_raw == "auto" else int(_num_gpu_raw or "0")
 _ollama_embed_keep_alive = (os.getenv("MEMBOT_OLLAMA_EMBED_KEEP_ALIVE") or "").strip() or None
 
 
 def _embed_via_ollama(text: str) -> np.ndarray:
     """Get embedding from Ollama API (no extra RAM — reuses running Ollama process).
 
-    MEMBOT_OLLAMA_EMBED_NUM_GPU pins the layer count (0 = CPU); MEMBOT_OLLAMA_EMBED_KEEP_ALIVE
-    is Ollama's keep_alive ("0" unloads immediately, "30s", "5m", ...). Unset, neither field
-    is sent and Ollama's own defaults apply.
+    Embeds on the CPU unless told otherwise. MEMBOT_OLLAMA_EMBED_NUM_GPU takes a layer count
+    (0 = CPU, the default) or "auto" to let Ollama place it. MEMBOT_OLLAMA_EMBED_KEEP_ALIVE is
+    Ollama's keep_alive ("0" unloads immediately, "30s", "5m", ...); unset, that field is not
+    sent and Ollama's own default applies.
     """
     import urllib.request
     body = {"model": _ollama_embed_model, "input": text}
     if _ollama_embed_num_gpu is not None:
-        body["options"] = {"num_gpu": int(_ollama_embed_num_gpu)}
+        body["options"] = {"num_gpu": _ollama_embed_num_gpu}
     if _ollama_embed_keep_alive is not None:
         body["keep_alive"] = _ollama_embed_keep_alive
     payload = json.dumps(body).encode()

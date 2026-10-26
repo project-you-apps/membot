@@ -2,12 +2,12 @@
 """The Ollama embed request sends num_gpu and keep_alive ONLY when configured.
 
 Adapted from dp-web4/membot (c31c3c6, 75cc47c), which pinned GPT's review on their #3.
-⚠ ONE ASSERTION IS DELIBERATELY INVERTED. Theirs required `options.num_gpu == 0` by
-default, forcing CPU, because on their boxes the GPU belongs to a being. Membot ships to
-hosts whose hardware we do not know, so our default sends NEITHER FIELD and lets Ollama
-decide — the same "unset means not sent" rule their own later keep_alive commit adopted.
-A test that asserted their default would fail here for the right reason, so it asserts
-ours and says why.
+⭐ WE KEEP dp's CPU DEFAULT. A first pass here inverted it to "let Ollama decide," on the
+grounds that membot ships to unknown hardware. Andy caught it: Ollama's auto-placement
+TAKES the GPU when one exists, so that is the aggressive default, not the neutral one —
+and on this box the card runs the lattice CUDA work. A memory layer embedding one text
+per operation should not hold VRAM away from the thing doing the thinking.
+⇒ `auto` is the explicit escape hatch back to Ollama's placement.
 
 No network. urllib.request.urlopen is replaced before _embed_via_ollama runs, and
 OLLAMA_HOST points at a closed port, so a missed patch fails loudly instead of reaching a
@@ -70,12 +70,12 @@ def probe(**env_overrides):
     return json.loads(r.stdout.strip().splitlines()[-1])
 
 
-# 1. Default: let Ollama decide. (INVERTED from dp's test — see the module docstring.)
+# 1. Default: CPU, same as dp's.
 out = probe()
 check("default: exactly one request sent", len(out["captured"]) == 1, out)
 body = out["captured"][0]["body"]
-check("default: NO num_gpu sent, so Ollama's own placement applies",
-      "options" not in body or "num_gpu" not in body.get("options", {}), body)
+check("default: options.num_gpu == 0 (the embedder does not take the accelerator)",
+      body.get("options", {}).get("num_gpu") == 0, body)
 check("default: request goes to /api/embed on OLLAMA_HOST",
       out["captured"][0]["url"] == "http://127.0.0.1:9/api/embed", out["captured"][0]["url"])
 check("default: model and input still carried",
@@ -103,7 +103,15 @@ check("keep_alive 0: sent as \"0\" (unload right after the embed)",
       out["captured"][0]["body"].get("keep_alive") == "0", out)
 out = probe(MEMBOT_OLLAMA_EMBED_KEEP_ALIVE="30s")
 check("keep_alive 30s: passed through", out["captured"][0]["body"].get("keep_alive") == "30s", out)
-check("keep_alive alone does not start sending num_gpu",
+check("keep_alive alone leaves num_gpu at the CPU default",
+      out["captured"][0]["body"].get("options", {}).get("num_gpu") == 0, out)
+
+# 4b. "auto" is the escape hatch back to Ollama's own placement, and it must be EXPLICIT.
+out = probe(MEMBOT_OLLAMA_EMBED_NUM_GPU="auto")
+check("auto: no num_gpu sent, so Ollama places it",
+      "num_gpu" not in out["captured"][0]["body"].get("options", {}), out)
+out = probe(MEMBOT_OLLAMA_EMBED_NUM_GPU="AUTO")
+check("auto: case-insensitive",
       "num_gpu" not in out["captured"][0]["body"].get("options", {}), out)
 
 # 5. The two knobs are independent and compose.
