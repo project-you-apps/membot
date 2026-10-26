@@ -1333,7 +1333,18 @@ def _anon_session_from_request(request, body_fallback: str = "") -> str:
         safe = re.sub(r"[^A-Za-z0-9_-]", "", hdr)[:64]
         if safe:
             return f"anon_{safe}"
-    return body_fallback
+
+    # ⛔ THE BODY FALLBACK USED TO BE RETURNED RAW, which made the docstring's namespace
+    # promise false on exactly one path (2026-10-25). The header path prefixes `anon_` so a
+    # tab can never name a `user_<uuid>` slot; the body path did not, so a REST caller could
+    # send {"session_id": "user_<someone-else>"} and land in that user's session. Nothing of
+    # ours relies on the raw value -- the demo page always sends X-Membot-Session -- so the
+    # fix is to refuse the two RESERVED PREFIXES rather than to prefix the body value, which
+    # would silently rename sessions for any script that picks its own name.
+    fb = re.sub(r"[^A-Za-z0-9_-]", "", (body_fallback or "").strip())[:64]
+    if not fb or fb.startswith(("user_", "anon_")):
+        return ""
+    return fb
 
 
 def _owner_id_to_uuid_bytes(owner_id: str | None) -> np.ndarray:
@@ -2580,8 +2591,21 @@ async def rest_mount(request: Request) -> JSONResponse:
         # onboarding over REST. If asked and the server is writable, initialize an empty knowledge
         # cart in CARTRIDGE_DIRS[0] so the mount succeeds. Opt-in so a typo doesn't silently spawn
         # a cart; per-user Mempack auto-creation is out of scope here. (Kimi friction #2, 2026-07-21.)
+        # ⛔ GATE THROUGH _write_blocked, NOT AN OPEN-CODED read_only (2026-10-25).
+        # dp wrote this line on 07-22 as `not _server_config.get("read_only")`; we
+        # centralized every write gate into _write_blocked on 08-01, whose own docstring
+        # says why: "ONE place, so the two gates cannot drift apart. Before this, every
+        # write site open-coded _server_config.get('read_only')." Neither of us was wrong
+        # on our own date -- the drift is the cost of the fork. Left as-is, a cart mounted
+        # read_only=True for this session would be refused by every other write path and
+        # still able to create a new .cart.npz on disk through this one.
         created = False
-        if bool(data.get("auto_create", False)) and not _server_config.get("read_only") and not _cartridge_exists(name):
+        if bool(data.get("auto_create", False)) and not _cartridge_exists(name):
+            blocked = _write_blocked(_get_session(session_id))
+            if blocked:
+                return JSONResponse(
+                    {"status": "error", "error": f"{blocked} auto_create is disabled."},
+                    status_code=403, headers=_cors_headers())
             _create_empty_cartridge(name)
             created = True
 
@@ -2700,10 +2724,25 @@ async def rest_save(request: Request) -> JSONResponse:
     try:
         data = await request.json() if await request.body() else {}
         name = data.get("name", "")
-        session_id = data.get("session_id", "")
+
+        # ⛔ THE BUG THIS FIXES (dp, 2026-07-22): this called save_cartridge() with NO
+        # ARGUMENTS, so the body was ignored and _resolve_session_id("") returned "default".
+        # Every REST save wrote the "default" session, whoever asked. Harmless when one
+        # shared slot was all there was; wrong since 2026-10-17, when every visitor got
+        # their own session and /api/save kept writing someone else's.
+        #
+        # ⚠ BUT NOT dp's MECHANISM. His fix read session_id straight from the body, which
+        # is right for a single-seat script and wrong here: a save is a WRITE, and taking
+        # the target session from caller-supplied data lets a visitor save into a session
+        # that is not theirs. DERIVE it exactly as rest_mount does -- JWT first, then the
+        # X-Membot-Session tab header -- so the body may name the CARTRIDGE and never the
+        # SESSION.
+        user_id = _get_user_id_from_request(request)
+        session_id = _session_id_for_user(
+            user_id,
+            fallback=_anon_session_from_request(request, data.get("session_id", "")))
+
         _call = getattr(save_cartridge, 'fn', save_cartridge)
-        # save_cartridge(name="", session_id="") — pass the body through so a
-        # REST caller can name a new cartridge (previously ignored). Mirrors rest_mount.
         result = _call(name=name, session_id=session_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
@@ -8004,6 +8043,37 @@ def _rate_limit_applies(client_ip: str) -> bool:
     return not (RATE_LIMIT_LOOPBACK_EXEMPT and _is_loopback(client_ip))
 
 
+def _bind_is_loopback(host: str) -> bool:
+    """True if binding to `host` means 'this machine only'.
+
+    ⚠ A DIFFERENT QUESTION FROM _is_loopback ABOVE, and the difference is load-bearing.
+    That one answers "did this REQUEST come from loopback", about an address another
+    party chose. This one answers "is this BIND ADDRESS unreachable from the network",
+    about a string the operator typed -- and `--host localhost` is a legal, common way
+    to type it. ipaddress.ip_address("localhost") raises, so the parsed client-IP test
+    would call it public and refuse to start a correctly-configured local server.
+
+    ⇒ The hostname is special-cased, explicitly and narrowly. Everything else parses.
+
+    Replaces a string set `{"127.0.0.1", "::1", "localhost", "127.0.0.0/8"}` plus a
+    startswith("127.") (2026-10-25). Two defects, one of them silent:
+      - "127.0.0.0/8" was a CIDR string in a set compared against a plain host, so it
+        could never match anything a user would type;
+      - the set lived in main() under the name `_is_loopback`, SHADOWING the function
+        above inside that scope. Nothing called it there, so it worked by luck.
+    """
+    h = (host or "").strip().lower()
+    if h in ("localhost", "localhost.localdomain"):
+        return True
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return (mapped or ip).is_loopback
+
+
 def _check_rate_limit(client_id: str) -> bool:
     """Returns True if request is allowed, False if rate-limited."""
     now = time.time()
@@ -10213,10 +10283,9 @@ if __name__ == "__main__":
         # ⭐ Composes with the --host default, which is now 127.0.0.1: reaching the
         # refused state takes TWO deliberate acts, typing --host 0.0.0.0 and
         # --writable. Exposure is no longer something you get by default.
-        _LOOPBACK = {"127.0.0.1", "::1", "localhost", "127.0.0.0/8"}
-        _is_loopback = args.host in _LOOPBACK or args.host.startswith("127.")
+        bind_loopback = _bind_is_loopback(args.host)
         _writable = not _server_config["read_only"]
-        if _writable and not _is_loopback and not api_key:
+        if _writable and not bind_loopback and not api_key:
             log.error("REFUSING TO START: writable + reachable from the network + no key.")
             log.error(f"  --host {args.host} accepts connections from other machines,")
             log.error("  --writable enables memory_store and save_cartridge,")
@@ -10230,7 +10299,7 @@ if __name__ == "__main__":
 
         _setup_http_middleware(api_key)
         log.info(f"HTTP server starting on {args.host}:{args.port}")
-        if _is_loopback:
+        if bind_loopback:
             log.info("Bound to loopback — not reachable from other machines.")
         elif api_key:
             log.info("Bound to a public interface, API key required.")

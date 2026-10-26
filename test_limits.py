@@ -21,7 +21,13 @@ import subprocess
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_MEMBOT_DIR = os.path.dirname(_HERE)
+# Find the directory that actually holds membot_server.py rather than assuming this file's
+# depth. Moved here from tests/ on 2026-10-25 -- as a pytest module its module-level
+# sys.exit() aborted COLLECTION of the whole suite, so it lives beside the other
+# script-style tests instead. `dirname(_HERE)` was correct in tests/ and pointed one level
+# above the repo from here, which is the kind of breakage a move should not be able to cause.
+_MEMBOT_DIR = _HERE if os.path.exists(os.path.join(_HERE, "membot_server.py")) \
+    else os.path.dirname(_HERE)
 
 failures = []
 
