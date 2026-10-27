@@ -6388,6 +6388,7 @@ def walk_associate_core(
     walk_max_show: int = 10,
     temperature: float = 0.0,
     session_id: str = "",
+    cart_id: str = "",
 ) -> dict:
     """Library-level walk_associate entry point. Returns a structured dict.
 
@@ -6406,7 +6407,15 @@ def walk_associate_core(
         walk_max_show: Maximum "missed" items to surface (default 10)
         temperature: 0.0 = deterministic walk (default); 0.1-1.0 adds noise
             to walk-hop queries for basin escape
-        session_id: Session identifier (uses default session if empty)
+        session_id: Session identifier (uses default session if empty).
+            Ignored when cart_id is given.
+        cart_id: Walk a cart mounted through `multi_cart` instead of the
+            caller's session. ⭐ HUB's seam, asked 2026-06-17 and answered
+            2026-10-24: the sidecar mounts via `multi_cart.mount(path)`, which
+            `mount_cartridge` cannot do because it resolves a registry NAME
+            against membot's depot rather than an arbitrary `.cart.npz` path.
+            Without this, a cart the sidecar mounted was unreachable from walk.
+            Empty (default) = today's behaviour exactly.
 
     Returns:
         dict with the following shape:
@@ -6460,14 +6469,54 @@ def walk_associate_core(
         result["error"] = f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
         return result
 
-    session_id = _resolve_session_id(session_id)
-    state = _get_session(session_id)
-    log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, session={session_id})")
+    # ──────────────────────────────────────────────────────────────────────
+    # STATE RESOLUTION — a session, or a multi_cart mount. ONE place.
+    #
+    # ⭐ `_new_cart_state()` in multi_cart carries the comment "Same shape as
+    #   _new_session in membot_server". The two were built to match and never
+    #   joined; this is the join. Of the ten keys walk touches, eight are
+    #   identical across both. Only two differ, and only one needs mapping:
+    #     cartridge_name -> cart_name   (3 reads: the guard, result, the header)
+    #     query_count                   (a WRITE, already .get()-defensive)
+    #
+    # ⚠ `owns_state` exists because a multi_cart entry is a SHARED module-global
+    #   (`_mounted_carts[cart_id]`), not this caller's private session dict, and
+    #   up to `_default_search_slots()` walks can run concurrently. A read path
+    #   must not mutate a shared payload, so the per-session query counter is
+    #   skipped for pooled carts rather than racing on someone else's dict.
+    # ──────────────────────────────────────────────────────────────────────
+    if cart_id:
+        # Local import: `import multi_cart as _mc` sits at module scope but far
+        # BELOW this function, so referencing it here would read as a forward
+        # reference even though load order makes it work. multi_cart imports
+        # nothing from this module (the shared helpers moved to cart_io.py on
+        # 2026-08-01 precisely to break that cycle), so this is cheap and safe.
+        import multi_cart as _mc_local
+        state = _mc_local.get_cart(cart_id)
+        if state is None:
+            # Name what IS mounted. A bare "not mounted" makes the caller guess
+            # between a typo and an unmounted cart, and those have different fixes.
+            mounted = sorted(m["cart_id"] for m in _mc_local.list_mounts())
+            result["error"] = (
+                f"cart_id '{cart_id}' is not mounted. "
+                + (f"Mounted: {', '.join(mounted)}. " if mounted else "No carts are mounted. ")
+                + "Use multi_cart.mount() first, or omit cart_id to walk the session.")
+            return result
+        cart_label = state.get("cart_name") or cart_id
+        owns_state = False
+        log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, cart_id={cart_id})")
+    else:
+        session_id = _resolve_session_id(session_id)
+        state = _get_session(session_id)
+        owns_state = True
+        log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, session={session_id})")
 
-    if state["cartridge_name"] is None:
-        result["error"] = "No cartridge mounted. Use mount_cartridge first."
-        return result
-    result["cart"] = state["cartridge_name"]
+        if state["cartridge_name"] is None:
+            result["error"] = "No cartridge mounted. Use mount_cartridge first."
+            return result
+        cart_label = state["cartridge_name"]
+
+    result["cart"] = cart_label
 
     has_embeddings = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
     if not has_embeddings:
@@ -6586,15 +6635,19 @@ def walk_associate_core(
                 "next": r["next"],
             })
 
-        state["query_count"] = state.get("query_count", 0) + 1
-        _log_activity(session_id, "walk",
+        # Only a session owns a query counter. A pooled multi_cart entry is shared
+        # across callers and threads; incrementing it here would be a read path
+        # writing someone else's dict. See the resolution block above.
+        if owns_state:
+            state["query_count"] = state.get("query_count", 0) + 1
+        _log_activity(session_id or f"cart:{cart_id}", "walk",
                       f"'{query[:40]}' -> primary={len(result['primary'])} missed={len(result['missed'])}",
                       elapsed_ms)
 
         result["elapsed_ms"] = elapsed_ms
         result["header"] = (f"Walk [primary+walk-hop, temp={temperature:.2f}]: "
                             f"{len(result['primary'])} primary + {len(result['missed'])} missed from "
-                            f"'{state['cartridge_name']}' ({elapsed_ms:.0f}ms)")
+                            f"'{cart_label}' ({elapsed_ms:.0f}ms)")
 
     except Exception as e:
         log.error(f"Walk error: {e}")
@@ -6661,6 +6714,7 @@ def walk_associate(
     walk_max_show: int = 10,
     temperature: float = 0.0,
     session_id: str = "",
+    cart_id: str = "",
 ) -> str:
     """Walk the substrate from a seed query to surface associations beyond direct matches.
 
@@ -6704,6 +6758,7 @@ def walk_associate(
         walk_max_show=walk_max_show,
         temperature=temperature,
         session_id=session_id,
+        cart_id=cart_id,
     )
     return _format_walk_text(result, walk_min_hits)
 
