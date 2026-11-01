@@ -67,6 +67,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -103,7 +104,18 @@ GENESIS_PREV_HASH = "sha256:" + ("0" * 64)
 # ask "show me every permission change" and trust the answer. Adding a verb here is a
 # deliberate act, and that is the point.
 VALID_SURFACES = ("CLI", "VSC", "WEB", "MCP")
-VALID_OPS = ("store", "tombstone", "corroborate", "supersede", "perm_change", "flag")
+# ⚠ A CLOSED VOCABULARY ON PURPOSE. `append` refuses an unknown verb rather than
+# recording it, so the set of things that can have happened to a document stays something
+# a reviewer can enumerate. Adding a verb is a deliberate edit here, not an argument at a
+# call site -- and this list earned that design on 2026-11-01, when wiring note_add to the
+# journal passed op="note", was refused, and the refusal was the only reason anyone
+# noticed the entry was missing.
+#
+# `note` was added that day: the six original verbs came from DESIGN-WAL-2026-09-02 §5,
+# written before sticky notes existed. A note is a genuine event in a document's history
+# -- somebody recorded why it is the way it is -- and sharing one is a `perm_change`.
+VALID_OPS = ("store", "tombstone", "corroborate", "supersede", "perm_change", "flag",
+             "note")
 
 # A payload with an inlined embedding is the expected large case (§4: serialize the
 # embedding, do not re-embed on replay -- re-embedding makes replay model-version
@@ -403,6 +415,17 @@ def append(journal_path, writer: str, surface: str, op: str, target: dict,
             fh.flush()
             os.fsync(fh.fileno())
 
+        # ⚠ AFTER the journal write, never before. If this fails the entry is still in the
+        # chain and the mark is merely stale, which verify() reports as a mark BEHIND the
+        # file -- an anomaly, but a recoverable one. Writing the mark first and then
+        # failing to append would claim an entry that does not exist, which is worse: it
+        # would make a clean journal look truncated for ever.
+        try:
+            _write_hwm(path, entry["seq"], entry["hash"])
+        except Exception as e:                         # noqa: BLE001
+            # Still under the lock, so no concurrent appender can interleave here.
+            entry["_hwm_error"] = str(e)
+
         out = dict(entry)
         out["_locked"] = lock.locked
         out["_lock_error"] = lock.error
@@ -412,6 +435,73 @@ def append(journal_path, writer: str, surface: str, op: str, target: dict,
 def append_to_cart(cart_path, *args, **kwargs) -> dict:
     """`append()` against the journal sidecar of a cart. Convenience, same semantics."""
     return append(journal_path_for(cart_path), *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# high-water mark
+# ---------------------------------------------------------------------------
+#
+# ⛔⛔ THE GAP THIS CLOSES, FOUND BY TEST 2026-11-01. A hash chain detects a tampered
+#    entry, a reordered pair and a DELETED INTERIOR entry, because all three break the
+#    link to the next record. It does NOT detect deletion of complete TRAILING entries:
+#    drop the last two lines and what remains is a shorter chain that verifies perfectly.
+#    Nothing inside the file can know the removed entries ever existed.
+#
+#    ⚠ So DESIGN-WAL-2026-09-02 §2 requirement 3 -- "deletion and reordering both break
+#      the chain" -- is true for interior deletion and FALSE for the tail. That matters
+#      more than the average gap, because truncating the tail is the EASIEST attack and
+#      the most useful one: it is how someone hides the thing they just did.
+#
+#    ⓘ Note this is a different failure from `truncated_tail` in verify(), which is a
+#      TORN last line from a crash mid-write. A clean removal at an entry boundary leaves
+#      no tear to find.
+#
+# ⇒ The mark is `{seq, hash}` of the newest entry, in a sidecar beside the journal. A
+#   trailing deletion now has to edit a SECOND file to stay invisible, and the two can be
+#   backed up, shipped or permissioned separately.
+#
+# ⛔ THIS IS TAMPER-EVIDENCE, NOT TAMPER-PROOFING, and the difference should never be
+#   blurred when describing it to a buyer. Someone with write access to the directory can
+#   update both files. The only construction that makes trailing deletion detectable by a
+#   party who does not trust us is EXTERNAL ANCHORING -- periodically publishing the head
+#   hash somewhere we do not control, which is what the design meant by "public
+#   anchoring". That remains unbuilt and is a deliberate decision, not an oversight.
+HWM_SUFFIX = ".hwm"
+
+
+def hwm_path_for(journal_path) -> Path:
+    return Path(journal_path).with_name(Path(journal_path).name + HWM_SUFFIX)
+
+
+def _write_hwm(journal_path, seq: int, entry_hash: str) -> None:
+    """Record the newest entry. Written atomically by replacement: unlike the journal,
+    this file is a CURRENT VALUE rather than a history, so replacing it is correct."""
+    path = hwm_path_for(journal_path)
+    payload = {"format": FORMAT, "version": VERSION, "seq": seq, "hash": entry_hash}
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def read_hwm(journal_path) -> dict | None:
+    """The recorded high-water mark, or None if absent or unreadable."""
+    path = hwm_path_for(journal_path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "seq" not in data or "hash" not in data:
+        return None
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +670,57 @@ def verify(journal_path) -> dict:
         dupes = sorted({s for s in seqs if s in seen or seen.add(s)})
         verdict["duplicate_seqs"] = dupes
         verdict["missing_seqs"] = [s for s in range(1, max(seqs) + 1) if s not in seen][:64]
+    # ⛔ THE TRAILING-DELETION CHECK. Everything above validates the file against itself,
+    # which cannot see entries that are no longer in it. This is the only check here that
+    # consults a fact stored OUTSIDE the journal.
+    hwm = read_hwm(path)
+    verdict["hwm_present"] = hwm is not None
+    verdict["hwm_seq"] = hwm.get("seq") if hwm else None
+    if hwm and seqs:
+        last_seq = max(seqs)
+        last_hash = next((e.get("hash") for _, _, e, _ in reversed(lines)
+                          if isinstance(e, dict) and e.get("seq") == last_seq), None)
+        gap = hwm.get("seq", 0) - last_seq
+        torn = bool(verdict.get("truncated_tail"))
+        if gap == 1 and torn:
+            # ⭐⭐ A CRASH MID-WRITE, NOT AN ATTACK -- and the mark is what makes the two
+            # distinguishable. The mark is written after the journal line is fsynced, so a
+            # process killed between those two steps leaves exactly this: the newest entry
+            # physically TORN in the file, with the mark one ahead.
+            #
+            # ⛔ Getting this wrong would break crash recovery, which is the whole point of
+            #    replay-on-boot (§4): a torn tail must be TOLERATED, so treating it as
+            #    deletion would make the server refuse to start after any hard kill. This
+            #    file's own tail-read comment said "a torn tail and a tampered tail look
+            #    the same" -- with the mark they no longer do, which is strictly better
+            #    than what was there before.
+            verdict["torn_tail_confirmed_by_hwm"] = True
+        elif gap > 0:
+            # Entries that were recorded are no longer in the file.
+            breaks.append({
+                "line_no": len(lines),
+                "seq": last_seq,
+                "reasons": ["entries_deleted_from_tail"],
+                "detail": (f"high-water mark records seq {hwm.get('seq')} but the file "
+                           f"ends at seq {last_seq} -- "
+                           f"{hwm.get('seq', 0) - last_seq} trailing entr"
+                           f"{'y' if hwm.get('seq', 0) - last_seq == 1 else 'ies'} "
+                           f"removed"),
+            })
+        elif hwm.get("seq") == last_seq and last_hash and hwm.get("hash") != last_hash:
+            # Same length, different content: the last entry was rewritten.
+            breaks.append({
+                "line_no": len(lines),
+                "seq": last_seq,
+                "reasons": ["tail_entry_rewritten"],
+                "detail": (f"high-water mark hash for seq {last_seq} does not match the "
+                           f"entry now in the file"),
+            })
+        # hwm BEHIND the file is not a break: an append whose mark write failed leaves a
+        # stale mark, and the chain itself is intact. Reported so it is visible.
+        elif hwm.get("seq", 0) < last_seq:
+            verdict["hwm_stale"] = True
+
     verdict["breaks"] = len(breaks)
     verdict["first_break"] = breaks[0] if breaks else None
     verdict["ok"] = not breaks

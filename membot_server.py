@@ -342,6 +342,65 @@ def _log_activity(session_id: str, action: str, detail: str = "", latency_ms: fl
         _sessions[session_id]["last_action"] = f"{action} {detail}".strip()
         _sessions[session_id]["last_action_time"] = time.time()
 
+
+def _journal_event(session_id: str, op: str, target: dict, payload: dict | None = None,
+                   cart_path=None) -> dict | None:
+    """Record ONE mutation in the cart's append-only journal. Returns the entry, or None.
+
+    ⛔ WHY THIS EXISTS AND `_log_activity` ABOVE IS NOT ENOUGH (DESIGN-WAL-2026-09-02 §1):
+    `_depot_activity` is a bounded Python list. It is gone on restart. Every permission
+    change, every tombstone, every store was being written to a ring buffer and forgotten,
+    which means the only event record the system kept did not survive a reboot. For a
+    provenance claim that is the same as having none.
+
+    ⚠ MUTATIONS ONLY, deliberately. `_log_activity` fires on reads too, and a journal
+      entry per search would make the ledger mostly noise and put a disk append on the
+      search path. The claim this supports is about what happened TO an item in the
+      corpus -- who put it there, what it supersedes, who changed its permissions.
+
+    ⛔⛔ THIS IS NOT YET "NO BYPASS", AND SAYING SO IS THE POINT. Requirement 1 of the
+      design is that every mutation produces a record BECAUSE THERE IS NO OTHER WAY TO
+      MUTATE -- an architectural property, achieved by funnelling every mutation through
+      one door. Today this is called from the mutation sites we know about, which makes it
+      a courtesy at each one, exactly the shape `object_access.audit()` turned out to be
+      (measured 2026-11-01: returns a string, two callers, both print to stdout, and the
+      object-level one has no callers at all). The unjournaled paths are enumerated in
+      docs/AUDIT-membot-mutation-paths-2026-11-01.md. ⇒ Until that funnel exists the
+      honest sentence is "we journal the writes we route through here", NOT "every write
+      is journaled".
+
+    ⭐ The writer is resolved rather than taken on trust, and HOW it was resolved travels
+      with the entry. A journal that cannot tell a verified identity from a string
+      somebody typed records nothing an auditor will accept.
+    """
+    try:
+        if cart_path is None:
+            state = _sessions.get(session_id) or {}
+            cart_path = state.get("cartridge_path")
+        if not cart_path:
+            # No cart on disk means no sidecar to append to. A Mempack or an unsaved
+            # in-memory mount is not an error; it simply has nowhere to put a ledger yet.
+            return None
+
+        resolved = _resolve_seat(session_id)
+        row = seat_identity.seat_for_journal(resolved)
+        body = dict(payload or {})
+        # Identity provenance rides ON the entry, not in a parallel log that could be
+        # separated from it.
+        body["identity_source"] = row["identity_source"]
+        if row["identity_overridden"]:
+            body["identity_overridden"] = True
+        if row["identity_refused"]:
+            body["identity_refused"] = True
+
+        return journal.append_to_cart(cart_path, writer=row["writer"], surface="MCP",
+                                      op=op, target=target, payload=body)
+    except Exception as e:                             # noqa: BLE001
+        # ⚠ A journal append must never take down the operation it is recording. But a
+        # silent failure is how a ledger develops holes, so this is logged at error.
+        log.error(f"journal append FAILED (op={op}, session={session_id}): {e}")
+        return None
+
 # session_id → session state dict
 _sessions: dict[str, dict] = {}
 
@@ -860,6 +919,7 @@ import seat_identity
 # journal would both be at their do-nothing default while looking installed.
 import redact
 import journal
+import note_store
 
 # One store per cart DIRECTORY, so overlays travel beside the cart they describe.
 _OVERLAY_STORES: dict = {}
@@ -5728,6 +5788,130 @@ def proposals(status: str = "open", session_id: str = "") -> str:
 
 
 @mcp.tool()
+def note_add(idx: int, kind: str, body: str, scope: str = "private",
+             surface: str = "CLI", session_id: str = "") -> str:
+    """Attach a sticky note to a passage — the WHY behind it, for whoever reads it next.
+
+    Every record system stores who touched what and when. Almost none store WHY, because
+    why has to be captured at the moment of the decision and cannot be reconstructed
+    afterward. This is that field.
+
+    `kind` is one of: why (the reasoning behind this), context (what a reader needs to
+    know that the passage does not say), caution (a trap in here), decision (what was
+    settled and by whom), prediction (what you expect to happen, so it can be checked
+    later).
+
+    ⛔ A note is born PRIVATE. Nothing else can see it until you explicitly share it with
+    `note_share` — a shared "why" that is on by default is surveillance, not memory.
+
+    Notes are append-only. To correct one, write a new note; nothing is edited in place,
+    and a correction cannot widen who can see the original.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not HAS_OVERLAYS:
+        return f"Notes unavailable (modules not importable: {OVERLAY_IMPORT_ERROR})."
+    if not state.get("cartridge_path"):
+        return "Notes need a cart on disk; this mount has no path."
+
+    texts = state["texts"]
+    if not (0 <= idx < len(texts)):
+        return f"Out of range for this cart ({len(texts)} passages): {idx}."
+
+    # ⚠ Content-keyed, NEVER index-keyed, for the same reason proposals are: an index
+    # points at a stranger after the next reindex, and a note is precisely the artifact
+    # someone reads months later.
+    target_key = _subcart_content_key(texts[idx])
+    try:
+        entry = note_store.add_note(state["cartridge_path"], target_key, kind, body,
+                                    by=session_id, surface=surface, scope=scope)
+    except ValueError as e:
+        return f"Refused: {e}"
+    except Exception as e:                             # noqa: BLE001
+        log.error("note_add failed: %s", e)
+        return f"Could not write the note: {type(e).__name__}: {e}"
+
+    _journal_event(session_id, "note", {"cart": state.get("cartridge_name"), "idx": idx},
+                   {"note_id": entry["id"], "kind": kind, "scope": entry["scope"]})
+
+    where = "only you can see it" if entry["scope"] == "private" else "shared with the cart"
+    return (f"Note {entry['id']} ({kind}) attached to passage {idx} — {where}. "
+            f"It will ride along with future search results that return this passage.")
+
+
+@mcp.tool()
+def notes(idx: int = -1, session_id: str = "") -> str:
+    """The sticky notes you can see on this cart, or on one passage if `idx` is given.
+
+    Shows your own private notes plus every shared note. ⛔ Never another seat's private
+    notes — that boundary is the whole reason a note can be written honestly.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("texts"):
+        return "No cartridge mounted."
+    if not state.get("cartridge_path"):
+        return "Notes need a cart on disk; this mount has no path."
+
+    texts = state["texts"]
+    target_key = ""
+    if idx >= 0:
+        if not (0 <= idx < len(texts)):
+            return f"Out of range for this cart ({len(texts)} passages): {idx}."
+        target_key = _subcart_content_key(texts[idx])
+
+    found = note_store.list_notes(state["cartridge_path"], seat=session_id,
+                                  target_key=target_key)
+    if not found:
+        where = f"passage {idx}" if idx >= 0 else state.get("cartridge_name")
+        return f"No notes you can see on {where}."
+
+    # Map content keys back to current positions so a note is actionable, and say so
+    # plainly when a passage has moved out of this cart rather than printing a bare key.
+    index = {}
+    for i, t in enumerate(texts):
+        index.setdefault(_subcart_content_key(t), i)
+
+    superseded = note_store.superseded_ids(found)
+    lines = [f"Notes on {state.get('cartridge_name')} ({len(found)}):"]
+    for n in found:
+        at = index.get(n["target_key"])
+        where_s = f"idx:{at}" if at is not None else "passage not in this cart"
+        tail = " (superseded)" if n["id"] in superseded else ""
+        lines.append(f"  [{n['id']}] {n['kind']} · {n['scope']} ({where_s}) "
+                     f"by {n['by'] or 'unknown'}{tail}\n      {n['body'][:300]}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def note_share(note_id: str, session_id: str = "") -> str:
+    """Promote one of YOUR private notes to the whole cart. Only the author may do this.
+
+    Sharing is a deliberate second act, never a setting someone else flips on your behalf.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("cartridge_path"):
+        return "Notes need a cart on disk; this mount has no path."
+    try:
+        entry = note_store.share(state["cartridge_path"], note_id, by=session_id)
+    except PermissionError as e:
+        return f"Refused: {e}"
+    except (ValueError, KeyError) as e:
+        return f"Refused: {e}"
+    except Exception as e:                             # noqa: BLE001
+        log.error("note_share failed: %s", e)
+        return f"Could not share the note: {type(e).__name__}: {e}"
+
+    _journal_event(session_id, "perm_change",
+                   {"cart": state.get("cartridge_name"), "note_id": note_id},
+                   {"note_id": note_id, "from": "private", "to": "shared"})
+    return f"Note {entry['id']} is now shared with everyone who can read this cart."
+
+
+@mcp.tool()
 def firm_hot_stack(top_k: int = 10, session_id: str = "") -> str:
     """What the ORGANISATION is warm on — not what any one person is.
 
@@ -7145,6 +7329,26 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
 
         elapsed_ms = (time.time() - t0) * 1000
         n = len(state["texts"])
+
+        # ⭐ JOURNAL THE STORE. Placed after the append succeeded, so the ledger records
+        # what is actually in the cart rather than what we intended to put there.
+        # `idx` is n-1 because `n` is the count AFTER appending and `search` reports the
+        # 0-based position -- the off-by-one documented immediately below. The journal
+        # uses the addressable number, not the display one.
+        #
+        # ⛔ The payload records that a redaction happened and WHICH KINDS, never the
+        #   value and never the original text. A journal is a durable, greppable,
+        #   backed-up file; putting the secret in it to prove we removed the secret would
+        #   defeat the filter one line after it ran.
+        _journal_event(
+            session_id, "store",
+            {"cart": state.get("cartridge_name"), "idx": n - 1},
+            {"chars": len(stored_text),
+             "tags": tags or "",
+             "redacted": bool(_secrets),
+             "redacted_kinds": sorted({f.get("kind", "?") for f in _secrets})
+                               if _secrets else []},
+        )
 
         # SAY THE HANDLE THE READER WILL ACTUALLY USE.
         #

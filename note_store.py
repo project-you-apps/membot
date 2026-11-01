@@ -134,10 +134,39 @@ def _write(cart_path, notes) -> None:
             json.dump(payload, fh, indent=2)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+# ⚠ WINDOWS, MEASURED 2026-11-01: `os.replace` fails intermittently with WinError 32
+# ("the process cannot access the file because it is being used by another process") at
+# roughly 1 run in 6. Nothing of ours holds the handle -- the file was just closed -- so
+# the usual cause is a scanner or the search indexer opening the newly created temp file
+# in the moment between close and replace. POSIX has no equivalent: a rename over an open
+# file is legal there.
+#
+# ⛔ WHY IT IS WORTH HANDLING RATHER THAN TOLERATING. The caller sees a refused write, and
+#   for this module a refused write means a note was NOT recorded. A note is the one copy
+#   of reasoning nobody can reconstruct later, so losing one to a transient lock loses the
+#   asset -- and it would look like the author never wrote it.
+#
+# ⓘ `proposal_store._write` and `membox` use this same mkstemp/replace shape and have the
+#   same latent flake. Not changed here: they are pre-existing and out of today's scope,
+#   but a reader hitting WinError 32 there should know why.
+def _replace_with_retry(tmp, path, attempts: int = 5, delay: float = 0.02) -> None:
+    for i in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            # Deliberately only PermissionError. A genuine problem -- a missing directory,
+            # a read-only volume, a bad path -- must fail immediately rather than be
+            # retried five times and then reported late.
+            if i == attempts - 1:
+                raise
+            time.sleep(delay * (2 ** i))
 
 
 def _load_writable(cart_path) -> dict:

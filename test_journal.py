@@ -254,21 +254,49 @@ def test_deleted_record_with_renumbered_seqs_is_still_detected(tmp_path):
     assert "hash_mismatch" in b["reasons"] or "prev_hash_mismatch" in b["reasons"], b
 
 
-def test_deleting_the_whole_tail_is_detected_by_the_caller_not_the_chain(tmp_path):
-    """⚠ The honest limit of a self-contained chain, pinned by a test so nobody forgets.
+def test_deleting_the_tail_is_detected_by_the_high_water_mark(tmp_path):
+    """⚠ THE ORIGINAL VERSION OF THIS TEST PINNED THE HOLE; this one pins the fix.
 
-    Chopping records off the END leaves a perfectly valid shorter chain. Nothing inside
-    the file can detect that -- detection requires an external witness (the last seq a
-    client saw, or a countersigned receipt). This test documents the hole rather than
-    pretending it is closed.
+    The insight it recorded is still exactly right and is preserved as the control below:
+    chopping records off the END leaves a perfectly valid shorter chain, and NOTHING
+    INSIDE THE FILE can detect it. Detection requires an external witness.
+
+    ⇒ 2026-11-01 added that witness -- a `{seq, hash}` mark in a sidecar, written after
+      each append. So the hole is closed to the extent that an external witness closes
+      it: a trailing deletion must now edit a SECOND file to stay invisible.
+
+    ⛔ Tamper-EVIDENCE, not tamper-proofing. Someone with write access to the directory
+      can update both files; only anchoring the head hash somewhere we do not control
+      makes this detectable by a party who does not trust us. That is still unbuilt.
     """
     p = tmp_path / "j.jsonl"
     _seed(p, 6)
     lines = _lines(p)
     _write_lines(p, lines[:3])
+
     v = journal.verify(p)
-    assert v["ok"] is True, "a truncated-at-the-end chain is internally consistent"
-    assert v["last_seq"] == 3, "and the only clue is the seq the reader remembered"
+    assert v["ok"] is False, "a cleanly truncated tail must not verify"
+    assert "entries_deleted_from_tail" in v["first_break"]["reasons"]
+    assert v["last_seq"] == 3
+    assert v["hwm_seq"] == 6, "the mark is the witness that says three entries are gone"
+
+
+def test_without_the_mark_a_truncated_tail_is_still_undetectable(tmp_path):
+    """⛔ THE CONTROL, and the original lesson kept intact: the CHAIN cannot do this.
+
+    If this ever starts failing, the chain is somehow catching trailing deletion on its
+    own, which would mean the mark is unnecessary -- and that is worth knowing rather than
+    assuming.
+    """
+    p = tmp_path / "j.jsonl"
+    _seed(p, 6)
+    lines = _lines(p)
+    _write_lines(p, lines[:3])
+    journal.hwm_path_for(p).unlink()
+
+    v = journal.verify(p)
+    assert v["ok"] is True, "a truncated-at-the-end chain IS internally consistent"
+    assert v["hwm_present"] is False
 
 
 # ---------------------------------------------------------------------------
