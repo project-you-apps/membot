@@ -81,3 +81,13 @@ Thumbs.db
 venv/
 .venv/
 .venv/
+
+# Runtime output of the ingest redaction filter (redact.append_review_log).
+# Holds kinds, offsets and fingerprints -- never the credential value, verified -- but it
+# is per-deployment operational data, not source, and it grows. Operators back it up with
+# the carts; it does not belong in the repo.
+redaction-review.jsonl
+
+# Journal and sidecar artifacts left by test runs against a cart in the tree.
+*.journal.jsonl
+*.journal.jsonl.hwm

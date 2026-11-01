@@ -920,6 +920,7 @@ import seat_identity
 import redact
 import journal
 import note_store
+import subscriptions
 
 # One store per cart DIRECTORY, so overlays travel beside the cart they describe.
 _OVERLAY_STORES: dict = {}
@@ -5833,7 +5834,11 @@ def note_add(idx: int, kind: str, body: str, scope: str = "private",
         log.error("note_add failed: %s", e)
         return f"Could not write the note: {type(e).__name__}: {e}"
 
-    _journal_event(session_id, "note", {"cart": state.get("cartridge_name"), "idx": idx},
+    # `target_key` is already in hand here -- see the note above about why the key rather
+    # than the index is the part that survives.
+    _journal_event(session_id, "note",
+                   {"cart": state.get("cartridge_name"), "idx": idx,
+                    "target_key": target_key},
                    {"note_id": entry["id"], "kind": kind, "scope": entry["scope"]})
 
     where = "only you can see it" if entry["scope"] == "private" else "shared with the cart"
@@ -5886,6 +5891,123 @@ def notes(idx: int = -1, session_id: str = "") -> str:
 
 
 @mcp.tool()
+def watch(idx: int = -1, session_id: str = "") -> str:
+    """Subscribe to a passage, or to the whole cart if `idx` is omitted.
+
+    Then `what_changed()` tells you what happened to the things you watch — who changed
+    them, whether that person's identity was verified, what the change supersedes, and the
+    notes explaining why.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("cartridge_path"):
+        return "Watching needs a cart on disk; this mount has no path."
+
+    target_key, scope = "", "cart"
+    if idx >= 0:
+        texts = state.get("texts") or []
+        if not (0 <= idx < len(texts)):
+            return f"Out of range for this cart ({len(texts)} passages): {idx}."
+        target_key, scope = _subcart_content_key(texts[idx]), "passage"
+
+    try:
+        row = subscriptions.subscribe(state["cartridge_path"], session_id,
+                                      target_key=target_key, scope=scope)
+    except ValueError as e:
+        return f"Refused: {e}"
+    except Exception as e:                             # noqa: BLE001
+        log.error("watch failed: %s", e)
+        return f"Could not subscribe: {type(e).__name__}: {e}"
+
+    what = f"passage {idx}" if scope == "passage" else f"all of {state.get('cartridge_name')}"
+    already = "" if row.get("created", True) else " (already watching)"
+    return f"Watching {what} as '{session_id}'{already}. Subscription {row['id']}."
+
+
+@mcp.tool()
+def unwatch(subscription_id: str, session_id: str = "") -> str:
+    """Stop watching. Deactivates the subscription; the record of it is kept."""
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("cartridge_path"):
+        return "Watching needs a cart on disk; this mount has no path."
+    try:
+        subscriptions.unsubscribe(state["cartridge_path"], session_id, subscription_id)
+    except (ValueError, KeyError, PermissionError) as e:
+        return f"Refused: {e}"
+    except Exception as e:                             # noqa: BLE001
+        log.error("unwatch failed: %s", e)
+        return f"Could not unsubscribe: {type(e).__name__}: {e}"
+    return f"Stopped watching ({subscription_id})."
+
+
+@mcp.tool()
+def what_changed(since: int = 0, mark_seen: bool = False, session_id: str = "") -> str:
+    """What happened to the documents you watch, and WHY — not just that they changed.
+
+    ⭐ The point of this tool is the explanation, not the alert. Every document system can
+    say "this file changed." This says what the change supersedes, who made it, whether
+    that person's identity was verified or merely claimed, and what the notes on the OLD
+    version said about why it stopped being current.
+
+    `since` defaults to wherever you last acknowledged. Pass `mark_seen=True` to
+    acknowledge what this call returns.
+
+    ⛔ If the provenance journal's hash chain is broken, this says so and withholds the
+    rows rather than presenting them as a record. Changes read out of a journal that may
+    have been edited are not evidence.
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    if not state.get("cartridge_path"):
+        return "Watching needs a cart on disk; this mount has no path."
+
+    # ⚠ The resolver covers entries written BEFORE target_key was stamped onto the journal
+    # target (2026-11-01). New entries carry the key and need no lookup; without this,
+    # older index-only entries would silently fail to match a passage subscription, and a
+    # silent zero is the one answer this tool must never give.
+    texts = state.get("texts") or []
+    resolver = ({i: _subcart_content_key(t) for i, t in enumerate(texts)}
+                if HAS_OVERLAYS and texts else None)
+
+    try:
+        res = subscriptions.what_changed(state["cartridge_path"], session_id,
+                                         since_seq=since, key_resolver=resolver)
+    except Exception as e:                             # noqa: BLE001
+        log.error("what_changed failed: %s", e)
+        return f"Could not read changes: {type(e).__name__}: {e}"
+
+    # ⛔ ASCII ONLY in what this returns. A tool result gets printed to whatever console
+    # the caller has, and on Windows that is cp1252 by default: a single non-ASCII
+    # character raises UnicodeEncodeError and takes down the caller rather than the
+    # server, which makes it look like the tool returned nothing. Found exactly that way.
+    # The house ⭐/⛔ markers belong in comments and documents, never in tool output.
+    lines = [res["verdict_line"]]
+    for n in res.get("notices", []):
+        lines.append(f"  note: {n}")
+    for c in res.get("changes", []):
+        lines.append(f"  {c['headline']}")
+        for w in c.get("why", [])[:2]:
+            lines.append(f"      why: {w['body'][:200]}")
+        for w in c.get("why_prior", [])[:2]:
+            lines.append(f"      why the previous version stopped being current: "
+                         f"{w['body'][:200]}")
+
+    if mark_seen and res.get("ok") and res.get("changes"):
+        # ⛔ Only after rendering, and only on request. Reading is not acknowledging: a
+        # client that advanced the mark and then failed to display would lose those
+        # changes with nothing able to tell afterwards.
+        top = max(c["seq"] for c in res["changes"])
+        try:
+            subscriptions.mark_seen(state["cartridge_path"], session_id, top)
+            lines.append(f"  — acknowledged through seq {top}.")
+        except Exception as e:                         # noqa: BLE001
+            lines.append(f"  — could NOT acknowledge: {e}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def note_share(note_id: str, session_id: str = "") -> str:
     """Promote one of YOUR private notes to the whole cart. Only the author may do this.
 
@@ -5905,8 +6027,14 @@ def note_share(note_id: str, session_id: str = "") -> str:
         log.error("note_share failed: %s", e)
         return f"Could not share the note: {type(e).__name__}: {e}"
 
+    # ⚠ `target_key` from the note itself, so this event resolves to the PASSAGE rather
+    # than only to a note id. Without it the event has no passage handle at all and a
+    # reader reports it as unresolved -- which reads as "the passage may be gone" when the
+    # truth is "this event never named one". Sharing a note genuinely IS a change to what
+    # a reader of that passage can see, so the passage is the right target.
     _journal_event(session_id, "perm_change",
-                   {"cart": state.get("cartridge_name"), "note_id": note_id},
+                   {"cart": state.get("cartridge_name"), "note_id": note_id,
+                    "target_key": entry.get("target_key", "")},
                    {"note_id": note_id, "from": "private", "to": "shared"})
     return f"Note {entry['id']} is now shared with everyone who can read this cart."
 
@@ -7340,9 +7468,16 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
         #   value and never the original text. A journal is a durable, greppable,
         #   backed-up file; putting the secret in it to prove we removed the secret would
         #   defeat the filter one line after it ran.
+        # ⭐ `target_key` as well as `idx`, and the key is the durable half. An index is
+        # only meaningful against one build of one cart: after a reindex it points at a
+        # stranger, so an index-only entry cannot be matched to anything that watches a
+        # PASSAGE rather than a position. Stamping the content key at write time means a
+        # reader never has to reconstruct the cart's state as it was to interpret the
+        # record -- which is the whole difference between a log and a provenance record.
         _journal_event(
             session_id, "store",
-            {"cart": state.get("cartridge_name"), "idx": n - 1},
+            {"cart": state.get("cartridge_name"), "idx": n - 1,
+             "target_key": _subcart_content_key(stored_text) if HAS_OVERLAYS else ""},
             {"chars": len(stored_text),
              "tags": tags or "",
              "redacted": bool(_secrets),
