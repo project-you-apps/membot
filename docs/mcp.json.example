@@ -1,21 +1,26 @@
 {
   "_comment_1": "Membot MCP server config template. Drop the 'mcpServers' entry into your MCP-aware host's config (Claude Code: .mcp.json or ~/.claude/mcp.json; Cursor: ~/.cursor/mcp.json; Windsurf: ~/.codeium/windsurf/mcp_config.json).",
-  "_comment_2": "Read access (port 8000) requires no API key. Write access (port 8040) requires an X-API-Key header — talk to your operator.",
+  "_comment_2": "Replace membot.example.internal with the host your operator gives you. This template deliberately contains no real address: it is a file people copy, and a published address is an invitation to scan it.",
+  "_comment_3": "AUTH: the server accepts 'Authorization: Bearer <key>' ONLY. An earlier version of this template told clients to send 'X-API-Key', which the server does not read -- the request is simply rejected with no indication that the header was the problem. If an operator set no key at all, the HTTP transport has no auth and the header below is ignored.",
+  "_comment_4": "PORTS are whatever your operator chose; there is nothing special about the two below. Ask rather than assume one is read-only -- write access is governed by the server's --writable flag, not by its port number.",
 
   "mcpServers": {
 
     "membot": {
-      "_comment": "Read-only Membot. List/mount/search the public hosted cartridges. No auth required.",
+      "_comment": "Read access. List/mount/search the cartridges this instance serves.",
       "type": "sse",
-      "url": "http://137.184.227.79:8000/sse"
+      "url": "http://membot.example.internal:8000/sse",
+      "headers": {
+        "Authorization": "Bearer <YOUR-API-KEY>"
+      }
     },
 
     "membot-write": {
-      "_comment": "Writable Membot. memory_store + memory_save endpoints. Replace <YOUR-API-KEY> with the key your operator gave you. Comment out this block if you don't need write access.",
+      "_comment": "Write access, if your operator runs a writable instance (memory_store + save_cartridge). Replace <YOUR-API-KEY> with the key you were given, and remove this whole block if you do not need to write.",
       "type": "sse",
-      "url": "http://137.184.227.79:8040/sse",
+      "url": "http://membot.example.internal:8040/sse",
       "headers": {
-        "X-API-Key": "<YOUR-API-KEY>"
+        "Authorization": "Bearer <YOUR-API-KEY>"
       }
     }
 
@@ -23,11 +28,12 @@
 
   "_post_setup_steps": [
     "1. Restart your MCP-aware host so it picks up the new config.",
-    "2. Verify the tools are available — typically membot.list_cartridges, membot.mount_cartridge, membot.memory_search, membot.get_status.",
-    "3. Call membot.list_cartridges to confirm connectivity. If you see a list of carts (gutenberg-classics, neuroscience-and-AI-papers, etc.), you're connected.",
-    "4. Mount a cart: membot.mount_cartridge name='neuroscience-and-AI-papers'",
+    "2. Verify the tools are available - typically membot.list_cartridges, membot.mount_cartridge, membot.memory_search, membot.get_status.",
+    "3. Call membot.list_cartridges to confirm connectivity. If you see a list of carts, you are connected.",
+    "4. Mount a cart: membot.mount_cartridge name='<one of the names listed>'",
     "5. Search it: membot.memory_search query='your query here' top_k=5",
-    "6. (Optional) If you have an API key, call membot-write.memory_store content='...' to test write access.",
-    "See AGENT_INSTRUCTIONS.md in this directory for the full agent-facing workflow."
+    "6. (Optional) If you have write access, call membot-write.memory_store content='...' to test it.",
+    "If a call fails with 'Access denied: invalid API key', check that the header is 'Authorization: Bearer <key>' and not 'X-API-Key'.",
+    "See docs/README-product.md for concepts and docs/REFERENCE-tools.md for the full tool surface."
   ]
 }
