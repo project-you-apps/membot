@@ -379,9 +379,54 @@ def _get_session(session_id: str) -> dict:
     return _sessions[session_id]
 
 
+def _resolve_seat(session_id: str) -> dict:
+    """Establish the seat for one @mcp.tool() call, preferring a VERIFIED identity.
+
+    ⛔ WHY THIS IS NOT JUST `session_id.strip()` ANY MORE (2026-11-01). Membot had two
+    request surfaces that disagreed about identity. The web/REST routes derive the seat
+    from a verified Supabase JWT via `_session_id_for_user`, and since 2026-10-25 their
+    body fallback refuses the reserved `user_`/`anon_` prefixes. The MCP tools never got
+    the same treatment: every one takes `session_id` as a plain parameter and believed it,
+    while the HTTP transport gates them with ONE SHARED BEARER TOKEN -- the same string
+    for every caller. So any holder of that key could pass
+    `session_id="user_<someone-else's-uuid>"` to `seat_hot_stack` and read that seat's
+    attention, hidden rows, subcarts or Pattern I.
+
+    ⭐ This function is the right place for the fix because it is already the chokepoint:
+    22 call sites, every per-seat tool among them. Fixing the six tools I first enumerated
+    would have left the other sixteen, which is how a gate ends up protecting part of a
+    surface.
+
+    The decision table lives in `seat_identity.resolve_seat`; see its docstring for why
+    each branch leaves working callers working. Here we only supply the request and the
+    two verifiers.
+    """
+    request = None
+    try:
+        # Only present on an HTTP transport, inside a live request. On stdio this raises
+        # or returns nothing, which is the "no identity to verify" branch -- a local pipe
+        # IS the user.
+        from fastmcp.server.dependencies import get_http_request
+        request = get_http_request()
+    except Exception:                                  # noqa: BLE001
+        request = None
+
+    return seat_identity.resolve_seat(
+        session_id,
+        request=request,
+        read_jwt=_read_jwt_from_request,
+        decode_jwt=_decode_supabase_jwt,
+    )
+
+
 def _resolve_session_id(session_id: str) -> str:
-    """Resolve empty session_id to 'default', return as-is otherwise."""
-    return session_id.strip() if session_id.strip() else "default"
+    """The seat for this call, as a plain string. See `_resolve_seat` for the rules.
+
+    Kept as a separate one-liner so the 22 existing call sites did not all have to change
+    shape; callers that need to know HOW the seat was established (for a journal entry,
+    or to report a refused impersonation) call `_resolve_seat` directly.
+    """
+    return _resolve_seat(session_id)["seat"]
 
 
 # ============================================================
@@ -796,6 +841,25 @@ try:
 except Exception as _overlay_err:                      # noqa: BLE001
     HAS_OVERLAYS = False
     OVERLAY_IMPORT_ERROR = str(_overlay_err)
+
+# ⛔ DELIBERATELY NOT IN A try/except, unlike the block above. The overlay import is
+# guarded because a deployment without those modules should lose per-seat TRACKING rather
+# than fail to boot -- degrading a feature. seat_identity is a security CHECK, and a
+# guarded import would turn a missing file into a silent fail-open: the server would come
+# up still accepting `session_id="user_<someone-else>"` from any shared-key caller while
+# every log line claimed identity was enforced. That is the "a check identical in both
+# states" failure this project keeps hitting, so a missing seat_identity.py must be a loud
+# boot failure. It is stdlib-only, so there is no dependency that can make it unavailable.
+import seat_identity
+
+# ⛔ Same reasoning, same deliberate lack of a guard. `redact` is the ingest filter that
+# makes "credentials structurally cannot enter the corpus" true rather than aspirational,
+# and `journal` is the append-only provenance record. Both are stdlib-only. A guarded
+# import of either would mean a deployment missing the file keeps ingesting and keeps
+# answering, with nothing recording that the control was absent -- the filter and the
+# journal would both be at their do-nothing default while looking installed.
+import redact
+import journal
 
 # One store per cart DIRECTORY, so overlays travel beside the cart they describe.
 _OVERLAY_STORES: dict = {}
@@ -6926,6 +6990,50 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     """
     if len(content) > MAX_TEXT_LENGTH:
         return f"Text too long ({len(content)} chars). Max is {MAX_TEXT_LENGTH}."
+
+    # ⛔⛔ INGEST REDACTION, TIERS 1+2 (2026-11-01). This is the ONLY place a secret can
+    # be stopped, and it has to be HERE rather than anywhere downstream:
+    #
+    #  · BEFORE THE EMBEDDING. `embed_text(content)` below turns the text into a vector,
+    #    and a vector computed from the original still encodes the secret. Masking the
+    #    string while keeping that vector leaves a partial leak that LOOKS clean.
+    #  · AT INGEST, NEVER AT RETRIEVAL. A read-path filter leaves the value on disk, one
+    #    bug away from being served.
+    #
+    # ⚠ `origin=""` deliberately, which disables tier 1 on this path. Tier 1 matches the
+    #   PROVENANCE of bytes -- a `.env` path, a `gh auth token` command -- and quarantines
+    #   the whole body, because a credentials file has no surrounding context worth
+    #   keeping. `tags` is not a provenance: a note legitimately tagged "env setup" would
+    #   match tier 1's command matcher and have its entire body quarantined. Tier 1
+    #   belongs on the transcript/tool-result ingest path, where a real origin exists.
+    #   Here only tier 2 (byte-level prefixed and checksummed formats) applies.
+    #
+    # ⇒ FAILS CLOSED. If the scan itself raises we refuse the store rather than storing
+    #   unscanned text. Refusing is recoverable and the caller is told; storing a
+    #   credential is not recoverable, because the embedding has already learned it.
+    try:
+        _clean, _secrets = redact.redact_text(content, origin="")
+    except Exception as _scan_err:                     # noqa: BLE001
+        log.error(f"memory_store: redaction scan failed, refusing the store: {_scan_err}")
+        return ("Refused: the ingest redaction scan failed, so this text was not stored. "
+                "Storing unscanned text is not safe. See the server log.")
+    if _secrets:
+        # The passage is KEPT with the value replaced by a fingerprint, so the context
+        # ("we set the API key and deploys started working") survives as useful memory and
+        # "was this value ever in our corpus?" stays answerable without the value being in
+        # it. ⛔ Never log the value -- only kinds.
+        content = _clean
+        _kinds = sorted({f.get("kind", "?") for f in _secrets})
+        log.warning(f"memory_store: redacted {len(_secrets)} credential(s) "
+                    f"before embedding: {', '.join(_kinds)}")
+        # The review trail. Ingest redaction is destructive and unreviewable by nature,
+        # so the one durable record that it happened must not depend on a log level.
+        # ⛔ Never fail the store because the audit append failed -- but say so loudly,
+        # because a redaction nobody can review is the part an auditor asks about.
+        try:
+            redact.append_review_log(_secrets, origin="", label="memory_store")
+        except Exception as _log_err:                  # noqa: BLE001
+            log.error(f"memory_store: redaction review log append FAILED: {_log_err}")
 
     session_id = _resolve_session_id(session_id)
     state = _get_session(session_id)
