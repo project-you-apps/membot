@@ -281,6 +281,91 @@ def test_deleting_the_tail_is_detected_by_the_high_water_mark(tmp_path):
     assert v["hwm_seq"] == 6, "the mark is the witness that says three entries are gone"
 
 
+def test_a_crash_torn_tail_is_distinguished_from_a_deletion(tmp_path):
+    """⛔⛔ THE BRANCH THAT BREAKS BOOT IF IT IS WRONG, and it had no test.
+
+    Both cases leave the mark AHEAD of the newest readable entry, so without this
+    distinction a hard kill mid-write would be reported as tampering and replay-on-boot
+    would refuse to start. The discriminator is that a crash leaves the last line
+    physically TORN, because the mark is written only after that line is fsynced.
+
+    ⚠ Asserting only "the torn case still verifies" would be a check identical in both
+      states: it would pass if the whole tail-deletion check were deleted. So this test
+      asserts BOTH SIDES in one place -- same mark offset, opposite verdicts.
+    """
+    torn = tmp_path / "torn.jsonl"
+    _seed(torn, 5)
+    raw = Path(torn).read_bytes()
+    Path(torn).write_bytes(raw[: len(raw) - 40])       # tear the newest line
+    v_torn = journal.verify(torn)
+
+    clean_cut = tmp_path / "cut.jsonl"
+    _seed(clean_cut, 5)
+    _write_lines(clean_cut, _lines(clean_cut)[:4])     # remove it cleanly instead
+    v_cut = journal.verify(clean_cut)
+
+    # Same shape of evidence: in both, the mark says 5 and only 4 entries are readable.
+    assert v_torn["hwm_seq"] == 5 and v_cut["hwm_seq"] == 5
+    assert v_torn["last_seq"] == 4 and v_cut["last_seq"] == 4
+
+    # ⓘ BOTH are `ok: False` -- a torn tail was already a break before the mark existed,
+    #   and `replay()` carries the tolerance rather than `verify()`. So "ok" is NOT the
+    #   discriminator; the REASON is, and the consequence that matters is whether the
+    #   server can still boot.
+    torn_reasons = (v_torn["first_break"] or {}).get("reasons", [])
+    cut_reasons = (v_cut["first_break"] or {}).get("reasons", [])
+
+    assert "entries_deleted_from_tail" not in torn_reasons, (
+        f"A CRASH MID-WRITE IS BEING REPORTED AS DELETION, which accuses an operator of "
+        f"tampering every time the process is killed. reasons: {torn_reasons}"
+    )
+    assert v_torn.get("torn_tail_confirmed_by_hwm") is True
+    assert "entries_deleted_from_tail" in cut_reasons, (
+        f"a clean trailing deletion was tolerated as if it were a crash, which would let "
+        f"anyone hide their last action by deleting one line. reasons: {cut_reasons}"
+    )
+
+    # ⭐ The consequence, asserted directly rather than inferred: a crash must still boot,
+    #   and a deletion must not be quietly replayed as though nothing were missing.
+    assert [e["seq"] for e in journal.replay(torn)] == [1, 2, 3, 4], (
+        "replay-on-boot cannot recover from a crash mid-write"
+    )
+    with pytest.raises(journal.JournalIntegrityError):
+        journal.replay(clean_cut)
+
+
+def test_resealing_the_final_entry_is_detected(tmp_path):
+    """The in-file chain cannot see this: rewrite the last entry, recompute its own hash,
+    and every link still agrees. The mark's recorded hash is the only witness."""
+    p = tmp_path / "j.jsonl"
+    _seed(p, 4)
+    lines = _lines(p)
+    last = json.loads(lines[-1])
+    last["payload"] = {"text": "rewritten after the fact", "embedding": [0.0]}
+    last["hash"] = journal.compute_hash(last)          # reseal it properly
+    _write_lines(p, lines[:-1] + [json.dumps(last, sort_keys=True)])
+
+    v = journal.verify(p)
+    assert v["ok"] is False, f"A RESEALED FINAL ENTRY VERIFIED CLEAN: {v['verdict_line']}"
+    assert "tail_entry_rewritten" in v["first_break"]["reasons"], (
+        f"detected, but reported as something else, so the operator is told the wrong "
+        f"thing: {v['first_break']}"
+    )
+
+
+def test_a_mark_behind_the_file_is_reported_but_not_a_break(tmp_path):
+    """A failed mark write leaves a STALE mark while the chain itself is intact. That is
+    an anomaly worth surfacing and NOT a reason to call the journal broken -- treating it
+    as tampering would turn a disk hiccup into a refusal to boot."""
+    p = tmp_path / "j.jsonl"
+    _seed(p, 4)
+    journal._write_hwm(p, 2, journal.read_hwm(p)["hash"])   # rewind the mark
+
+    v = journal.verify(p)
+    assert v["ok"] is True, "a stale mark must not invalidate an intact chain"
+    assert v.get("hwm_stale") is True, "but it must be visible, not swallowed"
+
+
 def test_without_the_mark_a_truncated_tail_is_still_undetectable(tmp_path):
     """⛔ THE CONTROL, and the original lesson kept intact: the CHAIN cannot do this.
 
