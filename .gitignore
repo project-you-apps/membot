@@ -91,3 +91,9 @@ redaction-review.jsonl
 # Journal and sidecar artifacts left by test runs against a cart in the tree.
 *.journal.jsonl
 *.journal.jsonl.hwm
+
+# The journal writer's advisory lock. Transient, recreated on every append, and the one
+# sidecar the 2026-11-02 sweep found untracked AND unignored -- which is the `git add -A`
+# footgun, in a repo that genuinely pushes. Verified never committed (absent from origin/main
+# and from all history) before adding this, so there is nothing to purge.
+*.journal.jsonl.lock
