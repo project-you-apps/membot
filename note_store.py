@@ -78,7 +78,20 @@ VERSION = 1
 #   prediction -- an expectation recorded BEFORE the outcome, which makes it falsifiable and
 #                 makes the wrong ones the informative ones. v1 stores it and does nothing
 #                 with it; scoring a prediction against its outcome is 1.5 work.
-VALID_KINDS = ("why", "context", "caution", "decision", "prediction")
+# ⚠ A KIND IS PERMANENT ON EVERY NOTE THAT USED IT. Notes cannot be deleted or edited, so
+# adding a kind later is cheap and removing one is not. Add deliberately.
+#
+# `recommendation` added 2026-11-07 (Andy). It pairs with `decision` without overlapping:
+# decision records what WAS chosen, recommendation records what someone thinks SHOULD be.
+# ⛔ It is deliberately NOT called `proposal`. That word is taken by proposal_store, which
+# is a different and stronger thing -- an agent's suggested REPLACEMENT TEXT for a passage,
+# with a resolution lifecycle (accept/reject, resolved_by). A note kind called `proposal`
+# would be that mechanism with the workflow removed: the name would promise an accept/
+# reject the note cannot deliver, and two things called "proposal" where one quietly does
+# not work is worse than either alone.
+# ⭐ A recommendation promises no workflow at all, which is why it is safe on an
+# append-only record. Acting on one is a later `decision` note, optionally superseding it.
+VALID_KINDS = ("why", "context", "caution", "decision", "prediction", "recommendation")
 
 SCOPE_PRIVATE = "private"
 SCOPE_SHARED = "shared"
