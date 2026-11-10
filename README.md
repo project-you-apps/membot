@@ -1,117 +1,46 @@
 # Membot
 
-**Brain cartridge server for AI agents.**
+**A portable memory store that agents and people read through the same tools, with attribution on every write, and no LLM in the retrieval path.**
 
-Membot is an MCP server that gives AI agents swappable, searchable memory stored on a neuromorphic substrate. Mount a brain cartridge, search it with multi-signal ranking, store new memories, swap to a different domain--all through standard [Model Context Protocol](https://modelcontextprotocol.io/) tool calls.
+Membot is an [MCP](https://modelcontextprotocol.io/) server. Point an agent at it and the agent
+gets a searchable store it can read, annotate and extend. Point a person at the same store
+through [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) and they see the
+same records, the same notes, and the same history.
 
-Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector-plus-studio), Membot uses a three-signal search pipeline--embedding cosine, binary Hamming similarity, and keyword reranking--to find results that any single method would miss. No GPU required. **No LLM required.**
+A **cartridge** — a cart — is one file. It holds passages, their embeddings, and a compact binary
+signature per passage. You can copy it, back it up, hand it to someone, or keep it on a machine
+that never touches the internet. Carts are built either by drag-and-drop in the Vector+ Studio
+front end, or with the Desktop Builder for large local builds and OCR. Both ingest your
+documents and embed them locally; building a cart does not send anything anywhere.
 
-The entire memory substrate--build, store, search, recall--runs without a single LLM call. Embeddings come from a sentence transformer (Nomic). Search is binary math. Physics is Hebbian dynamics. The only AI that touches Membot is the agent on the other end deciding what to search for.
+---
 
-> *The human brain doesn't need an LLM to remember things. Neither does Membot.*
+## Why this instead of a vector database
 
-![Membot Demo](docs/garfield-physics-demo.png)
+**Retrieval costs no tokens.** Search is a sentence-transformer embedding plus binary matching
+plus keyword reranking. No model is called to answer a query. For an agent making hundreds of
+retrievals in a run, that is the difference between a background cost and a line item.
 
-## How Search Works
+**Every write carries who, where and when.** Not an audit log bolted beside the data but an
+invariant in the format. A note written through a web browser and a note written by an agent at
+3am are both attributed, and both say which surface they came from.
 
-Membot's search blends three independent signals, each catching what the others miss:
+**Corrections never erase.** When a note is corrected, the old one is marked superseded and
+**stays** -- rendered struck through, still attributed. Nothing in the normal path removes a
+record. A reader can see that someone was wrong, who said so, and when.
 
-```text
-Query -> Nomic embed (768-dim)
-  |-- Cosine similarity (70%)       <- semantic geometry
-  |-- Hamming similarity (30%)      <- binary population code (XOR + popcount)
-  \-- Keyword reranking             <- +0.03 per hit, capped +0.12
-      -> Final ranked results
-```
+**It is a file.** No cluster, no managed service, no egress. The store is portable by
+construction, which matters when the data is not allowed to leave a building.
 
-**Cosine** captures semantic meaning. **Hamming** operates on a compact binary code (768 bits = 96 bytes per pattern) derived from the sign structure of each embedding--a form of neuromorphic population coding. **Keywords** catch surface-level matches that embedding geometry sometimes misses.
+---
 
-The binary code is computed at mount time: `bit_i = 1 if embedding_i > 0`. This sign pattern preserves the semantic fingerprint created by contrastive training (Pearson r=0.891 with full cosine), at 33x less storage.
-
-| Signal | What It Catches | Storage at 1M |
-|--------|-----------------|---------------|
-| Cosine (float32 embeddings) | Semantic similarity | 3 GB |
-| Hamming (sign-zero binary) | Population code agreement | 96 MB |
-| Keywords (raw text) | Exact term matches | (in passage text) |
-
-### Hamming-Only Mode
-
-Cartridges can ship with **only sign bits and text**--no full embeddings required. Membot auto-detects what's available and uses the best search mode:
-
-| Cart Contents | Search Mode | Storage at 2.4M |
-|---------------|-------------|------------------|
-| Embeddings + sign bits | 70% cosine + 30% Hamming + keywords | ~7.2 GB |
-| Sign bits only | Hamming + keywords | ~220 MB |
-
-Hamming-only carts achieve R@1=1.000 on 25K patterns and return high-quality results at 2.4 million scale. This makes it practical to serve massive knowledge bases from small servers--2.4 million arXiv paper abstracts search from a 3 GB cart with zero float operations.
-
-To build a Hamming-only cart, embed your passages, compute sign bits with `np.packbits((embeddings > 0).astype(np.uint8), axis=1)`, and store them in the `sign_bits` field of the cart. See `strip_embeddings.py` for an example that converts an existing cart.
-
-### Split Cart Format (Index + SQLite)
-
-For large-scale deployment where RAM is limited, Membot supports **split carts**--a two-file format that keeps the search index in RAM and stores full text on disk:
-
-| File | Format | Contents | Lives in |
-| ---- | ------ | -------- | -------- |
-| `name_index.npz` | NumPy compressed | Sign-zero bits + 200-char snippets + metadata | RAM |
-| `name_text.db` | SQLite | Full passages, titles, external IDs | Disk (paged on demand) |
-
-**How it works:** Hamming search and keyword reranking run entirely in RAM against the compact index. Only the top-K results trigger SQLite lookups (~1ms each) to fetch full passage text for display.
-
-| Format | RAM (2.4M entries) | Disk | Use Case |
-| ------ | ------------------ | ---- | -------- |
-| Standard `.pkl` | ~4 GB | ~3 GB | Local use, full portability |
-| Split `.npz` + `.db` | ~400 MB | ~4 GB | Server deployment, cheap hosting |
-
-Split carts achieve **88% RAM reduction** compared to loading everything into memory. A $12/month server can search 2.4 million entries.
-
-SQLite requires no additional server or daemon--Python's built-in `sqlite3` module reads directly from the `.db` file. Upload two files and you're done.
-
-**Building a split cart:**
-
-```bash
-# Convert any existing .pkl cart to split format
-python build_sqlite_cart.py my_cart.pkl
-
-# Custom output name and snippet length
-python build_sqlite_cart.py my_cart.pkl -o my_split_cart --truncate 300
-```
-
-The builder auto-detects compressed and uncompressed carts. Output: `my_split_cart_index.npz` + `my_split_cart_text.db`.
-
-When mounting, Membot auto-detects the SQLite sidecar and opens it for on-demand text retrieval. Search results show `hamming-only+kw+sqlite` in the mode label.
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
 - Python 3.10+
-- An MCP-compatible agent ([OpenClaw](https://github.com/anthropics/openclaw), [Claude Code](https://claude.com/claude-code), etc.)
-
-Optional (for lattice recall and training):
-- NVIDIA GPU with CUDA 11.0+
-- Pre-built CUDA engine (`lattice_cuda_v7.dll` / `.so`)
-
-### If HTTPS fails but your browser works
-
-If a first search, cart build, sign-in, or cart mount fails with
-`CERTIFICATE_VERIFY_FAILED` -- while a browser on the same machine reaches the same address
-fine -- your machine is **intercepting TLS**. Consumer antivirus (Norton, Avast, Kaspersky,
-ESET) and corporate proxies do this by presenting their own certificate. Browsers accept it
-because they verify against the OS trust store; Python verifies against a bundled CA set
-that has never heard of it.
-
-`requirements.txt` includes [`truststore`](https://pypi.org/project/truststore/), which
-routes verification through the OS store -- the same decision your browser already makes.
-A normal install handles it. **Verification stays fully on**; this changes where trust comes
-from, not whether it is checked.
-
-Watch for it especially when a cart **mount** returns 503: a TLS failure inside an access
-check is indistinguishable from a permissions outage, and the error will not mention
-certificates.
-
-Full diagnosis, an admin-facing section, and a one-line check:
-[docs/TROUBLESHOOTING-TLS-INTERCEPTION.md](../docs/TROUBLESHOOTING-TLS-INTERCEPTION.md)
+- An MCP-compatible client — [Claude Code](https://claude.com/claude-code), Claude Desktop,
+  [OpenClaw](https://github.com/anthropics/openclaw), or your own harness
 
 ### Install
 
@@ -124,890 +53,203 @@ pip install -r requirements.txt
 ### Run
 
 ```bash
-# Local (stdio)--for OpenClaw, Claude Desktop, local agents
-# Starts read-only by default. Add --writable to enable store and save.
+# Local (stdio) — for agents that launch Membot as a subprocess.
+# Read-only by default; add --writable to enable stores and saves.
 python membot_server.py
 
-# Remote (HTTP)--for any MCP client over the network (read-only by default)
+# Remote (HTTP) — for any MCP client over the network.
 python membot_server.py --transport http --port 8000
 
-# Writable mode--for personal or team servers that need store and save
+# Writable, for a personal or team server.
 python membot_server.py --transport http --port 8000 --writable
 ```
 
 | Flag | Default | Description |
-| ---- | ------- | ----------- |
-| `--transport` | `stdio` | Transport mode: `stdio`, `http`, or `sse` |
-| `--host` | `0.0.0.0` | Bind address (HTTP/SSE mode) |
-| `--port` | `8000` | Listen port (HTTP/SSE mode) |
-| `--writable` | off | Enable `memory_store` and `save_cartridge` (read-only by default) |
-
-**stdio mode**: JSON-RPC over stdin/stdout, designed for MCP agent frameworks that launch Membot as a subprocess.
-
-**HTTP mode**: Streamable HTTP on `http://{host}:{port}/mcp`. Any MCP client can connect remotely. Includes rate limiting (60 req/min per IP) and optional API key auth via `MEMBOT_API_KEY` environment variable.
-
-### Multi-Session Support
-
-Membot supports multiple concurrent sessions. Each session has its own mounted cartridge and independent state, so multiple agents can use the same server without stomping on each other.
-
-Every tool accepts an optional `session_id` parameter:
-
-```python
-# Agent A mounts its own cartridge
-mount_cartridge("medical-knowledge", session_id="agent-a")
-
-# Agent B mounts a different one — no collision
-mount_cartridge("legal-docs", session_id="agent-b")
-
-# Each searches their own mounted cartridge
-memory_search("symptoms of flu", session_id="agent-a")
-memory_search("statute of limitations", session_id="agent-b")
-```
-
-If `session_id` is omitted, all calls go to the `"default"` session (backward-compatible with single-user usage).
-
-**Session limits:**
-- Sessions expire after **30 minutes** of inactivity (configurable via `SESSION_TIMEOUT_SEC`)
-- Maximum **50 concurrent sessions** (oldest evicted when limit hit)
-- The embedding model and GPU are shared across all sessions — only the mounted cartridge state is per-session
-
-Sessions isolate *what you have mounted*. As of August 2026 they also isolate *what you have
-paid attention to* — see [Per-Seat Memory](#per-seat-memory) below.
-
-### Agent Configuration
-
-**OpenClaw** (`~/.openclaw/openclaw.json`):
-
-```json
-{
-  "plugins": {
-    "entries": {
-      "mcp-adapter": {
-        "enabled": true,
-        "config": {
-          "servers": [
-            {
-              "name": "membot",
-              "transport": "stdio",
-              "command": "python",
-              "args": ["/path/to/membot/membot_server.py"]
-            }
-          ]
-        }
-      }
-    }
-  }
-}
-```
-
-**Claude Code** (local, stdio):
-
-```json
-{
-  "mcpServers": {
-    "membot": {
-      "command": "python",
-      "args": ["/path/to/membot/membot_server.py"]
-    }
-  }
-}
-```
-
-**Claude Code** (remote, HTTP):
-
-```json
-{
-  "mcpServers": {
-    "membot": {
-      "type": "http",
-      "url": "http://your-server:8000/mcp"
-    }
-  }
-}
-```
-
-Tools will appear prefixed with `membot_` (e.g., `membot_memory_search`).
-
-**OpenClaw agent dispatch** (headless):
-
-OpenClaw agent dispatch doesn't load MCP adapter tools. Use [mcporter](https://github.com/steipete/mcporter) + a SOUL.md that instructs the agent to call Membot via Bash:
-
-```bash
-mcporter call membot.memory_search query="your query" top_k=5
-```
-
-See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working example.
-
-## What's New (August 2026)
-
-### Per-Seat Memory
-
-**A cart with two readers has no single hot list.** Two people searching the same shared brain
-are not doing the same thing, and until now Membot recorded as if they were — it tracked no
-access counts at all, so "what matters here" was a property of the cart rather than of the
-person asking.
-
-Now every seat carries its own attention: what it has read, how often, what it marked, and
-what it decided to do about it. A passage another seat has opened forty times is cold in yours
-if you have never touched it.
-
-```python
-# Each signed-in caller is already a distinct seat (session_id = user_<uuid>)
-memory_search("frustration policy", session_id="user_a")
-
-# ...and gets their own hierarchy over the shared cart
-seat_hot_stack(top_k=8, session_id="user_a")
-```
-
-The split is deliberate and worth knowing if you build on it:
-
-| lives with the CART (shared) | lives with the SEAT (private) |
-|---|---|
-| text, embeddings, `kind`, `truth_status`, duplicate marks | access counts, last-accessed, important/urgent, disposition |
-
-Attention is keyed by **content hash**, not passage index — so it survives a cart rebuild, and
-a seat's history cannot silently reattach itself to different passages. Overlays are sparse
-(one row per passage that seat has actually touched) and live in `<cart dir>/overlays/`, so
-they travel with the cart they describe.
-
-Counter-intuitively this makes writes *cheaper*: N seats write N separate files and never
-contend for the cart.
-
-### Sub-Cartridges
-
-**A named selection of a cart, stored by reference.** No passages and no embeddings are
-copied — a sub-cartridge is a parent pointer plus a list of content keys, so one cart can
-carry many views for the cost of a small key list each.
-
-```python
-# Search, see what you got, then select — indices come from memory_search results
-subcart_create("q3-invoices", indices="3,7,12,40", authored_by="user")
-subcart_list()
-subcart_delete("q3-invoices")     # manifest moves to trash; no passages removed
-```
-
-Membership can be chosen by **meaning** (a curated cluster), by **access** (what a seat may
-see), or by **curation** (a slice you intend to hand someone). The format is indifferent to
-which — it records *why* for humans reading it later, and nothing branches on it.
-
-Keys that no longer resolve are **reported, never dropped**. A passage that was tombstoned, or
-that belongs to a different mount, shows up as unresolved rather than quietly vanishing from
-someone's curated set.
-
-> **Sub-cartridges scope what you see. They are not a secrecy boundary.** A resolved
-> sub-cartridge is a mask over the parent's in-memory arrays — enough to keep payroll out of
-> your hot list, not enough to stop someone reading payroll. **Secrecy is separated by cart:**
-> a cart someone must not read is one they cannot mount.
-
-`subcart_export` materializes one into a standalone `.cart.npz`. **Export always
-materializes** — handing someone a manifest that points at a cart they cannot read is a
-broken artifact wearing a working one's costume. Link indices are remapped, not copied: on a
-real 300-passage slice, 453 references pointed outside it, and copying them verbatim would
-have pointed every one at a stranger.
-
-### The Firm View
-
-`seat_hot_stack` is what *you* are working on. `firm_hot_stack` is what the **organisation**
-is warm on — and they are not the same question.
-
-Fifty personal hot stacks do not sum to an institutional record unless the roll-up is
-deliberately kept. The signal that exists only here is **distinct seats**: one person reading
-something forty times and forty people reading it once produce the same access count and mean
-very different things about a company. Ranked by head-count first, volume second.
-
-Hiding a passage does **not** remove it from the firm view. One person should not be able to
-edit institutional memory by tidying their own list.
-
-### Hide — the free rung of the delete ladder
-
-```
-hidden     your view only      free, reversible, invisible to others
-tombstone  everyone, kept      not built yet
-purge      everyone, gone      not built yet
-```
-
-`seat_hide(indices)` drops passages out of *your* hot stack and *your* search results.
-Nothing is written to the cart; `unhide=True` puts it straight back; nobody else is affected.
-
-It exists because "this is noise TO ME" is the most common thing a person wants to say about
-a passage in a shared brain — and without it, the only options are to live with it or delete
-it for the whole company. **That is how shared knowledge gets destroyed by someone who only
-wanted a tidier list.**
-
-Hidden passages are *absent*, not ranked low, and every surface that filters them **counts
-what it filtered**. A search that quietly returns fewer results than it found is
-indistinguishable from a broken one.
-
-### Proposals — agents flag, humans decide
-
-**Membot has no destructive verbs, on purpose.** There is no edit, no delete, no purge, and a
-test asserts none exists so adding one has to be argued for rather than slipped in.
-
-Three reasons, in ascending importance:
-
-1. Appending is recoverable; deleting is not. The surface with the least human oversight
-   should get only the recoverable verb.
-2. **Agents are steerable by their inputs.** A poisoned document in a shared brain can
-   instruct an agent reading it to delete other documents. A capability that cannot be
-   reached cannot be abused.
-3. A capability whose safety only one person can verify is a single point of failure.
-
-So an agent files a proposal instead:
-
-```python
-propose_correction(idx=42, kind="outdated",
-                   body="Rotation changed to fortnightly in June; this says weekly.",
-                   suggested_text="Rotation is fortnightly.")   # never auto-applied
-
-proposals(status="open")     # read the queue; accepting is an OWNER action in the studio
-```
-
-Kinds are `correction` / `outdated` / `duplicate` / `context` / `question` — deliberately
-small, each mapping to something an owner can judge in one look. `rewrite` is **not** among
-them: a proposal that replaces a whole passage is indistinguishable from an edit, and
-reviewing it is as much work as doing it.
-
-**Open proposals ride back with search results**, so an agent needs no separate channel:
-
-```
-Search [hamming+embedding 70/30]: 5 results from 'redwood.pkl' (34ms)
-…
-⚑ 3 open proposal(s) on 2 of these passages — someone has flagged them as wrong,
-  outdated or incomplete. Run proposals() before relying on them.
-```
-
-**A comment is still a write, and that is fine.** The line is not read-vs-write, it is
-*destructive vs additive*. A proposal only appends to a sidecar, is fully reversible, and
-changes no passage — which is exactly what the `commenter` access level has always meant.
-
-> **What an agent MAY write to:** its own Mempack. That is what Mempacks are for — an agent
-> carrying its own memories. On a cart it does not own, it proposes.
-
-### Edits follow, so clusters do not break
-
-Passages are never edited in place — an edit appends and tombstones. That changes the body,
-which changes the content key, so without a recorded link every curated cluster would quietly
-shed that member and every seat's attention on it would go unresolved.
-
-Membot reads a **changes sidecar** (`<cart>.succession.json`) written by whichever product
-made the edit, and resolution follows the chain automatically — reporting that it followed,
-never silently substituting. Attention is read *through* the chain rather than migrated, so
-your forty reads survive someone fixing a typo at no write cost.
-
-### Stale writes are refused
-
-Mounts are per-session RAM copies, so two people holding one cart hold two independent
-arrays — and the second to save would silently write back whatever the first deleted.
-`save_cartridge` now checks a generation counter and refuses, naming who changed it and by
-how much. It refuses rather than merges: a refused save costs a reload, a silent one costs
-whatever the other person deleted.
-
-**See [`docs/GUIDE-MULTI-SEAT.md`](../docs/GUIDE-MULTI-SEAT.md)** for the full model,
-vocabulary, and an honest table of what is enforced where.
-
-## What's New (June 2026)
-
-### `walk_associate` -- substrate-walk MCP tool
-
-Membot now exposes **`walk_associate`** as a first-class MCP tool. Unlike `memory_search` which returns the top-K direct semantic matches, `walk_associate` additionally re-queries the substrate from each primary result's own embedding and surfaces items that appeared in multiple of those silent re-queries -- *"you may have missed"* associations the substrate found by walking outward from the seed.
-
-```python
-walk_associate(
-    query: str,
-    top_k: int = 10,              # primary results returned
-    walk_top_k: int = 0,          # per-primary walk-hop breadth (0 = auto = max(top_k*3, 20))
-    walk_min_hits: int = 2,       # min walks-to count to promote item to "may have missed"
-    walk_max_show: int = 10,      # max "may have missed" items returned
-    temperature: float = 0.0,     # 0.0 = deterministic; 0.3-0.5 = moderate serendipity; 0.7+ = high exploration
-    session_id: str = "",
-) -> str
-```
-
-**When to use `walk_associate` vs `memory_search`:**
-
-- **`memory_search`** -- direct factual lookup ("what did the user say about X?"). Returns ranked top-K. Use when the query maps to one cluster of closely-related passages and you want the obvious matches.
-- **`walk_associate`** -- exploratory discovery ("what's adjacent to X?", "who else cares about Y?", "find me collaborators around Z"). Returns direct matches PLUS items the substrate's walk discovered through associative re-querying. Use when adjacency matters as much as direct match -- member discovery, brainstorming, cross-cluster connection-finding.
-
-**The `temperature` knob**: controls how exploratory the walk is. Temperature 0.0 is deterministic -- walks each primary item's direct neighborhood. Temperature 0.3-0.5 perturbs walk-hop queries with controlled noise (basin escape) so the walk can hop to adjacent semantic neighborhoods. Temperature 0.7+ is high-exploration / brainstorming mode. Same query, different temperatures, different discovery modes.
-
-**Worked example** (gutenberg-poetry cart, 60k passages):
-
-```text
-walk_associate("love and loss", top_k=10, walk_min_hits=2, temperature=0.0)
-  -> 10 primary matches (Shakespeare sonnets, Keats elegies, etc.)
-  -> 3 "may have missed" Christina Rossetti poems -- Rossetti is famous for love-and-loss
-    work but didn't make the direct top-10; surfaced via walk-hop because multiple
-    primary items' nearest neighborhoods independently pointed at her poetry.
-
-walk_associate("love and loss", top_k=10, temperature=0.4)
-  -> Same 10 primary; missed set includes Rossetti's "Sweet Death" -- death-themed work
-    surfacing in a love-and-loss query because temperature broadened the walk into
-    adjacent themes.
-```
-
-**Calling from your own code:** [`tools/walk_associate_client_example.py`](tools/walk_associate_client_example.py) is a self-contained Python script that mounts a cart, calls `walk_associate` via MCP, and parses the response into a structured `{primary: [...], missed: [...]}` dict. Uses only `requests` (no FastMCP package needed on the client side), so the wire-level JSON-RPC protocol is visible and portable to any language. Run with defaults to hit the live droplet (`https://project-you.app/membot/mcp`) on gutenberg-poetry with "love and loss"; flags let you swap cart, query, or temperature.
-
-The architectural framing: Walk gives every LLM that mounts Membot a *tunable cognitive primitive* on top of standard retrieval. **Attention budget** = `top_k` x `walk_top_k` (how deeply the walk explores). **Goal-orientation** = `temperature` + query (where it points and how exploratory). The bridge from "external memory for LLMs" to "cognition substrate for LLMs."
-
-Mempack agents (`mempack_local_agent.py` SYSTEM_PROMPT_TEMPLATE) gained CORE BEHAVIOR #10 instructing the LLM to choose between `memory_search` and `walk_associate` based on task intent -- direct lookup vs exploratory discovery.
-
-**Roadmap (future enhancements):**
-
-- `seed_idx: int` -- when walking from a known passage index (e.g., agent clicks a result to "continue the walk"), skip text re-embedding and walk straight from the cached embedding. Pure speed win; no semantic change because sentence-transformers inference is deterministic in eval mode (no dropout, no sampling -- re-embedding the same text returns bitwise-identical vectors).
-- `walk_from: str` mode flag -- choose `"results"` (default, current: 2-hop consensus from primary results -- "what's central to my hits") vs `"seed"` (stochastic sampling of the query's own neighborhood with temperature -- "what else is near my query that just missed the top-K"). Different semantics, both useful; the consensus mode is what's load-bearing for associative-discovery v1.
-- `return_trail: bool` -- surface the actual walk path (which primary led to which neighbor) for explainability. Useful for "we surfaced X because primary item Y walked there."
-
-### Reader prompt library + dual-mode Mempack synthesis
-
-Two additions to the reader/answer-synthesis side of the stack, driven by LongMemEval architectural diagnostics that surfaced (1) a question-type taxonomy where preference/recommendation questions need fundamentally different reader posture than factual recall, and (2) a temporal-anchoring gap where relative time references in memory need an absolute date anchor to be resolvable.
-
-**[`prompts.py`](prompts.py) — explicit prompt template library.** Four named variants any client can import:
-
-```python
-from membot.prompts import RECOMMENDED_DEFAULT, READER_PROMPTS
-
-# Use the recommended dual-mode template (handles factual recall AND recommendation)
-prompt = RECOMMENDED_DEFAULT.format(context=retrieved_text, question=user_q)
-
-# Or pick a specific variant by name
-prompt = READER_PROMPTS["minimal"].format(...)
-```
-
-| Variant | Best for |
-|---|---|
-| `restrictive` | qwen-14b-class small-tier readers (legacy default) |
-| `permissive` | same long structure with deduction rules relaxed |
-| `minimal` | Sonnet/Opus single-mode factual recall |
-| `general` | Sonnet/Opus dual-mode — handles factual AND recommendation/preference questions correctly. This is `RECOMMENDED_DEFAULT`. |
-
-Membot itself does NOT apply these prompts — it's a retrieval substrate. The library publishes recommended templates for clients (benchmark runners, batch pipelines, custom agentic readers) that need a deterministic single-shot reader prompt.
-
-**Mempack agent gets the framing inline.** The local agent's [`SYSTEM_PROMPT_TEMPLATE`](tools/mempack_local_agent.py) now includes two new CORE BEHAVIORS:
-
-- **#8 — Dual-mode answering**: factual recall (answer from retrieval) vs recommendation/preference/advice (derive preferences from retrieval, then commit to a novel recommendation aligned with them). Closes the same gap LongMemEval revealed: capable readers under "answer from memory only" framing refuse recommendation queries even when they cleanly identified the relevant preferences.
-- **#9 — Temporal anchoring**: use the timestamp field already in the template as the anchor for resolving relative time references ("yesterday", "last week") to absolute dates. Prefer session-date metadata from retrieved passages when present.
-
-Net effect: a typical Mempack agent now handles both factual ("what did I say about X") and recommendation ("what should I get given what you know about me") queries correctly without per-cart Pattern I customization, and is ready to consume server-side temporal metadata projection when it ships.
+| --- | --- | --- |
+| `--transport` | `stdio` | `stdio`, `http`, or `sse` |
+| `--host` | `0.0.0.0` | Bind address (HTTP/SSE) |
+| `--port` | `8000` | Listen port (HTTP/SSE) |
+| `--writable` | off | Enables `memory_store` and `save_cartridge` |
+
+**stdio** is JSON-RPC over stdin/stdout. **HTTP** serves Streamable HTTP at
+`http://{host}:{port}/mcp`.
+
+> ⚠ **Read [Security posture](#security-posture) before exposing an HTTP server to anything but
+> loopback.** The API key and rate limit do not cover every route.
+
+### If HTTPS fails but your browser works
+
+A first search, build, sign-in or mount failing with `CERTIFICATE_VERIFY_FAILED` — while a
+browser on the same machine reaches the same address fine — means the machine is **intercepting
+TLS**. Consumer antivirus and corporate proxies do this by presenting their own certificate.
+Browsers accept it because they verify against the OS trust store; Python verifies against a
+bundled CA set that has never heard of it.
+
+`requirements.txt` includes [`truststore`](https://pypi.org/project/truststore/), which routes
+verification through the OS store. **Verification stays fully on** — this changes where trust
+comes from, not whether it is checked.
+
+⚠ Watch for it when a mount returns **503**: a TLS failure inside an access check is
+indistinguishable from a permissions outage, and the error will not mention certificates.
+Full diagnosis: [docs/TROUBLESHOOTING-TLS-INTERCEPTION.md](../docs/TROUBLESHOOTING-TLS-INTERCEPTION.md)
 
 ---
 
-## What's New (May 2026)
+## What you can do with it
 
-### Mempack — Per-Agent Writable Brain Cartridges
+Membot exposes about fifty MCP tools. Grouped by the job rather than alphabetically:
 
-A **Mempack** is a Membot cartridge an agent owns and writes to. Same lattice substrate as a knowledge cart, with three reserved slots that turn a static document into a living memory: a manifest at **Pattern 0**, behavioral instructions at **Pattern I** (idx=1), and accumulated learnings at **Pattern N+** (idx≥2). When the agent mounts its Mempack, the briefing and behavior load automatically. No prompt-stuffing, no per-session re-briefing. The cart bootstraps the agent.
+| Job | Tools |
+| --- | --- |
+| **Find things** | `memory_search` · `multi_search` · `walk_associate` · `get_passage` · `passage_links` |
+| **Mount and manage carts** | `mount_cartridge` · `unmount` · `list_cartridges` · `multi_mount` · `multi_mount_directory` · `multi_list` · `multi_unmount` · `get_status` |
+| **Annotate** | `note_add` · `notes` · `note_share` · `propose_correction` · `proposals` |
+| **Write and persist** | `memory_store` · `save_cartridge` · `get_pattern_meta` |
+| **Per-seat attention** | `seat_hot_stack` · `firm_hot_stack` · `seat_hide` · `seat_hidden` |
+| **Scoped subsets** | `subcart_create` · `subcart_list` · `subcart_export` · `subcart_delete` |
+| **Agent-owned memory (Mempack)** | `mempack_read_pattern_i` · `mempack_update_pattern_i` |
+| **Shared writable carts (Membox)** | `membox_mount` · `membox_search` · `membox_imprint` · `membox_acquire_lock` · `membox_release_lock` · `membox_lock_holder` · `membox_list` · `membox_status` · `membox_unmount` |
+| **Watch for change** | `watch` · `unwatch` · `what_changed` |
+| **Federate across machines** | `federate_publish` · `federate_consolidate` · `federate_load` · `federate_migrate_jsonl` |
 
-|Slot|Purpose|Default state|
-|---|---|---|
-|Pattern 0|Cart manifest: ownership, perms, cart_type, briefing|pinned + archival, read-only|
-|Pattern I (idx=1)|Agent's behavioral instructions, voice, persona, operating rules|pinned + archival, owner-writable|
-|Pattern N+ (idx≥2)|Accumulated findings, decisions, source links, search hits|volatile (decay-eligible), owner-writable|
-
-#### Two-Layer Persistence
-
-Mempacks split across Supabase rather than living on the Membot host's filesystem. Each user owns their data; the Membot droplet doesn't keep personal carts on disk.
-
-- **Postgres metadata** in `public.mempacks` (one row per cart) plus `public.mempack_patterns` (one row per pattern, with the 64-byte H-block exploded into native columns + 9 generated boolean/enum columns for SQL-side querying without unblobbing the cart).
-- **Binary blob** in Supabase Storage at `mempacks/<user_uuid>/<name>.cart.npz`. RLS scopes each user to their own folder; Membot uses a service-role key to read/write on the agent's behalf at mount time.
-
-Cross-Mempack search becomes a SQL JOIN over normalized H-block columns rather than fetch-all-blobs-then-filter. Free tier: 1 Mempack of 10 MB per user; Pro and Enterprise tiers tune via insert-trigger policy.
-
-#### MCP-Native Access
-
-A Mempack travels. Mount it from Claude Code today, Cursor tomorrow, a custom OpenClaw agent next week. The cart format is one file; the access protocol is MCP; provenance carries through every host.
-
-```python
-# Auto-provision on first list (Path C): empty roster -> starter primary
-GET /api/mempacks?owner_id=<supabase-uuid>
-# -> {"status": "ok", "count": 1, "auto_provisioned": true, "mempacks": [...]}
-
-# Read Pattern I via the MCP tool
-mempack_read_pattern_i(name="primary")
-# -> the agent's own behavioral instructions, fresh from Supabase
-
-# Mount and search like any cart
-mount_cartridge("primary")
-memory_search("attention mechanisms", top_k=5)
-```
-
-See [`docs/AGENT_INSTRUCTIONS.md`](docs/AGENT_INSTRUCTIONS.md) for the three access patterns (MCP / mcporter / REST) and [`docs/mcp.json.example`](docs/mcp.json.example) for a copy-paste MCP host config.
-
-#### Path C Lazy Auto-Provision
-
-The first time a user calls `GET /api/mempacks?owner_id=<uuid>` with no existing rows, Membot creates a starter `primary` Mempack: pinned + archival header, pinned + archival Pattern I with a default behavioral template, audit-log entry, status flipped to `ready` after the blob upload completes. Subsequent calls are idempotent. No signup-side trigger or service-key plumbing needed; the substrate primitive handles it directly.
-
-Set `auto_provision=false` on the query string to opt out (returns empty list without creating).
-
-#### Canonical 12-Field H-Block Format
-
-This release unifies the cart-format hippocampus on the canonical 12-field `HIPPO_FORMAT` (`<I B B I I I I H I B B 34s`, with `perms_byte` at offset 29). Legacy 11-field carts are still readable via the `format_version` discriminator at offset 4. New writes always emit canonical.
-
-The H-block (cart-format hippocampus, 64-byte struct per pattern) is distinct from the lattice-encoded H-row (64-bit physics-layer header on row 63). Two layers, two consumers: H-block for cart-format navigation + perms; H-row for F0 physics recall.
+⭐ **For agents, there is a companion document:** [AGENTS.md](AGENTS.md) that describes which tool for which
+job, what the returns mean, and the failure modes worth handling.
 
 ---
 
-## What's New (April 2026)
-
-### Multi-Cart Query — One Membot, Many Mounted Carts
-
-The single-cart `mount_cartridge` API still works exactly as before. In addition, Membot now supports a parallel **multi-cart pool** that can hold many carts mounted simultaneously and query across them with namespaced result attribution.
-
-```python
-multi_mount("./identity.cart", cart_id="me", role="identity")
-multi_mount("./gutenberg.cart", cart_id="library", role="reference")
-multi_mount("./fleet/cbp.cart", cart_id="cbp", role="federated")
-
-multi_search("uncertainty tolerance", scope="all")
-# → results attributed to source carts: [me#42], [library#9131], [cbp#3]
-```
-
-`scope` accepts `"all"`, `"local"`, a single `cart_id`, or a list. `role_filter` narrows further — `multi_search(q, role_filter="federated")` searches only federated carts.
-
-This is the foundation that turns Membot from a single-relation library into a multi-relation database. See [docs/RFC/multi-cart-query-spec.md](docs/RFC/multi-cart-query-spec.md) for the full design.
-
-### Federated Mode — Multi-Machine Brain Cart Sync
-
-Built on top of multi-cart, `federate.py` provides drop-in federation for fleets of machines that share a git directory of per-machine learning logs. Each machine writes only to its own cart (no git conflicts), consolidation finds cross-machine matches and writes them as cross-cart edges instead of dedup'ing them away.
-
-```python
-import federate
-
-# One-time migration from existing JSONL to brain carts
-federate.migrate_jsonl("shared-context/arc-agi-3/fleet-learning", in_place=True)
-
-# Daily consolidation (replaces consolidate.py)
-federate.consolidate("shared-context/arc-agi-3/fleet-learning")
-
-# Solver entry point: mount the whole fleet for cross-machine search
-federate.load_fleet("shared-context/arc-agi-3/fleet-learning")
-```
-
-The `federate.publish_session()` and `federate.consolidate()` functions are designed as drop-in replacements for Dennis Palatov's `publish_learning.py` and `consolidate.py` from the dp-web4/SAGE federated learning architecture. Same git-sync model, same per-machine append-only writes — just brain carts as the substrate instead of JSONL files.
-
-Validated against real SAGE fleet data: 28 input patterns from 2 simulated machines → 73 cross-machine confirmed pairs → 3 unique consolidated patterns in 0.4s.
-
-See [docs/RFC/federated-cart-spec.md](docs/RFC/federated-cart-spec.md) for the full design and the drop-in API for SAGE.
-
-### Membox — Multiuser CRUD with Locking (Phase 1 Shipped)
-
-The third mode of the same substrate: multiple users sharing one cart with a write mutex and per-agent attribution. **Phase 1 is shipped** — locking, agent_id tagging, and concurrent-write serialization. Phases 2-4 (version chains, dispute detection, permissions, admin agent) are next.
-
-```python
-import membox
-
-membox.mount("./team_kb.cart", cart_id="team", role="working")
-
-# Two agents writing safely to the same cart
-membox.imprint("team", text="The project uses React",
-               agent_id="alice", reasoning="Found in package.json")
-
-membox.imprint("team", text="We migrated to Vue last week",
-               agent_id="bob", reasoning="See PR #234")
-
-# Read never blocks on the write lock
-results = membox.search("team", "what frontend framework?")
-# Each result includes membox_meta with the writing agent_id and timestamp
-```
-
-Reads never block on writes (classic many-readers-one-writer concurrency). The write lock has a configurable lease for crash recovery — if an agent dies holding the lock, it auto-releases after N seconds. Specs at [docs/RFC/membox-phase1-implementation.md](docs/RFC/membox-phase1-implementation.md) (concrete) and [docs/RFC/membox-multiuser-dbms-spec.md](docs/RFC/membox-multiuser-dbms-spec.md) (full vision).
-
-Together, the three modes (single-user, federated, multiuser) make Membot the first working **neuromorphic database** — multi-relation, multi-machine, multi-user, all on the same substrate.
-
-## Tools
-
-### Single-cart (per-session)
-
-| Tool | Description |
-|------|-------------|
-| `list_cartridges` | Browse available brain cartridges with size and capabilities |
-| `mount_cartridge` | Load a cartridge into memory (embeddings + optional GPU brain) |
-| `memory_search` | Multi-signal search: cosine + Hamming + keyword reranking |
-| `memory_store` | Store new text into the mounted cartridge |
-| `save_cartridge` | Persist the current cartridge to disk (secure NPZ format) |
-| `unmount` | Free memory and unload the current cartridge |
-| `get_passage` | Retrieve a specific passage by index (for navigation and drill-down) |
-| `passage_links` | Get navigation links (prev/next/parent/related) for a passage |
-| `get_status` | Server diagnostics (mounted cartridge, memory count, GPU status) |
-
-### Multi-cart (process-global pool, query across many carts)
-
-| Tool | Description |
-|------|-------------|
-| `multi_mount` | Add a cart to the multi-cart pool with optional `cart_id` and `role` |
-| `multi_unmount` | Remove a cart from the pool by `cart_id` |
-| `multi_list` | List every cart currently mounted in the pool |
-| `multi_mount_directory` | Mount every cart in a directory matching a glob pattern (used by federation) |
-| `multi_search` | Search across mounted carts with `scope` and `role_filter`, results attributed to source |
-
-### Federate (federation drop-in for SAGE-style fleets)
-
-| Tool | Description |
-|------|-------------|
-| `federate_publish` | Append session learning entries to a machine's federated cart |
-| `federate_consolidate` | Find cross-machine matches across mounted carts, write a consolidated cart |
-| `federate_migrate_jsonl` | One-time migration from JSONL learning logs to brain carts |
-| `federate_load` | Mount every machine's federated cart in a fleet directory at once |
-
-## Depot Dashboard
-
-Membot includes a built-in operational dashboard showing all cartridges, connected agents, and activity in real time.
-
-```
-https://your-server:8000/depot
-```
-
-![Depot Dashboard](docs/depot-dashboard.png)
-
-The dashboard shows:
-- **Cartridge rack**: Every cartridge on disk as a block, with colored LEDs for connected agents (green = active, amber = idle)
-- **Activity log**: Last 200 events (mounts, searches, unmounts) with session IDs and latency
-- **Detail panes**: Click any cart or agent LED for drill-down stats
-
-The dashboard is a single-page app embedded in the server — no build step, no dependencies. It polls `/depot/status` every 2 seconds.
-
-## Web App
-
-Membot includes a user-facing search interface for browsing and storing memories from a browser.
-
-```
-https://your-server:8000/app
-```
-
-The app provides:
-- **Cartridge picker**: All available cartridges shown as clickable chips. Click to mount.
-- **Semantic search**: Type a query, get ranked results with scores and source tags
-- **Passage viewer**: Click any result to open the full untruncated text in a modal overlay. Close with X, Escape, or click outside. Prev/Next buttons are wired for future hippocampus linked-list navigation.
-- **Memory store**: Paste text with optional tags to add to the mounted cartridge
-- **Light/dark theme**: Toggle with localStorage persistence
-
-The app talks to the server through REST endpoints (`/api/status`, `/api/search`, `/api/cartridges`, `/api/mount`, `/api/store`). Like the depot, it's a single-page app embedded in the server with no external dependencies.
-
-A standalone version (`membot_app.html`) is also included for local development and testing. It connects to any Membot server via a configurable URL field.
-
-### Behind a Reverse Proxy
-
-If you serve Membot behind nginx (e.g., at `/membot/`), the dashboard auto-detects its base path:
-
-```nginx
-location /membot/ {
-    proxy_pass http://127.0.0.1:8000/;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-}
-```
-
-Then access at `https://your-domain/membot/depot`.
-
-## How It Works
-
-1. **Mount** a brain cartridge--embeddings, text, and optional brain weights load into memory. A binary corpus (sign-zero encoding) is computed automatically for Hamming search.
-2. **Search**--your query is embedded (Nomic v1.5, 768-dim), then:
-   - Cosine similarity against stored embeddings (semantic ranking)
-   - Hamming similarity on sign-zero binary codes (population code matching)
-   - **70/30 blend**: 70% cosine + 30% Hamming
-   - Keyword reranking boosts results containing query terms
-3. **Store**--new text is embedded, added to the cartridge, and its binary code is appended to the Hamming index
-4. **Save**--cartridge persists as secure `.npz` with SHA256 integrity manifest
-
-## Brain Cartridges
-
-A brain cartridge is a self-contained memory unit:
-
-| File | Contents | Required |
-| ---- | -------- | -------- |
-| `name.pkl` or `name.cart.npz` | Embeddings + text | Yes (standard cart) |
-| `name_index.npz` + `name_text.db` | Search index + SQLite text | Yes (split cart) |
-| `name_brain.npy` | Hebbian weight matrix (128 MB) | For lattice recall |
-| `name_manifest.json` | SHA256 integrity fingerprint | Recommended |
-
-Standard carts are single-file, fully portable artifacts. Split carts trade portability for dramatically lower RAM usage--ideal for server deployment. See [Split Cart Format](#split-cart-format-index--sqlite) above.
-
-The binary Hamming index is computed automatically at mount time from the stored embeddings--no pre-built index files needed.
-
-Cartridges are compatible with [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) v8.2+. Build them in Studio or with the CLI builder, serve them with Membot.
-
-### Building Cartridges
-
-Use the included `cartridge_builder.py` to create cartridges from local documents:
-
-```bash
-# Embed a folder of documents (fast, no GPU needed)
-python cartridge_builder.py ./my-docs/ --name my-knowledge
-
-# Full build with lattice training (GPU required, enables associative recall)
-python cartridge_builder.py ./my-docs/ --name my-knowledge --train
-
-# Single file, custom chunk size
-python cartridge_builder.py research-paper.pdf --name paper --chunk-size 500
-```
-
-Supports `.txt`, `.md`, `.pdf`, and `.docx`. Long documents are automatically chunked with overlap.
-
-Place cartridges in `cartridges/` or `data/` directories relative to the server.
-
-### Sample Cartridge
-
-The repo includes a pre-built cartridge of [*Attention Is All You Need*](https://arxiv.org/abs/1706.03762) (Vaswani et al., 2017)--the paper that introduced the Transformer architecture. 24 chunks with pre-computed embeddings, ready for immediate embedding-only search.
-
-```bash
-# Mount it and start searching right away
-> mount_cartridge("attention-is-all-you-need")
-> memory_search("how does multi-head attention work")
-```
-
-To enable lattice recall (content-addressable memory with noise tolerance), rebuild with `--train` (requires GPU):
-
-```bash
-python cartridge_builder.py attention-paper.pdf --name attention-is-all-you-need --train
-```
-
-Build your own from any PDF, markdown, or text file in seconds with `cartridge_builder.py`.
-
-## Deployment
-
-### Self-Hosted Setup
-
-Anyone can run their own Membot instance. Pick your own API key (any string), set it as an environment variable, and start the server:
-
-```bash
-# 1. Choose your API key (any string you want)
-export MEMBOT_API_KEY="my-secret-key-here"
-
-# 2. Start the server
-python membot_server.py --transport http --port 8000
-
-# Or writable (enables store and save -- read-only by default)
-python membot_server.py --transport http --port 8000 --writable
-```
-
-Clients connect by passing `Authorization: Bearer my-secret-key-here` in their HTTP headers. That's it — no account system, no registration. One key per server instance.
-
-### Connecting Agents to Your Server
-
-**Claude Code** (remote, with auth):
-
-```bash
-claude mcp add --transport http --scope user membot http://your-server:8000/mcp \
-  --header "Authorization: Bearer my-secret-key-here"
-```
-
-**OpenClaw / mcporter** (`~/.mcporter/mcporter.json`):
-
-```json
-{
-  "servers": {
-    "membot": {
-      "url": "http://your-server:8000/mcp",
-      "headers": {
-        "Authorization": "Bearer my-secret-key-here"
-      }
-    }
-  }
-}
-```
-
-### Deployment Architectures
-
-**Public dispensary** (read-only, default): Multiple agents search shared cartridges. Nobody can write. Build cartridges locally, upload to server. This is the default mode--no extra flags needed.
-
-```bash
-MEMBOT_API_KEY="shared-read-key" python membot_server.py --transport http
-```
-
-**Team server** (read-write): Multiple agents mount, search, and store independently. Each agent uses a `session_id` to get its own isolated state.
-
-```bash
-MEMBOT_API_KEY="team-key" python membot_server.py --transport http --writable
-```
-
-**Personal server** (full access): One user, one key, full CRUD. Add to your system startup for always-on memory.
-
-### systemd (Linux)
-
-```ini
-[Unit]
-Description=Membot Brain Cartridge Server
-After=network.target
-
-[Service]
-Environment="MEMBOT_API_KEY=your-secret-key"
-ExecStart=/opt/membot/venv/bin/python /opt/membot/membot_server.py --transport http --port 8000
-Restart=always
-WorkingDirectory=/opt/membot
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable membot
-sudo systemctl start membot
-```
-
-**Requirements**: Python 3.10+ and ~2 GB RAM (SentenceTransformer model). No GPU needed for search.
-
-### Live Deployment
-
-Membot currently serves **4.8 million searchable entries** on a $12/month DigitalOcean droplet (2 GB RAM, 50 GB disk):
-
-| Cart | Entries | Index (RAM) | Text (disk) |
-|------|---------|-------------|-------------|
-| arXiv abstracts | 2,400,000 | 360 MB | 3.5 GB |
-| Wikipedia articles | 2,400,000 | 380 MB | 1.3 GB |
-
-Both carts use the split format. Total RAM usage: ~780 MB for indexes + ~300 MB for the embedding model. Both carts can be mounted simultaneously with room to spare on a 2 GB server.
-
-### Writable Agent Workspace
-
-For multi-agent deployments, run a second Membot instance in writable mode on a separate port. Agents can search the shared read-only carts AND create their own:
-
-```bash
-# Port 8000: read-only (public, shared carts)
-MEMBOT_API_KEY="read-key" python membot_server.py --transport http --port 8000
-
-# Port 8040: writable (agent workspace, separate API key)
-MEMBOT_API_KEY="agent-key" python membot_server.py --transport http --port 8040 --writable
-```
-
-The writable instance shares the same `cartridges/` directory, so agents can search the big carts and store findings to their own carts.
-
-## Troubleshooting
-
-### "Session not found" error (-32600)
-
-```text
-Streamable HTTP error: Error POSTing to endpoint:
-{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Session not found"}}
-```
-
-**Cause:** The MCP client is sending a stale session ID. This happens after a server restart, a server crash (e.g., from mounting a cart that exceeds available RAM), or after the 30-minute session timeout.
-
-**Fix:** Restart your MCP client so it establishes a fresh session:
-
-- **OpenClaw TUI:** `openclaw gateway stop && openclaw gateway start`, then relaunch TUI
-- **Claude Code:** Restart VS Code, or restart the Claude Code extension
-- **Claude Desktop:** Quit and reopen
-
-The server itself is fine--it's the client holding an expired session ID.
-
-### Server crashes when mounting large cartridges
-
-If you mount a cart that exceeds available RAM (e.g., a 3 GB all-in-one cart on a 2 GB server), the Python process will be killed by the OS. The systemd service will auto-restart, but all connected clients will get "Session not found" errors (see above).
-
-**Prevention:** Use [split carts](#split-cart-format-index--sqlite) for large datasets on memory-constrained servers. A split cart keeps only the search index in RAM (~400 MB for 2.4M entries) with full text paged from disk via SQLite.
-
-## TUI Session Scanner
-
-Membot includes a scanner that captures OpenClaw TUI agent sessions and pushes them to a session memory server, giving TUI agents persistent memory across sessions.
-
-```bash
-# One-time scan (process all sessions, then exit)
-python tui_scanner.py --sessions-dir ~/.openclaw/agents --api-key YOUR_KEY --once
-
-# Continuous mode (scan every 120 seconds)
-python tui_scanner.py --sessions-dir ~/.openclaw/agents --api-key YOUR_KEY
-
-# Dry run (parse and format, don't push)
-python tui_scanner.py --sessions-dir ~/.openclaw/agents --dry-run --once
-```
-
-The scanner reads OpenClaw's JSONL session transcripts, extracts user/assistant exchange pairs, and pushes them to the session memory API. Each exchange is tagged with the agent name (`TUI-main`, `TUI-research-bot`, etc.) for filtering.
-
-A companion monitor script provides a clean, scrollable, color-coded view of TUI messages--no clobbering, no overwriting:
-
-```bash
-# Auto-find latest session and tail it
-python tui_monitor.py
-
-# Show full session history, then tail
-python tui_monitor.py --all
-```
-
-A startup script launches the scanner, OpenClaw gateway, TUI, and monitor in separate windows:
-
-```bash
-bash start-tui.sh
-```
-
-## What Makes Membot Different
-
-| | Membot | Typical AI Memory |
-|---|---|---|
-| **LLM dependency** | None. Search, store, and recall are LLM-free. | Every operation requires LLM calls (fact extraction, relationship building, compaction). |
-| **Storage model** | Portable brain cartridges--files you own and carry. | Cloud APIs, vendor lock-in, subscription pricing. |
-| **Search** | SimHash Hamming + keywords. Binary math, no neural inference. | Embedding cosine via API. Scales with token cost. |
-| **Scale** | 4.8M entries on a $12/mo server. | Priced per query, per GB, per seat. |
-| **Energy** | Train once, query forever. No LLM calls in the pipeline. | Every ingest and query requires LLM inference. |
-
-The sign-zero binary encoding used by Membot is a form of [SimHash (Charikar, 2002)](https://dl.acm.org/doi/10.1145/509907.509965)--a well-established locality-sensitive hashing technique. The cartridges Membot serves are built by [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio), which combines SimHash with Hebbian settle dynamics: patterns are trained through a neuromorphic physics pipeline before their binary signatures are captured. The resulting signatures encode associative relationships not present in the original embedding geometry.
-
-## Security
-
-- **NPZ-first**: New cartridges are always saved as `.npz` (NumPy archive --no code execution)
-- **PKL sandboxing**: Legacy `.pkl` files are only loaded from trusted directories (configurable)
-- **Integrity verification**: SHA256 manifest checked on mount; tampered cartridges are rejected
-- **Input sanitization**: Cartridge names validated against path traversal; text and query lengths capped
-- **Resource limits**: Max 3,000,000 entries per cartridge, 10,000 chars per store, 2,000 chars per query
-- **Read-only by default**: The server starts in read-only mode. `memory_store` and `save_cartridge` are disabled unless you explicitly pass `--writable`. This makes public-facing deployments safe by default.
-- **Concurrent writes**: In writable mode, multiple sessions can mount and search simultaneously, but concurrent saves to the same cartridge file are last-writer-wins. If you need file locking, per-user API keys, or a managed team deployment, [get in touch](mailto:andy@project-you.app).
-
-## Embedding Model
-
-Membot uses [nomic-ai/nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5) via SentenceTransformers. This matches the embedder used by Vector+ Studio to build cartridges.
-
-The model downloads automatically on first run (~270 MB). Subsequent starts load from cache.
-
-**Important**: The embedding model used to build cartridges must match the one used to query them. Membot and Vector+ Studio both use the same model, so cartridges are interchangeable.
-
-## System Requirements
-
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| Python | 3.10+ | 3.12+ |
-| RAM | 2 GB (split carts) / 4 GB (standard carts) | 16+ GB |
-| GPU | None (search works without GPU) | NVIDIA RTX 3080+ (for lattice recall) |
-| VRAM | -- | 8+ GB |
-| CUDA | -- | 12.0+ |
-
-## Project Structure
-
-```
-membot/
-├── membot_server.py              # MCP server + depot dashboard + web app
-├── membot_app.html               # Standalone web app (connects to any server)
-├── cartridge_builder.py          # CLI tool to build cartridges from documents
-├── build_gutenberg_cartridge.py  # Download + embed 44 Project Gutenberg classics
-├── build_sqlite_cart.py          # Convert .pkl cart to split format (index + SQLite)
-├── compress_cart.py              # Zlib-compress passages in a .pkl cart
-├── multi_lattice_wrapper_v7.py   # Python wrapper for CUDA engine
-├── requirements.txt
-├── tools/
-│   ├── tui_scanner.py            # OpenClaw TUI session scanner
-│   ├── tui_monitor.py            # Clean TUI message monitor (tail + pretty-print)
-│   └── start-tui.sh              # Launch scanner + gateway + TUI + monitor
-├── bin/
-│   └── lattice_cuda_v7.dll       # Pre-built CUDA physics engine (Windows)
-├── cartridges/                   # Your brain cartridges go here
-└── data/                         # Alternative cartridge directory
-```
-
-## License
-
-**Dual-Licensed:**
-
-| Component | License | Commercial Use |
-|-----------|---------|----------------|
-| Python code (`.py` files) | MIT | Yes |
-| CUDA Engine (`bin/*.dll`) | Proprietary | [Contact for license](mailto:andy@project-you.app) |
-
-The server code and utilities are open source under MIT. The compiled CUDA physics engine is free for personal, educational, and non-commercial use. Commercial use requires a separate license--see [bin/LICENSE](bin/LICENSE).
-
-## Links
-
-- [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio) -- GUI for building and searching brain cartridges
-- [Project You](https://project-you.app) -- Parent project
-- [Licensing](https://project-you.app/licensing) -- Commercial licensing options
+## How search works
+
+Three signals, combined:
+
+- **Cosine** over sentence-transformer embeddings (Nomic) — semantic similarity.
+- **Hamming** over a 768-bit binary signature per passage (96 bytes) — fast, cheap prefiltering
+  and a second opinion on ranking.
+- **Keyword reranking** — surface matches that embedding geometry misses, like identifiers and
+  proper nouns.
+
+ⓘ **An honest note on "associative" search.** Membot can return neighbours a literal query would
+not have found. Having tested it, we attribute that to the **embedding model's** representation
+quality rather than to anything downstream of it. We no longer claim an architectural
+differentiator in retrieval, and we would rather say so than have you discover it in a bake-off.
+
+The repository includes an optional GPU engine under a separate licence. It is **not required**
+and is not part of the retrieval path described above.
 
 ---
 
-*Patterns stored holographically, not as records. Memory served as cartridges, not as databases.*
+## Notes, attribution and history
+
+The features customers actually asked for, in order of how often they ask:
+
+**Notes on passages.** A note carries a `kind` — why, context, caution, decision, prediction,
+recommendation — plus its author, surface and timestamp. Notes live beside the cart in a sidecar
+file, not inside it, so annotating does not rewrite the data.
+
+**Correction without erasure.** A correcting note supersedes its predecessor. The superseded note
+renders **struck through**, still attributed. ⛔ Nothing in the normal path deletes a note.
+
+**A hash-chained journal.** Every note event appends a line carrying the previous line's hash, so
+an edited, reordered or interior-deleted entry is detectable. A **high-water mark** in a second
+file closes trailing deletion, which the chain alone cannot catch.
+
+⭐ **Keep the journal in a repo your reviewer also clones** and the last gap closes too: every
+clone is an independent witness, so a rewrite is detectable by anyone holding one.
+
+---
+
+## The Hot Stack
+
+A shared cart does not have *a* hot stack. Two people searching the same store build different
+hierarchies over it, and both are correct. So Membot keeps attention per seat, and rolls it up
+separately.
+
+**`seat_hot_stack`** returns what **you** have been working on in the mounted cart, ranked by
+your own attention. It scores only passages you have actually touched, so a passage another seat
+has opened forty times is cold for you if you have never opened it. ⇒ Untouched material is
+cold, not absent: a thing you could read but never have simply does not rise.
+
+**`firm_hot_stack`** returns what the **organization** is warm on, which is a different question
+and not the sum of the first one. ⭐ The signal that exists only here is **how many distinct
+people touched a passage**. One person reading something forty times and forty people reading it
+once produce the same access count and mean completely different things about a company.
+⇒ Ranked by distinct seats, that difference becomes visible.
+
+**`seat_hide` / `seat_hidden`** let a seat drop something out of its own view without removing it
+for anyone else — the free rung of the delete ladder.
+
+ⓘ **What this is and is not.** It is attention over a mounted cart, maintained per seat, and it
+works today. ⛔ It is *not* yet a personal memory that follows you across carts: **promotion** —
+moving what you worked on in a session into a durable personal or organizational store — is
+designed and not built, and a personal cart is not auto-mounted when you sign in. ⇒ Both are on
+the roadmap below.
+
+---
+
+## Security posture
+
+Stated plainly, because the previous version of this file was wrong about it.
+
+**What the API key covers.** `MEMBOT_API_KEY` and the 60 req/min rate limit are enforced in the
+MCP protocol hook, which means they apply to **`/mcp` tool calls only**. ⛔ The server also serves
+REST routes under `/api/*`, `/depot/*` and `/app` as ordinary HTTP endpoints — **those get
+neither the key check nor the rate limit.** ⚠ The middleware reads `Authorization: Bearer <key>`
+only; `X-API-Key` is ignored.
+
+⇒ **Do not expose an HTTP Membot to an untrusted network.** If you need remote access, proxy
+`/mcp` and block the rest.
+
+**How identity works.** The seat is resolved rather than accepted:
+
+- **stdio** — the claim is trusted. A local pipe *is* the user.
+- **a verified token present** — the seat is derived from it, and a disagreeing claim is recorded
+  as overridden.
+- **no usable identity** — the claim is honored and recorded as `claimed`, except in namespaces
+  the server reserves for itself.
+
+⇒ Journal entries carry `identity_source: verified | claimed | default`. ⭐ **A reader should
+treat `claimed` as present but unverified, never as equivalent to `verified`.** Binding a write
+to an author cryptographically is designed and not built.
+
+**Cartridges are data, and should be treated as data you trust.** Loading a cart from an
+untrusted source is not currently a safe operation. ⚠ Hardening the loader so that admissibility
+is checked before anything is materialized is in progress; until it lands, **only open carts you
+or your organization produced.**
+
+Further hardening is underway; this section will say more as it lands.
+
+---
+
+## Roadmap, stated as roadmap
+
+| | state |
+| --- | --- |
+| Notes, correction-by-supersession, hash-chained journal | ✅ shipped |
+| Per-seat hot stack and hidden set | ✅ shipped |
+| Mempack — agent-owned writable carts | ✅ shipped |
+| Membox — shared writable carts with a lock | ✅ phase 1 |
+| Federation across machines | ✅ shipped |
+| Hot Stack — per seat and firm-wide | ✅ shipped |
+| **Promotion — session work into a durable personal store** | ⬜ designed |
+| **Auto-mounted personal cart on sign-in** | ⬜ designed |
+| **Verified identity binding (signatures)** | ⬜ designed |
+| **Sealed carts — a one-way, append-only posture** | ⬜ designed |
+| **Loader hardening** | ⬜ in progress |
+| **Change notification to subscribers** | ⬜ designed |
+
+---
+
+## Related
+
+- **[Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio)** — the browser
+  front end. Drag and drop to build a cart, search it, read and write the same notes.
+- **[AGENTS.md](AGENTS.md)** — the agent-facing guide to these tools.
+
+## Licence
+
+| Component | Licence |
+| --- | --- |
+| Server, tools and utilities | MIT |
+| Optional GPU engine (`bin/*`) | Proprietary — see [bin/LICENSE](bin/LICENSE) |
+
+The GPU engine is free for personal, educational and non-commercial use. Commercial use requires
+a separate licence — [contact us](mailto:andy@project-you.app).
