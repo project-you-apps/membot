@@ -97,3 +97,6 @@ redaction-review.jsonl
 # footgun, in a repo that genuinely pushes. Verified never committed (absent from origin/main
 # and from all history) before adding this, so there is nothing to purge.
 *.journal.jsonl.lock
+
+# Generated render artifacts from the app-extraction tooling. Not source.
+tools/test_output/

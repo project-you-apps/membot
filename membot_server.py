@@ -3953,7 +3953,7 @@ function applyReadOnly(ro){
 }
 const BASE=()=>{
   const loc=location.pathname.replace(/\\/app\\/?$/,'');
-  return location.protocol==='file:'?'http://137.184.227.79:8000':location.origin+loc;
+  return location.protocol==='file:'?'http://localhost:8000':location.origin+loc;
 };
 /* ---------------------------------------------------------------------------
  * PER-TAB ANONYMOUS SESSION  (Andy, 2026-10-17; first asked 2026-02-01)

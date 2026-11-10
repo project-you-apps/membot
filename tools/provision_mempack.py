@@ -4,7 +4,7 @@ Admin tool — provision a Mempack for a user by calling /api/mempack/create.
 
 Usage:
     python provision_mempack.py --owner-id <uuid> --name primary
-    python provision_mempack.py --owner-id <uuid> --name primary --server http://137.184.227.79:8040
+    python provision_mempack.py --owner-id <uuid> --name primary --server http://your-membot-host:8040
     python provision_mempack.py --owner-id <uuid> --name primary --briefing "custom briefing text"
 
 Until auto-provision-on-signup lands (needs Supabase JWT verification on Membot
@@ -24,7 +24,7 @@ def main():
     p.add_argument("--name", default="primary", help="Mempack name (default: primary)")
     p.add_argument("--server", default="http://localhost:8040",
                    help="Membot write-tier URL (default: http://localhost:8040). "
-                        "Use http://137.184.227.79:8040 for the droplet.")
+                        "Use http://your-membot-host:8040 for the droplet.")
     p.add_argument("--api-key", default=None,
                    help="X-API-Key header value (defaults to MEMBOT_API_KEY env or no auth)")
     p.add_argument("--briefing", default=None, help="Override the default briefing template")

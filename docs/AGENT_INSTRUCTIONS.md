@@ -45,13 +45,13 @@ Drop this into your MCP host's config (typically `.mcp.json` or `mcp.json`):
   "mcpServers": {
     "membot": {
       "type": "sse",
-      "url": "http://137.184.227.79:8000/sse"
+      "url": "http://your-membot-host:8000/sse"
     }
   }
 }
 ```
 
-(For write access, swap the URL to `http://137.184.227.79:8040/sse` and add an `X-API-Key` header — talk to your operator about getting a key.)
+(For write access, swap the URL to `http://your-membot-host:8040/sse` and add an `Authorization: Bearer <key>` header — talk to your operator about getting a key.)
 
 Once configured, tools are exposed under the `membot.*` namespace. Call them like any other MCP tool:
 
@@ -98,7 +98,7 @@ curl -X POST https://project-you.app/membot/api/search \
 # Store (write access required)
 curl -X POST https://project-you.app/membot/api/store \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: <your-key>" \
+  -H "Authorization: Bearer <your-key>" \
   -d '{"content":"your finding","tags":"optional,tags"}'
 
 # Status
