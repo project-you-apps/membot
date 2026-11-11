@@ -21,6 +21,15 @@ documents and embed them locally; building a cart does not send anything anywher
 plus keyword reranking. No model is called to answer a query. For an agent making hundreds of
 retrievals in a run, that is the difference between a background cost and a line item.
 
+**It stores WHY, which almost nothing does.** Every record system stores who touched what and
+when. Almost none store **why**, because why has to be captured **at the moment of the decision
+and cannot be reconstructed afterward.** Six months on, the document is still in the folder and
+the person who chose it has moved on. Membot has a field for the part that leaves with them.
+
+**Your reasoning is yours until you publish it.** A note is born **private**. Nothing else can
+see it until you explicitly share it, because a shared "why" that is on by default is
+surveillance rather than memory. ⇒ People write honestly only when they are not performing.
+
 **Every write carries who, where and when.** Not an audit log bolted beside the data but an
 invariant in the format. A note written through a web browser and a note written by an agent at
 3am are both attributed, and both say which surface they came from.
@@ -144,6 +153,10 @@ The features customers actually asked for, in order of how often they ask:
 **Notes on passages.** A note carries a `kind` — why, context, caution, decision, prediction,
 recommendation — plus its author, surface and timestamp. Notes live beside the cart in a sidecar
 file, not inside it, so annotating does not rewrite the data.
+
+**Private by default, shared on purpose.** `note_add` creates a private note; `note_share` is a
+separate, deliberate act. ⛔ There is no setting that makes new notes public. ⚠ And a correction
+**cannot widen who can see the original** — correcting something must never leak it.
 
 **Correction without erasure.** A correcting note supersedes its predecessor. The superseded note
 renders **struck through**, still attributed. ⛔ Nothing in the normal path deletes a note.

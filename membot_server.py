@@ -5800,7 +5800,8 @@ def note_add(idx: int, kind: str, body: str, scope: str = "private",
     `kind` is one of: why (the reasoning behind this), context (what a reader needs to
     know that the passage does not say), caution (a trap in here), decision (what was
     settled and by whom), prediction (what you expect to happen, so it can be checked
-    later).
+    later), recommendation (what someone ought to do about this, which is a proposal
+    and not yet a decision).
 
     ⛔ A note is born PRIVATE. Nothing else can see it until you explicitly share it with
     `note_share` — a shared "why" that is on by default is surveillance, not memory.

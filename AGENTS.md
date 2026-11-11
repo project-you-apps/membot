@@ -10,7 +10,7 @@ model**, so searching is cheap enough to do liberally — the cost is latency, n
 
 ## 1 · The shape of a session
 
-```
+```text
 get_status            → is anything mounted? what?
 list_cartridges       → what is available
 mount_cartridge(name) → mount it
@@ -83,7 +83,23 @@ dropping them. Dropping them silently destroys the thing the format exists to pr
 
 **Always give a note a `kind`.** `why` · `context` · `caution` · `decision` · `prediction` ·
 `recommendation`. The kind is what makes a note findable later by someone who does not know it
-exists.
+exists. ⓘ `recommendation` is a proposal, not a settled thing — use `decision` only when it
+actually was decided, and say by whom.
+
+⛔ **Every note you write is PRIVATE until you share it.** `note_add` creates a private note;
+`note_share` is a separate, deliberate act, and there is no setting that makes new notes public.
+⇒ Two consequences for you:
+
+- **Write honestly.** Nobody sees it yet, so record the real reason rather than the presentable
+  one. ⭐ A shared "why" that is on by default is surveillance, not memory — which is why the
+  default is what it is.
+- ⚠ **If a human needs to see it, sharing is a step you must take.** A note that should have been
+  shared and was not is indistinguishable from a note nobody wrote. ⇒ When you record something
+  that changes what a person should do, share it and say that you did.
+
+⚠ **A correction cannot widen who can see the original.** Correcting something must never leak
+it. ⇒ If you need a correction to reach a wider audience than the note it corrects, that is a
+sharing decision for a human, not something to route around.
 
 ⭐ **Write the reasoning, not the conclusion.** The conclusion is usually recoverable from the
 data; the reasoning is not. *"Chose the 2024 schedule because the 2023 one predates the
@@ -113,7 +129,7 @@ than what you think you touched.
 
 ⇒ Good opening move for a resumed session:
 
-```
+```text
 get_status            → what is mounted
 seat_hot_stack(10)    → what I was working on here
 ```
