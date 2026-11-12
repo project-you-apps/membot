@@ -40,6 +40,7 @@ import os
 import pickle
 import struct
 import zlib
+from pathlib import Path
 
 import numpy as np
 
@@ -96,20 +97,60 @@ def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int) -> tup
 
 
 def is_trusted_directory(path: str) -> bool:
-    """Check if a file is within one of the trusted cartridge directories."""
-    real_path = os.path.realpath(path)
-    for d in CARTRIDGE_DIRS:
-        real_dir = os.path.realpath(d)
+    """True only if `path` lies strictly inside a trusted cartridge directory.
+
+    Comparison is COMPONENT-AWARE, by design. The previous implementation was:
+
         if real_path.startswith(real_dir + os.sep) or real_path.startswith(real_dir):
+
+    The first clause is correct. ⛔ The SECOND clause made it redundant and defeated
+    it: a sibling directory that merely shares the prefix was classified as trusted,
+    so `/carts-evil/x.pkl` passed while `/carts` was the trusted directory. And this
+    function is the gate the `.pkl` loader relies on, so it was the gate on the one
+    path that was actually gated.
+
+    ⭐ `trusted_dir in Path(real_path).parents` is true only when the trusted
+    directory is a genuine ANCESTOR, which is the property we meant:
+      · `/carts/a.pkl`       -> True   (direct child)
+      · `/carts/sub/a.pkl`   -> True   (nested, still inside)
+      · `/carts-evil/a.pkl`  -> False  (sibling sharing a prefix)
+      · `/carts`             -> False  (the directory is not a file inside itself)
+    ⓘ It also avoids two edge cases `startswith` has: a trusted dir that already
+    ends in a separator, and a Windows path on a different drive.
+
+    ⚠ `realpath` resolves symlinks first, so a symlink pointing out of a trusted
+    directory is judged on its target. That is deliberate.
+    ⚠ On a case-insensitive filesystem a differently-cased path fails this check.
+    That is a false NEGATIVE, which for a gate is the safe direction.
+    """
+    real_path = Path(os.path.realpath(path))
+    parents = set(real_path.parents)
+    for d in CARTRIDGE_DIRS:
+        if Path(os.path.realpath(d)) in parents:
             return True
     return False
 
 
 def load_cartridge_safe(path: str) -> dict:
-    """Load a cartridge using the safest available method.
+    """Load a cartridge using the safest available method CURRENTLY IMPLEMENTED.
 
-    NPZ files are always safe (no code execution).
-    PKL files are only loaded from trusted directories.
+    ⛔⛔ THIS DOCSTRING USED TO SAY "NPZ files are always safe (no code execution)".
+    THAT WAS FALSE, and it outlived every reader who trusted it. An `.npz` opened
+    with `allow_pickle=True` unpickles object arrays, and unpickling executes code.
+    Two of our six arrays are object dtype (`passages`, `compressed_texts`), so the
+    loader has been passing `allow_pickle=True` and an `.npz` is therefore NOT a
+    safe thing to open from an untrusted source today.
+
+    ⚠ WHAT IS AND IS NOT TRUE RIGHT NOW:
+      · `.pkl` is gated to trusted directories by `is_trusted_directory`.
+      · `.npz` is NOT gated at all, and executes code on load. ⇒ The file extension
+        is not a safety boundary.
+      · The loader also runs BEFORE manifest verification, so nothing has checked
+        that the file is what it claims to be at the moment it is materialized.
+
+    ⇒ The repair is the gauntlet: admissible, then authentic, then authorized, in
+      that order (docs/DESIGN-the-gauntlet-verify-before-materialize-2026-11-12.md).
+      ⭐ Until it lands, mount only carts your own organization produced.
     """
     if path.endswith(".npz"):
         return load_npz_cartridge(path)
