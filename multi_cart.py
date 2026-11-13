@@ -159,7 +159,8 @@ def mount(cart_path: str, cart_id: Optional[str] = None,
     embeddings = data["embeddings"]
     texts = data["texts"]
 
-    ok, verify_msg = verify_manifest(cart_path, embeddings, len(texts))
+    ok, verify_msg = verify_manifest(cart_path, embeddings, len(texts),
+                                     texts=texts)
     if not ok:
         if verify_integrity:
             raise ValueError(

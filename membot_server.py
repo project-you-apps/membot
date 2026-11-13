@@ -5534,7 +5534,8 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
             # admitted them -- no new information, and a full hash per visitor.
             verify_msg = "shared payload (verified at first load)"
         else:
-            ok, verify_msg = verify_manifest(cart["path"], embeddings, len(texts))
+            ok, verify_msg = verify_manifest(cart["path"], embeddings, len(texts),
+                                             texts=texts)
             if not ok:
                 log.error(f"INTEGRITY CHECK FAILED for {cart['name']}: {verify_msg}")
                 # ⛔ Drop the bad payload from the pool, or the next session to ask
@@ -10772,7 +10773,8 @@ if __name__ == "__main__":
             # that is fine. A non-zero exit is the only variant systemd and the fleet
             # monitor can actually see.
             ok, verify_msg = verify_manifest(cart["path"], data["embeddings"],
-                                             len(data["texts"]))
+                                             len(data["texts"]),
+                                             texts=data["texts"])
             if not ok and not args.allow_unverified_mount:
                 _shared_release(state, sid)
                 _shared_cart_data.pop(cart["path"], None)

@@ -204,8 +204,19 @@ UNREADABLE = "UNREADABLE"
 
 
 def verify_manifest_detail(cart_path: str, embeddings: np.ndarray, n_texts: int,
-                           texts=None) -> tuple[str, str]:
-    """Return (verdict, message). ⭐ The caller cannot mistake a reason for a pass."""
+                           texts) -> tuple[str, str]:
+    """Return (verdict, message). ⭐ The caller cannot mistake a reason for a pass.
+
+    ⛔⛔ `texts` HAS NO DEFAULT, AND THE DEFAULT IS WHAT BROKE THE BOOT PATH.
+      It was `texts=None`, so a caller that omitted it compiled fine and failed
+      only when execution reached `compute_fingerprint`. ⚠ On a cart with a v1
+      manifest this function returns LEGACY_MANIFEST *before* that line, so the
+      three callers that omitted `texts` worked for as long as every manifest was
+      stale, and crashed the server the moment the manifests were upgraded.
+    ⇒ A parameter needed on only one branch WILL be omitted, and the omission
+      hides on the other branch. Required is the only version with no hiding
+      place: now every caller fails identically, immediately, on any cart.
+    """
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
 
     if not os.path.exists(manifest_path):
@@ -260,13 +271,27 @@ def verify_manifest_detail(cart_path: str, embeddings: np.ndarray, n_texts: int,
 
 
 def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
-                    texts=None) -> tuple[bool, str]:
+                    texts) -> tuple[bool, str]:
     """(ok, message), where ⭐ ok is True ONLY for VERIFIED.
 
-    Signature and return SHAPE are unchanged from v1 on purpose, so the four
-    existing call sites -- membot_server.py:5502 and :10737, multi_cart.py:162,
-    test_boot_integrity.py -- pick up the corrected behaviour without edits and
-    without any chance of a truthy reason string being read as a pass.
+    The RETURN SHAPE is unchanged from v1 on purpose, so no call site can read a
+    truthy reason string as a pass.
+
+    ⛔⛔ CORRECTION, 2026-11-13. This docstring previously said the four existing
+      call sites "pick up the corrected behaviour WITHOUT EDITS". That was wrong,
+      and writing it down is what stopped me checking:
+
+        - the return shape was compatible, so the calls kept compiling
+        - but three of them passed no `texts`, and `texts=None` made that legal
+        - and `verify_manifest_detail` returns LEGACY_MANIFEST before it needs
+          `texts`, so the gap was invisible while every manifest was still v1
+
+      ⇒ Upgrading the manifests -- the fix -- is what crashed the boot path.
+      ⇒ `texts` is now REQUIRED here and in `verify_manifest_detail`. Every call
+        site was edited: membot_server.py:5537 and :10774, multi_cart.py:162,
+        test_boot_integrity.py.
+      ⭐ I verified SIGNATURE compatibility and called it ARGUMENT completeness.
+        They are different questions and only one of them was asked.
     """
     verdict, msg = verify_manifest_detail(cart_path, embeddings, n_texts,
                                           texts=texts)

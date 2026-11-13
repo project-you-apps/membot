@@ -64,12 +64,18 @@ try:
     emb = rng.standard_normal((25, 768)).astype(np.float32)
     texts = [f"boot fixture passage {i}" for i in range(25)]
     M.save_as_npz(CART, emb, texts)
-    M.save_manifest(CART, emb, 25)
+    # ⛔ `texts=texts` -- the SAME list save_as_npz wrote. A patch here first
+    #   invented `[f"passage {i}" ...]` while `texts` sat in scope one line up,
+    #   and the manifest then attested text the cart did not contain. ⭐ The v2
+    #   fingerprint caught it on the next run; v1, which hashed no text at all,
+    #   would have called that cart verified.
+    M.save_manifest(CART, emb, 25, texts=texts)
     created = [CART, MANIFEST]
 
     print("\n§1 · a manifest that MATCHES must verify")
     d = load_cartridge_safe(CART)
-    ok, msg = verify_manifest(CART, d["embeddings"], len(d["texts"]))
+    ok, msg = verify_manifest(CART, d["embeddings"], len(d["texts"]),
+                              texts=d["texts"])
     check("good cart verifies", ok, msg)
 
     print("\n§2 · a manifest that does NOT match must refuse the boot")
@@ -79,7 +85,8 @@ try:
     emb2 = rng.standard_normal((30, 768)).astype(np.float32)
     M.save_as_npz(CART, emb2, [f"different passage {i}" for i in range(30)])
     d2 = load_cartridge_safe(CART)
-    ok2, msg2 = verify_manifest(CART, d2["embeddings"], len(d2["texts"]))
+    ok2, msg2 = verify_manifest(CART, d2["embeddings"], len(d2["texts"]),
+                                texts=d2["texts"])
     check("fixture now genuinely fails verification", not ok2, msg2[:48])
 
     rc = boot(NAME)

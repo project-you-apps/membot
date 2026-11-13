@@ -92,7 +92,7 @@ def make_cart(name, n=40, dim=768):
     emb = RNG.standard_normal((n, dim)).astype(np.float32)
     texts = [f"{name} passage {i} about lattices and memory" for i in range(n)]
     save_as_npz(path, emb, texts)
-    save_manifest(path, emb, n)
+    save_manifest(path, emb, n, texts=texts)
     return {"name": name, "path": path}
 
 
