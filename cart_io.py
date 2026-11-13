@@ -298,6 +298,47 @@ def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
     return verdict == VERIFIED, f"[{verdict}] {msg}"
 
 
+def unverified_mount_allowed(cart_name: str, allow_all: bool,
+                             allow_names=None) -> tuple[bool, str]:
+    """May THIS cart mount despite failing verification? Returns (allowed, why).
+
+    ⛔⛔ WHY THE PER-CART FORM EXISTS. `--allow-unverified-mount` is GLOBAL. It does not
+      accept a known risk on one cart -- it removes the gate from the process. On a host
+      serving several carts, switching it on for the one stale cart silently un-gates
+      every cart that was verifying correctly, and the log looks the same.
+    ⇒ `--allow-unverified-cart NAME` names the exception, so everything else stays
+      fail-closed and the log says which cart was excused and why.
+      Andy's ruling, 2026-11-13, on the droplet's split carts.
+
+    ⭐ MATCHING IS EXACT AND CASE-SENSITIVE. A substring rule here would reintroduce
+      precisely the ambiguity `b6eac68` removed from `mount_cartridge` -- and it would do
+      it on the path that decides whether to skip an integrity check, which is the worst
+      possible place for a fuzzy match.
+    """
+    if allow_names and cart_name in allow_names:
+        return True, f"--allow-unverified-cart {cart_name!r}"
+    if allow_all:
+        return True, "--allow-unverified-mount (GLOBAL: every cart is un-gated)"
+    return False, ""
+
+
+def unused_bypass_names(available_names, allow_names=None) -> list[str]:
+    """Names given to --allow-unverified-cart that match no cart on this host.
+
+    ⛔ A typo'd name fails CLOSED, which sounds safe and is the problem: the operator
+      believes an exception is in place, the server refuses the cart anyway, and the
+      failure is indistinguishable from the flag not working at all.
+    ⇒ Worse, the reverse reading is available too -- "the gate is protecting me" -- when
+      in fact the intended exception simply never applied to anything.
+    ⭐ Same shape as the stale-exemption check in tests/test_no_bare_texts_calls.py: an
+      exception that matches nothing must SAY so rather than pass silently.
+    """
+    if not allow_names:
+        return []
+    have = {str(n) for n in (available_names or ())}
+    return sorted({n for n in allow_names if n not in have})
+
+
 def is_trusted_directory(path: str) -> bool:
     """True only if `path` lies strictly inside a trusted cartridge directory.
 

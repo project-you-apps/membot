@@ -1056,6 +1056,8 @@ from cart_io import (          # noqa: F401  (re-exported for backward compatibi
     CARTRIDGE_DIRS,
     compute_fingerprint,
     verify_manifest,
+    unverified_mount_allowed,
+    unused_bypass_names,
     FINGERPRINT_ALGO,
     is_trusted_directory,
     load_cartridge_safe,
@@ -10665,10 +10667,19 @@ if __name__ == "__main__":
                              "of physical RAM. Carts already resident always mount, "
                              "since an extra holder costs nothing.")
     parser.add_argument("--allow-unverified-mount", action="store_true",
-                        help="Start even if the --mount cartridge fails its manifest "
-                             "integrity check. For a KNOWN-STALE manifest on a cart you "
-                             "trust; the failure is still logged at ERROR. Without this, "
-                             "a failed check refuses to start (exit 3).")
+                        help="GLOBAL bypass: start even if a cartridge fails its manifest "
+                             "integrity check, FOR EVERY CART. This does not accept a risk "
+                             "on one cart, it removes the gate from the process. Prefer "
+                             "--allow-unverified-cart NAME. The failure is still logged at "
+                             "ERROR. Without either flag a failed check refuses to start "
+                             "(exit 3).")
+    parser.add_argument("--allow-unverified-cart", action="append", metavar="NAME",
+                        default=None,
+                        help="Allow THIS cart, by exact name, to mount with a failed or "
+                             "missing manifest. Repeatable. Every other cart stays gated. "
+                             "Use for a known-stale cart you trust -- a split cart whose "
+                             "manifest predates sha256-full-v2, for instance -- so the rest "
+                             "of the host is not un-gated to accommodate it.")
     args = parser.parse_args()
 
     _server_config["read_only"] = not args.writable
@@ -10725,6 +10736,17 @@ if __name__ == "__main__":
     carts = find_cartridges()
     log.info(f"Found {len(carts)} cartridges")
 
+    # ⛔ A bypass name with a typo fails CLOSED, which looks exactly like the flag not
+    #   working -- or, worse, like the gate protecting you when the exception you meant
+    #   to grant never applied to anything. Say so at startup, not at mount time.
+    _unused = unused_bypass_names([c["name"] for c in carts],
+                                  getattr(args, "allow_unverified_cart", None))
+    if _unused:
+        log.warning("--allow-unverified-cart named %d cart(s) that do not exist here: %s",
+                    len(_unused), ", ".join(repr(n) for n in _unused))
+        log.warning("  Those names excuse nothing. Check the spelling against the list "
+                    "above; cart names are matched exactly and case-sensitively.")
+
     # Auto-mount cartridge if requested
     if args.mount:
         cart_name = args.mount
@@ -10744,7 +10766,23 @@ if __name__ == "__main__":
         sid = _resolve_session_id("")
         state = _get_session(sid)
         mount_carts = find_cartridges()
-        mount_match = [c for c in mount_carts if cart_name.lower() in c["name"].lower()]
+        # ⛔ WAS a bare substring scan whose first hit was taken -- the same defect
+        #   b6eac68 removed from mount_cartridge, still live on the STARTUP path, which
+        #   is the one that then decides whether to run an integrity check. Found
+        #   2026-11-13 while adding the per-cart bypass.
+        # ⇒ Exact name first; a unique substring still works, so `--mount heartbeat`
+        #   keeps working; ambiguity refuses and names the candidates.
+        mount_exact = [c for c in mount_carts if c["name"] == cart_name]
+        if mount_exact:
+            mount_match = mount_exact[:1]
+        else:
+            _near = [c for c in mount_carts if cart_name.lower() in c["name"].lower()]
+            if len(_near) > 1:
+                log.error("--mount %r matches %d cartridges: %s", cart_name, len(_near),
+                          ", ".join(c["name"] for c in _near))
+                log.error("  Refusing to guess which one you meant. Pass the exact name.")
+                sys.exit(3)
+            mount_match = _near
         if mount_match:
             cart = mount_match[0]
             # Goes through the SHARED pool like any other mount (2026-10-18). Without
@@ -10775,7 +10813,10 @@ if __name__ == "__main__":
             ok, verify_msg = verify_manifest(cart["path"], data["embeddings"],
                                              len(data["texts"]),
                                              texts=data["texts"])
-            if not ok and not args.allow_unverified_mount:
+            _bypass_ok, _bypass_why = unverified_mount_allowed(
+                cart["name"], args.allow_unverified_mount,
+                args.allow_unverified_cart)
+            if not ok and not _bypass_ok:
                 _shared_release(state, sid)
                 _shared_cart_data.pop(cart["path"], None)
                 _shared_refs.pop(cart["path"], None)
@@ -10786,14 +10827,16 @@ if __name__ == "__main__":
                 log.error("  Refusing to start. The cart does not match its manifest — "
                           "it is corrupted, was edited without regenerating the manifest, "
                           "or was tampered with.")
-                log.error("  If the manifest is merely stale, re-save it, or start with "
-                          "--allow-unverified-mount to accept the risk explicitly.")
+                log.error(f"  If the manifest is merely stale, re-save it (see "
+                          f"scripts/rebuild_manifests.py), or start with "
+                          f"--allow-unverified-cart {cart['name']!r} to excuse THIS cart "
+                          f"while every other cart stays gated.")
                 sys.exit(3)
             if not ok:
                 # Explicitly accepted. Say so at ERROR so it cannot be mistaken for a
                 # clean boot in the log.
                 log.error(f"INTEGRITY CHECK FAILED for '{cart['name']}': {verify_msg} — "
-                          f"mounting anyway because --allow-unverified-mount was passed.")
+                          f"mounting anyway, excused by {_bypass_why}.")
 
             state["embeddings"] = data["embeddings"]
             state["texts"] = data["texts"]

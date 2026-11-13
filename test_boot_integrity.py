@@ -102,6 +102,21 @@ try:
     check("the flag is what changed the outcome", rc2 != 3 and RESULTS[2][1],
           "same cart: exit 3 without, past-the-gate with")
 
+    print("\n§4 · the PER-CART hatch, which must excuse one cart and no others")
+    # ⭐ §3 proved the GLOBAL flag changes the outcome. That cannot distinguish an
+    #   allowlist from an amnesty, so both halves are needed here: the named cart gets
+    #   through, and a run that names a DIFFERENT cart still takes the exit-3 refusal.
+    #   The second check is the one that proves the allowlist is actually consulted in
+    #   the boot path rather than merely existing in cart_io.
+    rc3 = boot(NAME, extra=["--allow-unverified-cart", NAME], timeout=60)
+    check("--allow-unverified-cart <this cart> does NOT refuse", rc3 != 3, f"exit={rc3}")
+
+    rc4 = boot(NAME, extra=["--allow-unverified-cart", "a-cart-that-is-not-this-one"],
+               timeout=60)
+    check("naming a DIFFERENT cart still REFUSES (exit 3)", rc4 == 3, f"exit={rc4}")
+    check("so the bypass is an allowlist, not an amnesty",
+          rc3 != 3 and rc4 == 3, "same cart, two names: one excuses it, one does not")
+
 finally:
     for p in created:
         try:
