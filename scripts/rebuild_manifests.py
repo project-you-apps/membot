@@ -49,12 +49,36 @@ from cart_io import (
 )
 
 
+_CART_SUFFIXES = (".cart.npz", ".cart.pkl")
+
+
 def find_cart_files(directory: str) -> list[str]:
     """Find every cart file (.cart.npz or .cart.pkl) in a directory."""
     out = []
     for root, _, files in os.walk(directory):
         for f in sorted(files):
-            if f.endswith(".cart.npz") or f.endswith(".cart.pkl"):
+            if f.endswith(_CART_SUFFIXES):
+                out.append(os.path.join(root, f))
+    return out
+
+
+def find_unswept(directory: str) -> list[str]:
+    """Loadable-looking files this sweep will NOT touch, and must therefore name.
+
+    ⛔ WHY: on 2026-11-13 `test-sysco.cart copy.npz` -- a 9.2 MB Windows duplicate
+      of a client-data cart -- sat in cartridges/ and the sweep reported CLEAN.
+      `.cart copy.npz` does not end in `.cart.npz`, so it was skipped in silence
+      while still being a perfectly loadable npz that a path-taking mount could
+      open. An `arxiv_2400k_lite copy.pkl` was there too, on the PICKLE path.
+
+    ⇒ A hygiene tool that says "clean" about the files it happened to match is
+      reporting its own glob, not the directory. This makes the gap audible.
+      It does not act on them: naming them is the job, deciding is a person's.
+    """
+    out = []
+    for root, _, files in os.walk(directory):
+        for f in sorted(files):
+            if f.endswith((".npz", ".pkl")) and not f.endswith(_CART_SUFFIXES):
                 out.append(os.path.join(root, f))
     return out
 
@@ -268,6 +292,14 @@ def _write_manifest(manifest_path: str, n_texts: int, fingerprint: str,
     }
     # Preserve non-standard fields from the existing manifest.
     if preserve_extra:
+        # `rebuilt_by` is in `base`, so the loop below would silently drop it --
+        # and it is the only record of WHICH of the six fingerprint
+        # implementations wrote this manifest (heartbeat's said
+        # `multi_cart.imprint_with_meta`). That is evidence about the codebase,
+        # and a sweep is the one moment it can still be captured.
+        prior_writer = preserve_extra.get("rebuilt_by")
+        if prior_writer and prior_writer != base["rebuilt_by"]:
+            base["previously_rebuilt_by"] = prior_writer
         for k, v in preserve_extra.items():
             if k not in base and not k.startswith("_"):
                 base[k] = v
@@ -399,6 +431,19 @@ def main():
         print("first and last embedding and a count. Passing it means the ENDS")
         print("match, not that the content is intact. Each new manifest records")
         print("this as an upgrade rather than claiming a check it never had.")
+
+    # Named AFTER the verdict, because a verdict that ignores them is a verdict
+    # about the glob rather than about the directory.
+    unswept = find_unswept(args.directory)
+    if unswept:
+        print()
+        print(f"NOT SWEPT -- {len(unswept)} loadable file(s) whose name does not end")
+        print("in .cart.npz or .cart.pkl. This tool cannot verify them and did not")
+        print("touch them. They are still openable by any path-taking mount:")
+        for p in unswept:
+            rel = os.path.relpath(p, args.directory)
+            kind = "PICKLE" if p.endswith(".pkl") else "npz"
+            print(f"  - [{kind}] {rel}")
 
     if args.dry_run:
         print()
