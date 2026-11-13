@@ -113,8 +113,17 @@ def _hash_embeddings(h: "hashlib._Hash", embeddings) -> int:
         return 0
     arr = np.ascontiguousarray(embeddings)
     h.update(f"embeddings:{arr.dtype.str}:{arr.shape}".encode())
-    h.update(memoryview(arr).cast("B"))
-    return len(arr)
+    # ⛔ `memoryview().cast()` raises TypeError on ANY shape containing a zero, so
+    #   a cart with no rows crashed the hash instead of hashing to a stable value.
+    #   Found 2026-11-13 by the first real sweep, on `embed-consistency-test`.
+    #   ⚠ This is the same class as the missing length guard in the inline copies
+    #     this function replaced -- removed there, reintroduced here in a new form.
+    #   ⭐ Nothing is lost by skipping the empty buffer: the shape and dtype line
+    #     above already separates (0, 768) from (0, 384) and both from None.
+    if arr.size:
+        h.update(memoryview(arr).cast("B"))
+    # A 0-d array has no len(). Report rows, not a crash.
+    return int(arr.shape[0]) if arr.ndim else 0
 
 
 def _hash_texts(h: "hashlib._Hash", texts) -> int:
@@ -169,7 +178,15 @@ def compute_fingerprint_legacy(embeddings: np.ndarray, n_texts: int) -> str:
     a bare mismatch cannot distinguish them.
     """
     h = hashlib.sha256()
-    if embeddings is not None and len(embeddings) > 0:
+    # ⛔ Was `len(embeddings) > 0`, which raises "len() of unsized object" on a
+    #   0-d array -- the same degenerate-shape hole as `_hash_embeddings` had,
+    #   in the function kept to RECOGNIZE the old manifests. Found 2026-11-13 on
+    #   `x.cart.npz`, one cart after the v2 version of this bug was fixed.
+    # ⭐ Identical output for every normal array: for ndim >= 1, `len(a)` IS
+    #   `a.shape[0]`. Only the shapes that previously raised behave differently,
+    #   and a manifest can never have been written for one of those.
+    if (embeddings is not None and getattr(embeddings, "ndim", 0) >= 1
+            and embeddings.shape[0] > 0):
         h.update(embeddings[0].tobytes())
         h.update(embeddings[-1].tobytes())
     h.update(str(n_texts).encode())
