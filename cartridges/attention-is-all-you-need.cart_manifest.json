@@ -2,7 +2,13 @@
   "version": "mcp-v4",
   "count": 24,
   "has_hippocampus": true,
-  "fingerprint": "c26c5978e9fc62e8",
-  "timestamp": "2026-04-08T15:10:46Z",
-  "rebuilt_by": "scripts/rebuild_attention_cart.py"
+  "fingerprint_algo": "sha256-full-v2",
+  "fingerprint": "03e121aa50874dafa421e3e02de9e7aa8489c4ad3d3b03abbeb4f0472e3e2362",
+  "attestation": "upgraded-from-trunc64-ends-v1",
+  "timestamp": "2026-11-13T11:50:02Z",
+  "rebuilt_by": "scripts/rebuild_manifests.py",
+  "previously_rebuilt_by": "scripts/rebuild_attention_cart.py",
+  "upgraded_from_algo": "trunc64-ends-v1",
+  "upgraded_from_fingerprint": "c26c5978e9fc62e8",
+  "upgrade_coverage_note": "trunc64-ends-v1 covered the first embedding, the last embedding and a count -- nothing in between and no passage text. This manifest re-attests the full content as of 2026-11-13T11:50:02Z; it does NOT inherit a guarantee from trunc64-ends-v1, because trunc64-ends-v1 never made one."
 }
