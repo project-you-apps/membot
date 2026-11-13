@@ -5442,8 +5442,27 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
     carts = find_cartridges()
     match = [c for c in carts if c["name"] == clean_name]
 
+    # ⛔⛔ THE SUBSTRING FALLBACK USED TO PICK match[0] SILENTLY.
+    #   Legion's check 7 (forum/legion-to-waving-cat-branches-and-checks-2026-11-13.md):
+    #   "a new file can win a match it was never meant to." ⇒ Confirmed: a cart named
+    #   `redwood` matched `redwood-DD-2026` and anything else containing "redwood",
+    #   case-insensitively, and the first in listing order won.
+    # ⭐⭐ AND THE FIX WAS ALREADY WRITTEN FOUR LINES BELOW. The Mempack branch
+    #   refuses when `len(mempack_match) > 1`, with the comment "substring matching
+    #   against Mempacks risks cross-user collision". ⇒ The codebase already knew,
+    #   and applied the knowledge to the adjacent path only.
+    # ⇒ Convenience is kept -- a unique substring still mounts -- but ambiguity is a
+    #   REFUSAL, naming the candidates, rather than a silent choice.
     if not match:
-        match = [c for c in carts if clean_name.lower() in c["name"].lower()]
+        near = [c for c in carts if clean_name.lower() in c["name"].lower()]
+        if len(near) > 1:
+            names = ", ".join(c["name"] for c in near[:10])
+            more = f" (+{len(near) - 10} more)" if len(near) > 10 else ""
+            return (
+                f"'{clean_name}' matches {len(near)} cartridges: {names}{more}. "
+                f"Refusing to guess -- pass the exact name."
+            )
+        match = near
 
     # Mempack fallback: if the standard catalog doesn't have
     # this name, check user-segmented Mempacks. Exact-name match only here —
