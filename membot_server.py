@@ -161,8 +161,14 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
                   world_perms: str | None = None,
                   group_id: str | None = None,
                   max_patterns: int | None = None,
-                  cart_type: str | None = None):
+                  cart_type: str | None = None,
+                  texts=None):
     """Save integrity manifest alongside cartridge.
+
+    ⛔ `texts` is required in practice (2026-11-12). It is last in the keyword list
+    so no positional argument changed meaning, and it raises rather than defaulting,
+    because the v1 fingerprint it replaces covered only the first and last embedding
+    and no passage text at all -- a default would silently reproduce that.
 
     Pattern 0 v2 fields:
       briefing      — UTF-8 text presented to agents on mount (Phase 1)
@@ -177,11 +183,20 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
     them mount with world_perms=r (treat legacy carts as publicly readable) so
     existing flows keep working unchanged.
     """
+    if texts is None:
+        raise TypeError(
+            "save_manifest() requires texts=. Without it the fingerprint cannot "
+            "cover passage content, which was the v1 defect."
+        )
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     manifest = {
         "version": "mcp-v3",
         "count": n_texts,
-        "fingerprint": compute_fingerprint(embeddings, n_texts),
+        # ⭐ The algorithm is NAMED in the manifest so a reader can tell a v1
+        #   manifest from an altered v2 one. Without it, "mismatch" is the only
+        #   available verdict and the two need different responses.
+        "fingerprint_algo": FINGERPRINT_ALGO,
+        "fingerprint": compute_fingerprint(embeddings, n_texts, texts=texts),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     # Optional Pattern 0 v2 fields — only emit when caller supplied them so legacy
@@ -1041,6 +1056,7 @@ from cart_io import (          # noqa: F401  (re-exported for backward compatibi
     CARTRIDGE_DIRS,
     compute_fingerprint,
     verify_manifest,
+    FINGERPRINT_ALGO,
     is_trusted_directory,
     load_cartridge_safe,
     load_pkl_cartridge,
@@ -7572,7 +7588,8 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
 
         # Save integrity manifest
-        manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]))
+        manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]),
+                                 texts=state["texts"])
         state["modified"] = False
 
         # Bump AFTER a successful write, never before: bumping first and then failing
@@ -9845,6 +9862,7 @@ async def rest_copy(request: Request) -> JSONResponse:
             group_id=dst_manifest.get("group_id"),
             max_patterns=dst_manifest.get("max_patterns"),
             cart_type=dst_manifest.get("cart_type"),
+            texts=dst_texts,
         )
 
         log.info(f"Copy (legacy fs): {src_cart_name}#{src_idx} -> {dst_path}")
@@ -10699,7 +10717,7 @@ if __name__ == "__main__":
             empty_path = os.path.join(save_dir, f"{cart_name}.cart.npz")
             empty_emb = np.zeros((0, 768), dtype=np.float32)
             save_as_npz(empty_path, empty_emb, [])
-            save_manifest(empty_path, empty_emb, 0)
+            save_manifest(empty_path, empty_emb, 0, texts=[])
             log.info(f"Created empty cartridge: {empty_path}")
 
         # Mount into default session (bypass @mcp.tool decorator)

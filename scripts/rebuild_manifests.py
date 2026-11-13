@@ -32,6 +32,7 @@ from membot_server import (
     load_cartridge_safe,
     compute_fingerprint,
     verify_manifest,
+    FINGERPRINT_ALGO,
 )
 
 
@@ -76,7 +77,7 @@ def rebuild_one(cart_path: str, dry_run: bool = False, force: bool = False) -> d
     embeddings = data.get("embeddings")
     texts = data.get("texts", [])
     n_texts = len(texts)
-    actual_fp = compute_fingerprint(embeddings, n_texts)
+    actual_fp = compute_fingerprint(embeddings, n_texts, texts=texts)
     result["actual_fp"] = actual_fp
 
     manifest_p = manifest_path_for(cart_path)
@@ -143,6 +144,9 @@ def _write_manifest(manifest_path: str, n_texts: int, fingerprint: str,
         "version": "mcp-v4",
         "count": n_texts,
         "has_hippocampus": has_hippocampus,
+        # ⭐ In `base`, not merely appended, so `preserve_extra` below cannot carry
+        #   a STALE fingerprint_algo forward from the manifest being replaced.
+        "fingerprint_algo": FINGERPRINT_ALGO,
         "fingerprint": fingerprint,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "rebuilt_by": "scripts/rebuild_manifests.py",

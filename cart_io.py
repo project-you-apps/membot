@@ -61,8 +61,113 @@ CARTRIDGE_DIRS = [
 _HIPPO_FORMAT = '<I B B I I I I H I B B 34s'
 
 
-def compute_fingerprint(embeddings: np.ndarray, n_texts: int) -> str:
-    """Compute SHA256 fingerprint from embedding content + count."""
+# ═════════════════════════════════════════════════════════════════════════════
+# INTEGRITY FINGERPRINT
+#
+# ⛔⛔ WHAT THE v1 ALGORITHM ACTUALLY COVERED, measured 2026-11-12:
+#
+#     h.update(embeddings[0].tobytes())
+#     h.update(embeddings[-1].tobytes())
+#     h.update(str(n_texts).encode())
+#     return h.hexdigest()[:16]
+#
+#   · the FIRST and LAST embedding only ⇒ every embedding in between could be
+#     altered freely and the fingerprint still matched
+#   · NO passage text at all ⇒ a passage could be rewritten undetected
+#   · truncated to 16 hex chars ⇒ 64 bits
+#   · and `verify_manifest` returned (True, "no manifest (legacy cartridge)")
+#     when the manifest was ABSENT, so an unmanifested cart VERIFIED.
+#
+# ⭐⭐ WHY THIS MATTERS MORE THAN IT LOOKS. On 2026-10-18 the boot path was fixed
+#   to act on its integrity verdict -- Andy: "if it doesn't see if it's ok what's
+#   the point of checking in the first place?" ⇒ So the ENFORCEMENT was correct
+#   and the CHECK was nearly meaningless. A gate faithfully enforcing a test that
+#   tested almost nothing is worse than a missing gate, because it reads as cover.
+#
+# ⓘ Found by reading a fleet test TITLE on dp-web4/membot, branch
+#   codex/membot-save-race-review:
+#     test_manifest_covers_text_and_middle_embedding_not_just_group_metadata
+#
+# ⭐ A FINGERPRINT IS INTEGRITY, NEVER AUTHENTICITY. It proves the bytes did not
+#   change. It says nothing about who produced them. Authenticity needs a
+#   signature, which is gate 2 of the gauntlet and is not this function's job.
+#   See docs/DESIGN-the-gauntlet-verify-before-materialize-2026-11-12.md
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Written into every new manifest and checked on read, so a v1 manifest is a
+# NAMED refusal rather than an unexplained mismatch.
+FINGERPRINT_ALGO = "sha256-full-v2"
+LEGACY_ALGO = "trunc64-ends-v1"
+
+
+def _hash_embeddings(h: "hashlib._Hash", embeddings) -> int:
+    """Hash EVERY embedding, with shape and dtype bound in. Returns rows hashed.
+
+    ⭐ Shape and dtype are hashed because `(2, 768) float32` and `(768, 2) float32`
+      hold the same bytes and are not the same cartridge.
+    ⓘ Uses a memoryview per row rather than `.tobytes()` on the whole array, so a
+      725 MB cart does not get a 725 MB copy made of it to be hashed.
+    """
+    if embeddings is None:
+        h.update(b"embeddings:none")
+        return 0
+    arr = np.ascontiguousarray(embeddings)
+    h.update(f"embeddings:{arr.dtype.str}:{arr.shape}".encode())
+    h.update(memoryview(arr).cast("B"))
+    return len(arr)
+
+
+def _hash_texts(h: "hashlib._Hash", texts) -> int:
+    """Hash every passage, length-prefixed. Returns passages hashed.
+
+    ⛔ LENGTH-PREFIXED ON PURPOSE. Hashing concatenated text makes
+      ["ab", "c"] and ["a", "bc"] identical, so a passage boundary could be moved
+      without changing the digest. The prefix makes the split part of the content.
+    """
+    if texts is None:
+        h.update(b"texts:none")
+        return 0
+    n = 0
+    for t in texts:
+        b = (t if isinstance(t, str) else str(t)).encode("utf-8", "surrogatepass")
+        h.update(len(b).to_bytes(8, "big"))
+        h.update(b)
+        n += 1
+    return n
+
+
+def compute_fingerprint(embeddings: np.ndarray, n_texts: int,
+                        texts=None) -> str:
+    """Full-coverage integrity fingerprint: every embedding, every passage.
+
+    ⛔ `texts` IS REQUIRED. It is a keyword with no default ONLY so that a caller
+      written against the v1 signature fails loudly instead of silently producing
+      a weaker hash. ⇒ This is the day's own lesson applied to our own API: a
+      function that cannot do its whole job must refuse, not do part of it.
+    """
+    if texts is None:
+        raise TypeError(
+            "compute_fingerprint() now requires `texts=`. The v1 algorithm hashed "
+            "only the first and last embedding plus a count, covering no passage "
+            "text at all; passing no texts would silently reproduce that weakness. "
+            "Pass the passage list."
+        )
+    h = hashlib.sha256()
+    h.update(f"{FINGERPRINT_ALGO}\n".encode())
+    n_emb = _hash_embeddings(h, embeddings)
+    n_txt = _hash_texts(h, texts)
+    h.update(f"counts:{n_emb}:{n_txt}:{n_texts}".encode())
+    return h.hexdigest()            # ⭐ full 256 bits, not [:16]
+
+
+def compute_fingerprint_legacy(embeddings: np.ndarray, n_texts: int) -> str:
+    """The v1 algorithm. ⛔ NOT FOR WRITING -- kept only to RECOGNIZE old manifests.
+
+    Lets `verify_manifest` tell "this is an old manifest whose content still
+    matches under the old weak algorithm, rebuild it" apart from "this is an old
+    manifest and the content has changed too". Those need different responses and
+    a bare mismatch cannot distinguish them.
+    """
     h = hashlib.sha256()
     if embeddings is not None and len(embeddings) > 0:
         h.update(embeddings[0].tobytes())
@@ -71,29 +176,84 @@ def compute_fingerprint(embeddings: np.ndarray, n_texts: int) -> str:
     return h.hexdigest()[:16]
 
 
-def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int) -> tuple[bool, str]:
-    """Verify cartridge against its manifest. Returns (ok, message)."""
+# Verdicts. ⛔ Only VERIFIED is a pass. Every other value is a refusal with a
+# reason, which is the opposite of v1's "no manifest => True".
+VERIFIED = "VERIFIED"
+MISMATCH = "MISMATCH"
+COUNT_MISMATCH = "COUNT_MISMATCH"
+NO_MANIFEST = "NO_MANIFEST"
+LEGACY_MANIFEST = "LEGACY_MANIFEST"
+UNREADABLE = "UNREADABLE"
+
+
+def verify_manifest_detail(cart_path: str, embeddings: np.ndarray, n_texts: int,
+                           texts=None) -> tuple[str, str]:
+    """Return (verdict, message). ⭐ The caller cannot mistake a reason for a pass."""
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
+
     if not os.path.exists(manifest_path):
-        return True, "no manifest (legacy cartridge)"
+        # ⛔⛔ v1 RETURNED SUCCESS HERE. An unmanifested cart verified, which made
+        #   "verified" mean "either checked and clean, or never checkable".
+        return NO_MANIFEST, (
+            f"no manifest at {os.path.basename(manifest_path)}. An unverifiable "
+            f"cartridge is not a verified one. Build a manifest with "
+            f"scripts/rebuild_manifests.py."
+        )
 
     try:
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
-
-        expected_fp = manifest.get("fingerprint", "")
-        actual_fp = compute_fingerprint(embeddings, n_texts)
-
-        if expected_fp != actual_fp:
-            return False, f"FINGERPRINT MISMATCH: expected {expected_fp}, got {actual_fp}"
-
-        expected_count = manifest.get("count", -1)
-        if expected_count != n_texts:
-            return False, f"COUNT MISMATCH: expected {expected_count}, got {n_texts}"
-
-        return True, f"verified ({actual_fp})"
     except Exception as e:
-        return False, f"manifest read error: {e}"
+        return UNREADABLE, f"manifest read error: {e}"
+
+    expected_fp = manifest.get("fingerprint", "")
+    algo = manifest.get("fingerprint_algo") or (
+        LEGACY_ALGO if len(expected_fp) == 16 else "")
+
+    expected_count = manifest.get("count", -1)
+    if expected_count != n_texts:
+        return COUNT_MISMATCH, (
+            f"COUNT MISMATCH: manifest says {expected_count}, cart has {n_texts}")
+
+    if algo == LEGACY_ALGO:
+        # Name it, and say whether the old weak check still passes, because
+        # "rebuild me" and "I have been altered" are different emergencies.
+        legacy_fp = compute_fingerprint_legacy(embeddings, n_texts)
+        still = "and its content still matches under that algorithm" \
+            if legacy_fp == expected_fp else \
+            "AND THE CONTENT HAS CHANGED under that algorithm too"
+        return LEGACY_MANIFEST, (
+            f"manifest uses {LEGACY_ALGO}, which covered only the first and last "
+            f"embedding and no passage text, {still}. Rebuild with "
+            f"scripts/rebuild_manifests.py to get {FINGERPRINT_ALGO}."
+        )
+
+    if algo != FINGERPRINT_ALGO:
+        return UNREADABLE, (
+            f"manifest declares unknown fingerprint_algo {algo!r}; expected "
+            f"{FINGERPRINT_ALGO}. Refusing rather than guessing.")
+
+    actual_fp = compute_fingerprint(embeddings, n_texts, texts=texts)
+    if expected_fp != actual_fp:
+        return MISMATCH, (
+            f"FINGERPRINT MISMATCH: expected {expected_fp[:16]}..., "
+            f"got {actual_fp[:16]}...")
+
+    return VERIFIED, f"verified ({FINGERPRINT_ALGO}, {actual_fp[:16]}...)"
+
+
+def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
+                    texts=None) -> tuple[bool, str]:
+    """(ok, message), where ⭐ ok is True ONLY for VERIFIED.
+
+    Signature and return SHAPE are unchanged from v1 on purpose, so the four
+    existing call sites -- membot_server.py:5502 and :10737, multi_cart.py:162,
+    test_boot_integrity.py -- pick up the corrected behaviour without edits and
+    without any chance of a truthy reason string being read as a pass.
+    """
+    verdict, msg = verify_manifest_detail(cart_path, embeddings, n_texts,
+                                          texts=texts)
+    return verdict == VERIFIED, f"[{verdict}] {msg}"
 
 
 def is_trusted_directory(path: str) -> bool:

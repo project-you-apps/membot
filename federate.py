@@ -285,14 +285,19 @@ def _save_federated_cart(cart_path: str, texts: list[str], embeddings: np.ndarra
         version="federate-v1",
     )
 
-    # Write integrity manifest matching membot_server's verify_manifest format
-    import hashlib
-    h = hashlib.sha256()
-    if len(embeddings) > 0:
-        h.update(embeddings[0].tobytes())
-        h.update(embeddings[-1].tobytes())
-    h.update(str(len(texts)).encode())
-    fingerprint = h.hexdigest()[:16]
+    # Write integrity manifest matching membot_server's verify_manifest format.
+    #
+    # ⛔⛔ THIS BLOCK USED TO REIMPLEMENT THE FINGERPRINT INLINE:
+    #     h.update(embeddings[0].tobytes()); h.update(embeddings[-1].tobytes())
+    #     h.update(str(len(texts)).encode()); fingerprint = h.hexdigest()[:16]
+    #   A copy-paste of cart_io's v1 algorithm, in a different file. ⇒ When v1 was
+    #   replaced on 2026-11-12, this copy would have kept writing v1 manifests and
+    #   every federated cart would have verified as LEGACY_MANIFEST forever, with
+    #   nothing pointing at why.
+    # ⭐ Two implementations of one algorithm always diverge; the only question is
+    #   when you notice. Call the real function.
+    from cart_io import compute_fingerprint, FINGERPRINT_ALGO
+    fingerprint = compute_fingerprint(embeddings, len(texts), texts=texts)
 
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     # cart_path ends with .cart.npz so the manifest goes next to it as
@@ -303,6 +308,7 @@ def _save_federated_cart(cart_path: str, texts: list[str], embeddings: np.ndarra
     manifest = {
         "version": "federate-v1",
         "count": len(texts),
+        "fingerprint_algo": FINGERPRINT_ALGO,
         "fingerprint": fingerprint,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "format": "federated_cart",

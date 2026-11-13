@@ -245,16 +245,19 @@ def main():
     # Re-run the rebuild_manifests script logic to update the manifest fingerprint
     print()
     print("Updating manifest fingerprint to match final cart...")
-    h = hashlib.sha256()
-    h.update(embeddings[0].tobytes())
-    h.update(embeddings[-1].tobytes())
-    h.update(str(len(entries)).encode())
-    final_fingerprint = h.hexdigest()[:16]
+    # ⛔⛔ WAS AN INLINE COPY of cart_io's v1 fingerprint (first + last
+    #   embedding + count, truncated to 64 bits, no passage text). One of SIX
+    #   implementations of one algorithm found on 2026-11-12. ⇒ Call the real one.
+    #   ⚠ This copy also lacked the len() guard, so it would IndexError on an
+    #   empty cart. Fixed incidentally by calling the function.
+    from cart_io import compute_fingerprint, FINGERPRINT_ALGO
+    final_fingerprint = compute_fingerprint(embeddings, len(entries), texts=entries)
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     manifest = {
         "version": "mcp-v4",
         "count": len(entries),
         "has_hippocampus": True,
+        "fingerprint_algo": FINGERPRINT_ALGO,
         "fingerprint": final_fingerprint,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "rebuilt_by": "scripts/rebuild_attention_cart.py",

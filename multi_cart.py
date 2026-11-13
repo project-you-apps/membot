@@ -824,18 +824,19 @@ def _persist_cart(state: dict, per_pattern_meta_addition: Optional[dict] = None)
     np.savez_compressed(cart_path, **save_kwargs)
 
     # 3. Rewrite the manifest with the new fingerprint and count
-    h = hashlib.sha256()
-    if len(state["embeddings"]) > 0:
-        h.update(state["embeddings"][0].tobytes())
-        h.update(state["embeddings"][-1].tobytes())
-    h.update(str(len(state["texts"])).encode())
-    fingerprint = h.hexdigest()[:16]
+    # ⛔⛔ WAS AN INLINE COPY of cart_io's v1 fingerprint (first + last
+    #   embedding + count, truncated to 64 bits, no passage text). One of SIX
+    #   implementations of one algorithm found on 2026-11-12. ⇒ Call the real one.
+    from cart_io import compute_fingerprint, FINGERPRINT_ALGO
+    fingerprint = compute_fingerprint(state["embeddings"], len(state["texts"]),
+                                      texts=state["texts"])
 
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     manifest = {
         "version": "mcp-v4",
         "count": len(state["texts"]),
         "has_hippocampus": "hippocampus" in existing_keys,
+        "fingerprint_algo": FINGERPRINT_ALGO,
         "fingerprint": fingerprint,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "rebuilt_by": "multi_cart.imprint_with_meta",

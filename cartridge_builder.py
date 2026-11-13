@@ -506,17 +506,17 @@ def save_cartridge(output_dir: str, name: str, embeddings: np.ndarray, texts: li
     np.savez_compressed(cart_path, **save_kwargs)
 
     # Integrity manifest
-    h = hashlib.sha256()
-    if len(embeddings) > 0:
-        h.update(embeddings[0].tobytes())
-        h.update(embeddings[-1].tobytes())
-    h.update(str(len(texts)).encode())
-    fingerprint = h.hexdigest()[:16]
+    # ⛔⛔ WAS AN INLINE COPY of cart_io's v1 fingerprint (first + last
+    #   embedding + count, truncated to 64 bits, no passage text). One of SIX
+    #   implementations of one algorithm found on 2026-11-12. ⇒ Call the real one.
+    from cart_io import compute_fingerprint, FINGERPRINT_ALGO
+    fingerprint = compute_fingerprint(embeddings, len(texts), texts=texts)
 
     manifest = {
         "version": "mcp-v4",
         "count": len(texts),
         "has_hippocampus": metadata is not None,
+        "fingerprint_algo": FINGERPRINT_ALGO,
         "fingerprint": fingerprint,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
