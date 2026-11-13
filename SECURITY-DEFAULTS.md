@@ -25,7 +25,9 @@ box often describes very little about what is actually running there.
 | `--port` | `8000` | since 2026-02-10 | `cad1975` |
 | writability | **read-only.** `--writable` is the only thing that enables `memory_store` and `save_cartridge` | since 2026-02-10 | `cad1975` |
 | mount integrity | **a failed verification refuses the mount.** It used to be logged and ignored | **2026-10-18** | `a70340a` |
-| `--allow-unverified-mount` | **off** — the explicit, visible way to accept the risk | **2026-10-18** | `a70340a` |
+| `--allow-unverified-mount` | **off.** ⚠ When on it is **GLOBAL** — every cart on the host is un-gated, not just the one you had in mind. Prefer the per-cart form below | **2026-10-18** | `a70340a` |
+| `--allow-unverified-cart NAME` | **not set.** Excuses **one** cart by exact name, repeatable; every other cart stays gated, and a name matching no cart is reported at startup | **2026-11-13** | `83368fa` |
+| `--mount NAME` resolution | **exact name first**; a unique substring still resolves; **an ambiguous name refuses to start** and names the candidates. It previously took the first substring match | **2026-11-13** | `83368fa` |
 | a cart with **no manifest** | **refused.** It used to verify successfully | **2026-11-12** | `bec3ece` |
 | integrity fingerprint | **`sha256-full-v2`** — every embedding with shape and dtype, every passage length-prefixed, full SHA-256, algorithm named in the manifest. Was a 64-bit digest over the first embedding, the last embedding and a count | **2026-11-12** | `bec3ece` |
 | trusted-directory test | **component-aware ancestor match.** A bare string-prefix match previously admitted a sibling directory sharing the prefix | **2026-11-12** | `a7fa937` |
