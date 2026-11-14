@@ -85,7 +85,50 @@ class BridgeHandler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8001)
+    parser.add_argument(
+        '--host', default='127.0.0.1',
+        help="Bind address. Default 127.0.0.1, loopback only. Pass 0.0.0.0 to accept "
+             "connections from other machines. WARNING: this bridge has no "
+             "authentication of any kind and is always writable, so exposing it "
+             "gives anyone who can reach the port read and write access to the "
+             "mounted cartridge. From 2026-11-18 a non-loopback bind will be "
+             "REFUSED rather than warned about.")
     args = parser.parse_args()
 
-    print(f"Membot REST bridge on port {args.port}")
-    HTTPServer(('0.0.0.0', args.port), BridgeHandler).serve_forever()
+    # Was hard-coded to 0.0.0.0, with no flag. Found 2026-11-14 by cbp-claude during
+    # the fleet listener check, on two seats.
+    #
+    # The fix that created the gap: 9d7c471 (2026-10-18) made 127.0.0.1 the default
+    # for membot_server.py and nobody looked at the second server in the same
+    # directory. test_bind_and_auth_defaults.py checks that 'default="0.0.0.0"' does
+    # not appear in membot_server.py's source, which a hard-coded HTTPServer tuple in
+    # another file passes trivially. A check matching one pattern in one file, read as
+    # covering the behaviour.
+    #
+    # Why this is worse here than on the server, and why the posture differs:
+    #   - No auth exists. MEMBOT_API_KEY cannot help: the middleware that enforces it
+    #     is a FastMCP protocol hook, and this bridge calls the tool functions
+    #     in-process, so the key is never consulted.
+    #   - Always writable. _server_config defaults to read_only=False and this entry
+    #     point never runs the main() that would set it from --writable. /store and
+    #     /save therefore work regardless of any flag.
+    #   - No caller identity. _default_session is a constant, so every caller shares
+    #     one session.
+    # => On the server, exposure can be made safe by requiring a key. Here there is
+    #    nothing to require, so exposure has to be refused instead. Staged: warn now,
+    #    refuse from 2026-11-18, so fleet units can add --host first.
+    bind_loopback = mb._bind_is_loopback(args.host)
+
+    print(f"Membot REST bridge on {args.host}:{args.port}")
+    if bind_loopback:
+        print("Bound to loopback - not reachable from other machines.")
+    else:
+        print("WARNING: bound to a non-loopback address.")
+        print("  This bridge has NO authentication and is ALWAYS writable.")
+        print("  Anyone who can reach this port can read the mounted cartridge,")
+        print("  write into it with /store, and persist that with /save.")
+        print("  From 2026-11-18 this will refuse to start. Put a proxy in front,")
+        print("  or bind loopback and reach it through that.")
+    print("Writable: yes, unconditionally. This bridge has no read-only mode.")
+
+    HTTPServer((args.host, args.port), BridgeHandler).serve_forever()

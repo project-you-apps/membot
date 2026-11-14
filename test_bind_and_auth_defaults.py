@@ -87,6 +87,55 @@ check("public demo: read-only, no key, 0.0.0.0", rc3 != REFUSE_CODE, f"exit={rc3
 rc4, _ = boot(["--host", "0.0.0.0", "--writable"], env_key="s3cret", settle=25)
 check("authenticated: writable, 0.0.0.0, WITH a key", rc4 != REFUSE_CODE, f"exit={rc4}")
 
+print("\n3b · EVERY entry point that binds a socket, not just this one")
+# This file's section 1 checks that 'default="0.0.0.0"' is absent from
+# membot_server.py. On 2026-11-14 cbp-claude found membot_rest_bridge.py binding
+# with a hard-coded HTTPServer(('0.0.0.0', port)) and no --host flag at all, on two
+# fleet seats, unauthenticated and unconditionally writable.
+#
+# Section 1 passed the whole time. It matched ONE pattern in ONE file, and was read
+# as covering the behaviour. A literal in a different file and a different syntax is
+# invisible to it.
+#
+# => Scan every entry point in the tree for a non-loopback bind literal instead.
+import glob  # noqa: E402
+import re  # noqa: E402
+
+BIND_LITERAL = re.compile(r"""(HTTPServer|serve|run|bind)\s*\(\s*\(?\s*["']0\.0\.0\.0["']""")
+
+entry_points, offenders = [], []
+for path in sorted(glob.glob(os.path.join(HERE, "**", "*.py"), recursive=True)):
+    rel = os.path.relpath(path, HERE).replace("\\", "/")
+    if rel.startswith("droplet-snapshot") or "/tests/" in f"/{rel}" or rel.startswith("test_"):
+        continue
+    text = open(path, encoding="utf-8", errors="replace").read()
+    if "__main__" not in text:
+        continue
+    entry_points.append(rel)
+    for i, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if s.startswith("#") or '"""' in s:
+            continue
+        if BIND_LITERAL.search(s):
+            offenders.append(f"{rel}:{i}")
+
+check(f"scanned {len(entry_points)} entry points, not one file", len(entry_points) >= 2,
+      ", ".join(entry_points[:4]) + ("..." if len(entry_points) > 4 else ""))
+check("no entry point hard-codes a non-loopback bind", not offenders,
+      "; ".join(offenders))
+
+# POSITIVE CONTROL. A scanner that finds nothing is indistinguishable from a scanner
+# that matches nothing, which is exactly how the original check passed for a month.
+check("the scanner can actually see such a line",
+      bool(BIND_LITERAL.search("    HTTPServer(('0.0.0.0', args.port), H).serve_forever()")),
+      "probe is the exact line that was in the bridge")
+
+check("the bridge has a --host flag defaulting to loopback",
+      "parser.add_argument(\n        '--host', default='127.0.0.1'" in
+      open(os.path.join(HERE, "membot_rest_bridge.py"), encoding="utf-8").read()
+      or "'--host', default='127.0.0.1'" in
+      open(os.path.join(HERE, "membot_rest_bridge.py"), encoding="utf-8").read())
+
 print("\n§4 · CONTROL — the refusal is caused by the combination, not by one flag")
 # Each of the three above differs from §2 by exactly ONE thing and each one boots.
 # If any of them had also been refused, §2 would prove nothing about the rule.

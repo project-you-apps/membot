@@ -35,6 +35,30 @@ box often describes very little about what is actually running there.
 | pickle-format carts | opened only from a configured trusted directory | since v1.0, 2026-02-08 | `c2199e3` |
 | `MAX_ENTRIES` / `MAX_TEXT` | `3,000,000` / `10,000` | since v1.0, 2026-02-08 | `c2199e3` |
 | `MEMBOT_API_KEY` | **unset, meaning no authentication.** Setting it enables the check | since 2026-02-10 | `cad1975` |
+| `membot_rest_bridge.py --host` | **`127.0.0.1`.** ⛔ The bind was **hard-coded to `0.0.0.0` with no flag at all** from 2026-03-31 until this change | **2026-11-14** | see git log |
+
+---
+
+## ⛔ `membot_rest_bridge.py` is a second server, and it is not the one above
+
+It runs alongside the MCP server, serves `POST /store`, `/search`, `/mount`, `/save` and
+`GET /status`, and **none of the protections on this page apply to it.**
+
+- **It has no authentication, and `MEMBOT_API_KEY` cannot give it any.** The middleware that
+  enforces the key is a FastMCP protocol hook; the bridge calls the tool functions in-process,
+  so the key is never consulted.
+- **It is always writable.** `--writable` is a flag on the *server*, and the bridge never runs
+  the code that reads it, so `/store` and `/save` work regardless.
+- **It has no caller identity.** The session id is a constant, so every caller shares one
+  session.
+
+⇒ **Run it on loopback.** As of 2026-11-14 that is the default; from **2026-11-18** a
+non-loopback bind is refused rather than warned about. If you need it reachable, put a proxy in
+front that does the authentication this program does not.
+
+⚠ **Check your own units for it:** `ss -ltn '( sport = :8001 )'`. It was found on two fleet
+seats on 2026-11-14 binding all interfaces, because the 2026-10-18 loopback default was applied
+to `membot_server.py` and nobody looked at the second server in the same directory.
 
 The boot log prints the live values of the last several on every start — read it rather than
 inferring them from the unit file.
