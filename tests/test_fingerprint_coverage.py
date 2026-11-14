@@ -113,18 +113,35 @@ def main() -> int:
         check("D2_no_manifest_ok_is_False", ok, False,
               "v1 returned True with 'no manifest (legacy cartridge)'")
 
-        # a good v2 manifest
+        # ⛔ REWRITTEN 2026-11-13 for v3, and the reason matters more than the edit.
+        #   These checks used to alter the ARRAYS PASSED IN while leaving the file
+        #   alone. v2 hashed the caller's arrays, so that worked. v3 hashes the FILE,
+        #   so altering an argument now proves nothing -- the cart on disk is what is
+        #   attested. ⇒ The tamper has to happen to the file, which is also the only
+        #   tamper an attacker can actually perform.
+        # ⚠ KNOWN LIMIT, written down rather than left implicit: because v3 re-reads
+        #   the file, the bytes verified are not provably the bytes a caller already
+        #   loaded into RAM. Closing that needs the digest computed during the single
+        #   load. See cart_io's note; not done here.
+        good = c.fingerprint_cart_file(cart)
         Path(man).write_text(json.dumps({
             "count": len(txt), "fingerprint_algo": c.FINGERPRINT_ALGO,
-            "fingerprint": base}), encoding="utf-8")
+            "fingerprint": good}), encoding="utf-8")
         v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
-        check("good_v2_manifest_VERIFIES", v, c.VERIFIED)
+        check("good_v3_manifest_VERIFIES", v, c.VERIFIED)
 
-        # the same manifest against altered content
+        # the same manifest against an altered FILE
+        np.savez_compressed(cart, embeddings=mid)
         v, _ = c.verify_manifest_detail(cart, mid, len(txt), texts=txt)
         check("altered_middle_embedding_is_MISMATCH", v, c.MISMATCH)
-        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=t2)
-        check("altered_text_is_MISMATCH", v, c.MISMATCH)
+
+        # and an array v2 never covered at all
+        np.savez_compressed(cart, embeddings=emb,
+                            hippocampus=np.full((len(txt), 64), 7, dtype=np.uint8))
+        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
+        check("added_unsealed_array_is_MISMATCH", v, c.MISMATCH,
+              "v2 returned VERIFIED here")
+        np.savez_compressed(cart, embeddings=emb)   # restore for the v1 checks below
 
         # a v1 manifest must be NAMED, not silently mismatched
         Path(man).write_text(json.dumps({

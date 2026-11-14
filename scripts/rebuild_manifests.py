@@ -44,7 +44,9 @@ from cart_io import (
     load_cartridge_safe,
     compute_fingerprint,
     compute_fingerprint_legacy,
+    fingerprint_cart_file,
     FINGERPRINT_ALGO,
+    V2_ALGO,
     LEGACY_ALGO,
 )
 
@@ -143,8 +145,10 @@ def rebuild_one(cart_path: str, dry_run: bool = False, force: bool = False,
     # One unhashable cart must not end the sweep. Before this guard a single
     # zero-row cart raised out of main(), and the 13 carts after it were never
     # examined -- a crash in the instrument reported as silence about the rest.
+    # ⭐ v3 is computed from the FILE, so it covers every array the loader reads
+    #   rather than the two this function happens to hold.
     try:
-        actual_fp = compute_fingerprint(embeddings, n_texts, texts=texts)
+        actual_fp = fingerprint_cart_file(cart_path)
     except Exception as e:
         result["status"] = "error"
         result["action"] = f"fingerprint failed: {type(e).__name__}: {e}"
@@ -212,6 +216,47 @@ def rebuild_one(cart_path: str, dry_run: bool = False, force: bool = False,
             _write_manifest(manifest_p, n_texts, actual_fp,
                             has_hippocampus=has_hippo, preserve_extra=existing,
                             attestation="re-attested")
+        return result
+
+    # ---- v2: verify under v2 BEFORE upgrading to v3 -----------------------
+    # v2 covered embeddings and passages and nothing else. Passing it means those
+    # two match; it says nothing about hippocampus, per_pattern_meta or sign_bits,
+    # which the loader also reads. ⇒ Same shape as the v1 upgrade: the check that
+    # can be made is made, and the manifest records exactly what it was worth.
+    if prior_algo == V2_ALGO:
+        try:
+            v2_fp = compute_fingerprint(embeddings, n_texts, texts=texts)
+        except Exception as e:
+            result["status"] = "error"
+            result["action"] = f"v2 fingerprint failed: {type(e).__name__}: {e}"
+            return result
+        if v2_fp != expected_fp or not count_matches:
+            detail = []
+            if v2_fp != expected_fp:
+                detail.append(f"v2 fingerprint {expected_fp[:16]}... != {v2_fp[:16]}...")
+            if not count_matches:
+                detail.append(f"count {expected_count} != {n_texts}")
+            if not accept_content_change:
+                result["status"] = "refused"
+                result["action"] = (
+                    f"INTEGRITY FAILURE under {V2_ALGO}: " + "; ".join(detail)
+                    + ". The embeddings or passages have changed since the manifest "
+                      "was written, so upgrading it would attest to content nothing "
+                      "vouched for. Refusing."
+                )
+                return result
+            result["status"] = "rebuilt"
+            result["action"] = ("v2 check FAILED, --accept-content-change given: "
+                                + "; ".join(detail))
+        else:
+            result["status"] = "upgraded"
+            result["action"] = (f"verified under {V2_ALGO} (embeddings and passages "
+                                f"only); upgraded to {FINGERPRINT_ALGO}")
+        if not dry_run:
+            _write_manifest(manifest_p, n_texts, actual_fp,
+                            has_hippocampus=has_hippo, preserve_extra=existing,
+                            attestation="upgraded-from-" + V2_ALGO,
+                            prior_algo=prior_algo, prior_fingerprint=expected_fp)
         return result
 
     # ---- unknown algorithm ------------------------------------------------
@@ -307,11 +352,21 @@ def _write_manifest(manifest_path: str, n_texts: int, fingerprint: str,
     if prior_algo:
         base["upgraded_from_algo"] = prior_algo
         base["upgraded_from_fingerprint"] = prior_fingerprint
+        # ⚠ The note must describe the algorithm actually superseded. It was written
+        #   for v1 and would have stated something false about v2, which covered a
+        #   great deal more than "the ends and a count".
+        if prior_algo == V2_ALGO:
+            covered = ("covered every embedding and every passage, and left every "
+                       "other array in the cart unsealed -- hippocampus, which "
+                       "carries the tombstone flag that hides a passage from search, "
+                       "and per_pattern_meta, which carries attribution")
+        else:
+            covered = ("covered the first embedding, the last embedding and a count "
+                       "-- nothing in between and no passage text")
         base["upgrade_coverage_note"] = (
-            f"{prior_algo} covered the first embedding, the last embedding and a "
-            f"count -- nothing in between and no passage text. This manifest "
-            f"re-attests the full content as of {now}; it does NOT inherit a "
-            f"guarantee from {prior_algo}, because {prior_algo} never made one."
+            f"{prior_algo} {covered}. This manifest re-attests the full file as of "
+            f"{now}; it does NOT inherit a guarantee from {prior_algo}, because "
+            f"{prior_algo} never made one over what is now covered."
         )
     else:
         base.pop("upgraded_from_algo", None)
@@ -372,6 +427,11 @@ def main():
     counts = {"ok": 0, "upgraded": 0, "rebuilt": 0, "created": 0,
               "refused": 0, "error": 0, "skipped": 0}
     refused_details = []
+    # ⛔ The summary used to print "upgraded from <LEGACY_ALGO>" no matter which
+    #   algorithm was actually superseded. With v2 manifests on disk it reported 17
+    #   upgrades from v1, which was a confident statement about the wrong thing.
+    #   ⇒ Count what happened instead of asserting it.
+    upgraded_from: dict = {}
 
     for cart_path in cart_files:
         rel = os.path.relpath(cart_path, args.directory)
@@ -383,6 +443,8 @@ def main():
         if status == "ok":
             print(f"  [ok]       {rel}")
         elif status == "upgraded":
+            _from = result.get("prior_algo") or "unknown"
+            upgraded_from[_from] = upgraded_from.get(_from, 0) + 1
             print(f"  [upgrade]  {rel}")
             print(f"             {result['action']}")
         elif status == "rebuilt":
@@ -410,7 +472,9 @@ def main():
               f"nothing refused.")
     print("=" * 66)
     print(f"  ok (already {FINGERPRINT_ALGO}): {counts['ok']}")
-    print(f"  upgraded from {LEGACY_ALGO}:  {counts['upgraded']}")
+    print(f"  upgraded:                       {counts['upgraded']}")
+    for _from, _n in sorted(upgraded_from.items()):
+        print(f"      from {_from}: {_n}")
     print(f"  rewritten:                      {counts['rebuilt']}")
     print(f"  created:                        {counts['created']}")
     print(f"  REFUSED:                        {counts['refused']}")
@@ -427,10 +491,16 @@ def main():
 
     if counts["upgraded"]:
         print()
-        print(f"NOTE on the {counts['upgraded']} upgraded: {LEGACY_ALGO} covered the")
-        print("first and last embedding and a count. Passing it means the ENDS")
-        print("match, not that the content is intact. Each new manifest records")
-        print("this as an upgrade rather than claiming a check it never had.")
+        print(f"NOTE on the {counts['upgraded']} upgraded. An upgrade re-attests the "
+              f"whole file now;")
+        print("it does not inherit a guarantee the old algorithm never made:")
+        if LEGACY_ALGO in upgraded_from:
+            print(f"  {LEGACY_ALGO}: covered the first and last embedding and a count.")
+            print("    Passing it means the ENDS matched, not that content was intact.")
+        if V2_ALGO in upgraded_from:
+            print(f"  {V2_ALGO}: covered every embedding and every passage, and NO")
+            print("    other array -- hippocampus (whose tombstone flag hides a passage")
+            print("    from search) and per_pattern_meta (attribution) were unsealed.")
 
     # Named AFTER the verdict, because a verdict that ignores them is a verdict
     # about the glob rather than about the directory.

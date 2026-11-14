@@ -828,9 +828,12 @@ def _persist_cart(state: dict, per_pattern_meta_addition: Optional[dict] = None)
     # ⛔⛔ WAS AN INLINE COPY of cart_io's v1 fingerprint (first + last
     #   embedding + count, truncated to 64 bits, no passage text). One of SIX
     #   implementations of one algorithm found on 2026-11-12. ⇒ Call the real one.
-    from cart_io import compute_fingerprint, FINGERPRINT_ALGO
-    fingerprint = compute_fingerprint(state["embeddings"], len(state["texts"]),
-                                      texts=state["texts"])
+    from cart_io import fingerprint_cart_file, FINGERPRINT_ALGO
+    # ⛔ v3 fingerprints the FILE, not the arrays this function happens to hold.
+    #   v2 covered embeddings and passages and left hippocampus, per_pattern_meta
+    #   and sign_bits unsealed -- all of which the loader reads. Passing a subset
+    #   is impossible here because the function takes a path.
+    fingerprint = fingerprint_cart_file(cart_path)
 
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     manifest = {

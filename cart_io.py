@@ -96,8 +96,29 @@ _HIPPO_FORMAT = '<I B B I I I I H I B B 34s'
 
 # Written into every new manifest and checked on read, so a v1 manifest is a
 # NAMED refusal rather than an unexplained mismatch.
-FINGERPRINT_ALGO = "sha256-full-v2"
+FINGERPRINT_ALGO = "sha256-members-v3"
+V2_ALGO = "sha256-full-v2"
 LEGACY_ALGO = "trunc64-ends-v1"
+
+# ⛔⛔ WHY v3 EXISTS, 2026-11-13. v2 hashed every embedding and every passage, which
+#   sounded like full coverage and was not: the LOADER reads more than that. Measured
+#   on a real cart, with the preconditions checked rather than assumed --
+#
+#       embeddings identical, passages identical, `hippocampus` tampered
+#       => fingerprint IDENTICAL. The seal did not cover it.
+#
+#   `hippocampus` carries the TOMBSTONE flag, and the search path honours it:
+#   `if flags & 0x01: continue`. ⇒ Setting one bit removes a passage from every search
+#   result while the cart still verifies and still matches the hash a signed package
+#   names. `per_pattern_meta` carries agent_id / written_at / origin / tags, so
+#   ATTRIBUTION was unsealed too.
+#
+# ⭐ THE FIX IS NOT A LONGER LIST. v2's defect was a whitelist that fell behind what the
+#   loader reads, and adding the missing names would only reset that clock. v3 hashes
+#   EVERY member of the file, so an array added next year is covered on the day it is
+#   added, by nobody remembering anything.
+# ⇒ And the primitive takes a PATH, not arrays: a caller cannot hand it an incomplete
+#   set, because it does not accept a set.
 
 
 def _hash_embeddings(h: "hashlib._Hash", embeddings) -> int:
@@ -162,11 +183,79 @@ def compute_fingerprint(embeddings: np.ndarray, n_texts: int,
             "Pass the passage list."
         )
     h = hashlib.sha256()
-    h.update(f"{FINGERPRINT_ALGO}\n".encode())
+    # ⚠ Pinned to V2_ALGO, not FINGERPRINT_ALGO. This function must keep producing the
+    #   v2 digest forever so a v2 manifest can still be RECOGNISED after v3 shipped.
+    h.update(f"{V2_ALGO}\n".encode())
     n_emb = _hash_embeddings(h, embeddings)
     n_txt = _hash_texts(h, texts)
     h.update(f"counts:{n_emb}:{n_txt}:{n_texts}".encode())
     return h.hexdigest()            # ⭐ full 256 bits, not [:16]
+
+
+def fingerprint_members(members) -> str:
+    """v3: hash EVERY array in a cart, name + dtype + shape + bytes, in sorted order.
+
+    `members` is a mapping of npz member name -> array, i.e. everything the file holds
+    rather than everything one caller happened to pass.
+
+    ⭐ Sorted by name so the digest does not depend on the order numpy hands members
+      back, and the name is hashed with the data so moving bytes between two members
+      cannot cancel out.
+    ⭐ Shape and dtype are bound in for the same reason they were in v2: (2, 768) and
+      (768, 2) hold the same bytes and are not the same cart.
+    """
+    h = hashlib.sha256()
+    h.update(f"{FINGERPRINT_ALGO}\n".encode())
+    names = sorted(str(k) for k in members.keys())
+    h.update(f"members:{len(names)}\n".encode())
+    for name in names:
+        arr = np.asarray(members[name])
+        nb = name.encode("utf-8")
+        h.update(len(nb).to_bytes(8, "big"))
+        h.update(nb)
+        h.update(f"|{arr.dtype.str}|{arr.shape}|".encode())
+        if arr.dtype == object:
+            # Object arrays hold Python values, not a contiguous buffer. Hash each
+            # element's repr-free bytes the same way v2 hashed passages: length
+            # prefixed, so an element boundary cannot be moved undetected.
+            flat = arr.reshape(-1)
+            h.update(f"obj:{flat.size}".encode())
+            for item in flat:
+                b = (item if isinstance(item, (bytes, bytearray))
+                     else str(item).encode("utf-8", "surrogatepass"))
+                h.update(len(b).to_bytes(8, "big"))
+                h.update(b)
+        elif arr.size:
+            h.update(memoryview(np.ascontiguousarray(arr)).cast("B"))
+    return h.hexdigest()
+
+
+def fingerprint_cart_file(cart_path: str) -> str:
+    """v3 fingerprint of a cart ON DISK. ⭐ The only way to produce a v3 digest.
+
+    ⛔ Deliberately takes a path rather than arrays. v2's defect was that a caller could
+      pass a subset of the cart and get back something that looked like full coverage;
+      the only durable fix is a function that does not accept a subset.
+    ⚠ Reads the file. For a large cart that is real I/O, but fingerprinting is a
+      build-and-verify operation, not a per-query one.
+
+    ⬜ KNOWN LIMIT, NOT YET CLOSED -- time-of-check to time-of-use.
+      The mount path loads a cart into RAM and then calls the verifier, which reads
+      the file AGAIN. Those are two reads of the same path. ⇒ The bytes attested are
+      not provably the bytes being served: a file replaced between the two reads
+      verifies one artifact while the process serves another.
+      ⚠ v2 did not have this gap, because it hashed what the caller already held --
+        but it hashed only two of the arrays, which is why it was replaced.
+      ⇒ The fix is to compute the digest DURING the single load, inside
+        `load_npz_cartridge`, and have the verifier use that rather than re-reading.
+        It is a small change and it touches the loader plus three call sites, so it
+        wants its own pass rather than being bolted onto this one.
+      ⇒ Until then: v3 attests the file on disk at verification time. That closes the
+        unsealed-array hole and does not close TOCTOU. Both halves are true and the
+        second half should not be quoted without the first.
+    """
+    with np.load(cart_path, allow_pickle=True) as data:
+        return fingerprint_members({k: data[k] for k in data.files})
 
 
 def compute_fingerprint_legacy(embeddings: np.ndarray, n_texts: int) -> str:
@@ -256,12 +345,35 @@ def verify_manifest_detail(cart_path: str, embeddings: np.ndarray, n_texts: int,
             f"scripts/rebuild_manifests.py to get {FINGERPRINT_ALGO}."
         )
 
+    if algo == V2_ALGO:
+        # ⛔ v2 is now LEGACY, and for a sharper reason than v1 was. v1 was weak;
+        #   v2 was INCOMPLETE in a way that reads as complete. It hashed every
+        #   embedding and every passage and nothing else, while the loader also
+        #   reads hippocampus, per_pattern_meta, sign_bits and more. Measured
+        #   2026-11-13: tampering with `hippocampus` leaves the v2 digest identical,
+        #   and `hippocampus` carries the TOMBSTONE flag that hides a passage from
+        #   every search.
+        v2_fp = compute_fingerprint(embeddings, n_texts, texts=texts)
+        still = ("and its embeddings and passages still match under that algorithm"
+                 if v2_fp == expected_fp else
+                 "AND ITS EMBEDDINGS OR PASSAGES HAVE CHANGED under it too")
+        return LEGACY_MANIFEST, (
+            f"manifest uses {V2_ALGO}, which covered embeddings and passage text "
+            f"only and left every other array in the cart unsealed, {still}. "
+            f"Rebuild with scripts/rebuild_manifests.py to get {FINGERPRINT_ALGO}."
+        )
+
     if algo != FINGERPRINT_ALGO:
         return UNREADABLE, (
             f"manifest declares unknown fingerprint_algo {algo!r}; expected "
             f"{FINGERPRINT_ALGO}. Refusing rather than guessing.")
 
-    actual_fp = compute_fingerprint(embeddings, n_texts, texts=texts)
+    # ⭐ v3 is computed from the FILE, not from what this caller happened to pass, so
+    #   the arguments above cannot narrow what gets checked.
+    try:
+        actual_fp = fingerprint_cart_file(cart_path)
+    except Exception as e:                                  # noqa: BLE001
+        return UNREADABLE, f"could not fingerprint the cart file: {e}"
     if expected_fp != actual_fp:
         return MISMATCH, (
             f"FINGERPRINT MISMATCH: expected {expected_fp[:16]}..., "

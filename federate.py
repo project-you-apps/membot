@@ -296,8 +296,12 @@ def _save_federated_cart(cart_path: str, texts: list[str], embeddings: np.ndarra
     #   nothing pointing at why.
     # ⭐ Two implementations of one algorithm always diverge; the only question is
     #   when you notice. Call the real function.
-    from cart_io import compute_fingerprint, FINGERPRINT_ALGO
-    fingerprint = compute_fingerprint(embeddings, len(texts), texts=texts)
+    from cart_io import fingerprint_cart_file, FINGERPRINT_ALGO
+    # ⛔ v3 fingerprints the FILE, not the arrays this function happens to hold.
+    #   v2 covered embeddings and passages and left hippocampus, per_pattern_meta
+    #   and sign_bits unsealed -- all of which the loader reads. Passing a subset
+    #   is impossible here because the function takes a path.
+    fingerprint = fingerprint_cart_file(cart_path)
 
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     # cart_path ends with .cart.npz so the manifest goes next to it as

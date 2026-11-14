@@ -250,8 +250,12 @@ def main():
     #   implementations of one algorithm found on 2026-11-12. ⇒ Call the real one.
     #   ⚠ This copy also lacked the len() guard, so it would IndexError on an
     #   empty cart. Fixed incidentally by calling the function.
-    from cart_io import compute_fingerprint, FINGERPRINT_ALGO
-    final_fingerprint = compute_fingerprint(embeddings, len(entries), texts=entries)
+    from cart_io import fingerprint_cart_file, FINGERPRINT_ALGO
+    # ⛔ v3 fingerprints the FILE, not the arrays this function happens to hold.
+    #   v2 covered embeddings and passages and left hippocampus, per_pattern_meta
+    #   and sign_bits unsealed -- all of which the loader reads. Passing a subset
+    #   is impossible here because the function takes a path.
+    final_fingerprint = fingerprint_cart_file(cart_path)
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     manifest = {
         "version": "mcp-v4",

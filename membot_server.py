@@ -196,7 +196,7 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
         #   manifest from an altered v2 one. Without it, "mismatch" is the only
         #   available verdict and the two need different responses.
         "fingerprint_algo": FINGERPRINT_ALGO,
-        "fingerprint": compute_fingerprint(embeddings, n_texts, texts=texts),
+        "fingerprint": fingerprint_cart_file(cart_path),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     # Optional Pattern 0 v2 fields — only emit when caller supplied them so legacy
@@ -1055,6 +1055,7 @@ def _write_blocked(state: dict) -> str | None:
 from cart_io import (          # noqa: F401  (re-exported for backward compatibility)
     CARTRIDGE_DIRS,
     compute_fingerprint,
+    fingerprint_cart_file,
     verify_manifest,
     unverified_mount_allowed,
     unused_bypass_names,

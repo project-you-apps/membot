@@ -36,7 +36,7 @@ _MEMBOT = os.path.dirname(_HERE)
 sys.path.insert(0, _MEMBOT)
 sys.path.insert(0, os.path.join(_MEMBOT, "scripts"))
 
-from cart_io import compute_fingerprint_legacy  # noqa: E402
+from cart_io import FINGERPRINT_ALGO, compute_fingerprint_legacy  # noqa: E402
 from rebuild_manifests import rebuild_one  # noqa: E402
 
 PASS, FAIL = [], []
@@ -98,8 +98,11 @@ def main():
         r2 = rebuild_one(cart_b, dry_run=False)
         check("status is 'upgraded'", r2["status"] == "upgraded", f"got {r2['status']!r}")
         m2 = json.load(open(mp_b, encoding="utf-8"))
-        check("the new manifest is sha256-full-v2",
-              m2.get("fingerprint_algo") == "sha256-full-v2")
+        # ⚠ Tracks the constant, not a version string. This read "sha256-full-v2"
+        #   and broke the day v3 shipped, which is a test asserting the version
+        #   rather than the property.
+        check(f"the new manifest is {FINGERPRINT_ALGO}",
+              m2.get("fingerprint_algo") == FINGERPRINT_ALGO)
         check("it records that it was an UPGRADE, not a fresh check",
               m2.get("attestation") == "upgraded-from-trunc64-ends-v1")
         check("the superseded v1 fingerprint is preserved",
