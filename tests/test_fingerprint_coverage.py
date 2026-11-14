@@ -107,9 +107,11 @@ def main() -> int:
         man = cart.rsplit(".", 1)[0] + "_manifest.json"
 
         # D2 · NO MANIFEST. v1 returned True here.
-        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
+        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("D2_no_manifest_is_NOT_verified", v, c.NO_MANIFEST)
-        ok, _ = c.verify_manifest(cart, emb, len(txt), texts=txt)
+        ok, _ = c.verify_manifest(cart, emb, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("D2_no_manifest_ok_is_False", ok, False,
               "v1 returned True with 'no manifest (legacy cartridge)'")
 
@@ -127,18 +129,21 @@ def main() -> int:
         Path(man).write_text(json.dumps({
             "count": len(txt), "fingerprint_algo": c.FINGERPRINT_ALGO,
             "fingerprint": good}), encoding="utf-8")
-        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
+        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("good_v3_manifest_VERIFIES", v, c.VERIFIED)
 
         # the same manifest against an altered FILE
         np.savez_compressed(cart, embeddings=mid)
-        v, _ = c.verify_manifest_detail(cart, mid, len(txt), texts=txt)
+        v, _ = c.verify_manifest_detail(cart, mid, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("altered_middle_embedding_is_MISMATCH", v, c.MISMATCH)
 
         # and an array v2 never covered at all
         np.savez_compressed(cart, embeddings=emb,
                             hippocampus=np.full((len(txt), 64), 7, dtype=np.uint8))
-        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
+        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("added_unsealed_array_is_MISMATCH", v, c.MISMATCH,
               "v2 returned VERIFIED here")
         np.savez_compressed(cart, embeddings=emb)   # restore for the v1 checks below
@@ -146,7 +151,8 @@ def main() -> int:
         # a v1 manifest must be NAMED, not silently mismatched
         Path(man).write_text(json.dumps({
             "count": len(txt), "fingerprint": base_v1}), encoding="utf-8")
-        v, msg = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
+        v, msg = c.verify_manifest_detail(cart, emb, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("v1_manifest_is_LEGACY_not_MISMATCH", v, c.LEGACY_MANIFEST)
         check("legacy_message_says_content_still_matches",
               "still matches" in msg, True,
@@ -157,12 +163,14 @@ def main() -> int:
         #   · the LAST embedding altered  -> v1 reports CONTENT HAS CHANGED.
         #   The first case is D1. This assertion failed on its first run because I
         #   expected v1 to notice a middle change; it cannot, and the test was right.
-        v, msg = c.verify_manifest_detail(cart, mid, len(txt), texts=txt)
+        v, msg = c.verify_manifest_detail(cart, mid, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("legacy_is_BLIND_to_a_middle_change", "still matches" in msg, True,
               "a v1 manifest cannot report an altered middle embedding -- this is D1")
 
         ends = emb.copy(); ends[-1, 0] = -42.0          # the LAST row, which v1 hashes
-        v, msg = c.verify_manifest_detail(cart, ends, len(txt), texts=txt)
+        v, msg = c.verify_manifest_detail(cart, ends, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("legacy_DOES_see_a_last_row_change",
               "CONTENT HAS CHANGED" in msg, True,
               "v1 hashed exactly the first and last rows, so it sees only these")
@@ -171,19 +179,22 @@ def main() -> int:
         Path(man).write_text(json.dumps({
             "count": len(txt), "fingerprint_algo": "sha3-future-v9",
             "fingerprint": "deadbeef" * 8}), encoding="utf-8")
-        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
+        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("unknown_algo_is_refused", v, c.UNREADABLE)
 
         # count disagreement is its own verdict
         Path(man).write_text(json.dumps({
             "count": 999, "fingerprint_algo": c.FINGERPRINT_ALGO,
             "fingerprint": base}), encoding="utf-8")
-        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
+        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("count_disagreement_is_COUNT_MISMATCH", v, c.COUNT_MISMATCH)
 
         # unparseable manifest
         Path(man).write_text("{not json", encoding="utf-8")
-        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt)
+        v, _ = c.verify_manifest_detail(cart, emb, len(txt), texts=txt,
+                                  loaded_fingerprint=c.fingerprint_cart_file(cart))
         check("unparseable_manifest_is_UNREADABLE", v, c.UNREADABLE)
 
     # ---- ⭐ THE INVARIANT THAT MATTERS MOST: only VERIFIED is a pass.

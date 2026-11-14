@@ -139,7 +139,7 @@ def mount(cart_path: str, cart_id: Optional[str] = None,
     # Lazy import to avoid circular dependency
     # cart_io, NOT membot_server — importing the server here is what made MOUNT
     # require fastmcp in the caller's interpreter (HUB, 2026-07-28).
-    from cart_io import load_cartridge_safe, verify_manifest
+    from cart_io import LOADED_FP_KEY, load_cartridge_safe, verify_manifest
 
     if not os.path.exists(cart_path):
         raise ValueError(f"Cart path does not exist: {cart_path}")
@@ -160,7 +160,8 @@ def mount(cart_path: str, cart_id: Optional[str] = None,
     texts = data["texts"]
 
     ok, verify_msg = verify_manifest(cart_path, embeddings, len(texts),
-                                     texts=texts)
+                                     texts=texts,
+                                     loaded_fingerprint=data.get(LOADED_FP_KEY))
     if not ok:
         if verify_integrity:
             raise ValueError(

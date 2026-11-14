@@ -41,6 +41,7 @@ sys.path.insert(0, _MEMBOT_DIR)
 #   the legacy path -- which is the half this script actually needs. The original
 #   imported `verify_manifest` from membot_server and then never called it.
 from cart_io import (
+    LOADED_FP_KEY,
     load_cartridge_safe,
     compute_fingerprint,
     compute_fingerprint_legacy,
@@ -145,13 +146,14 @@ def rebuild_one(cart_path: str, dry_run: bool = False, force: bool = False,
     # One unhashable cart must not end the sweep. Before this guard a single
     # zero-row cart raised out of main(), and the 13 carts after it were never
     # examined -- a crash in the instrument reported as silence about the rest.
-    # ⭐ v3 is computed from the FILE, so it covers every array the loader reads
-    #   rather than the two this function happens to hold.
-    try:
-        actual_fp = fingerprint_cart_file(cart_path)
-    except Exception as e:
+    # ⭐ Use the digest the LOADER already computed from the read it just did.
+    #   Besides being the same bytes rather than a second read, it halves the I/O:
+    #   this function had just loaded the whole cart and was re-reading it to hash.
+    actual_fp = data.get(LOADED_FP_KEY)
+    if not actual_fp:
         result["status"] = "error"
-        result["action"] = f"fingerprint failed: {type(e).__name__}: {e}"
+        result["action"] = ("loader produced no v3 digest: "
+                            + str(data.get("_fingerprint_error") or "unknown"))
         return result
     result["actual_fp"] = actual_fp
     has_hippo = data.get("hippocampus") is not None

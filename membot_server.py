@@ -1054,6 +1054,7 @@ def _write_blocked(state: dict) -> str | None:
 # working. New read-path code should import `cart_io` directly and skip the server entirely.
 from cart_io import (          # noqa: F401  (re-exported for backward compatibility)
     CARTRIDGE_DIRS,
+    LOADED_FP_KEY,
     compute_fingerprint,
     fingerprint_cart_file,
     verify_manifest,
@@ -5538,7 +5539,8 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
             verify_msg = "shared payload (verified at first load)"
         else:
             ok, verify_msg = verify_manifest(cart["path"], embeddings, len(texts),
-                                             texts=texts)
+                                             texts=texts,
+                                             loaded_fingerprint=data.get(LOADED_FP_KEY))
             if not ok:
                 log.error(f"INTEGRITY CHECK FAILED for {cart['name']}: {verify_msg}")
                 # ⛔ Drop the bad payload from the pool, or the next session to ask
@@ -10813,7 +10815,8 @@ if __name__ == "__main__":
             # monitor can actually see.
             ok, verify_msg = verify_manifest(cart["path"], data["embeddings"],
                                              len(data["texts"]),
-                                             texts=data["texts"])
+                                             texts=data["texts"],
+                                             loaded_fingerprint=data.get(LOADED_FP_KEY))
             _bypass_ok, _bypass_why = unverified_mount_allowed(
                 cart["name"], args.allow_unverified_mount,
                 args.allow_unverified_cart)

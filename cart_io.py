@@ -100,6 +100,13 @@ FINGERPRINT_ALGO = "sha256-members-v3"
 V2_ALGO = "sha256-full-v2"
 LEGACY_ALGO = "trunc64-ends-v1"
 
+# ⭐ The key under which the loader records the digest it computed FROM THE READ IT
+#   JUST DID. Verification uses this rather than re-reading the file, so the bytes
+#   attested are the bytes that were actually loaded. See the TOCTOU note on
+#   `fingerprint_cart_file`.
+LOADED_FP_KEY = "_fingerprint_v3"
+LOADED_FP_ERR_KEY = "_fingerprint_error"
+
 # ⛔⛔ WHY v3 EXISTS, 2026-11-13. v2 hashed every embedding and every passage, which
 #   sounded like full coverage and was not: the LOADER reads more than that. Measured
 #   on a real cart, with the preconditions checked rather than assumed --
@@ -239,20 +246,18 @@ def fingerprint_cart_file(cart_path: str) -> str:
     ⚠ Reads the file. For a large cart that is real I/O, but fingerprinting is a
       build-and-verify operation, not a per-query one.
 
-    ⬜ KNOWN LIMIT, NOT YET CLOSED -- time-of-check to time-of-use.
-      The mount path loads a cart into RAM and then calls the verifier, which reads
-      the file AGAIN. Those are two reads of the same path. ⇒ The bytes attested are
-      not provably the bytes being served: a file replaced between the two reads
-      verifies one artifact while the process serves another.
-      ⚠ v2 did not have this gap, because it hashed what the caller already held --
-        but it hashed only two of the arrays, which is why it was replaced.
-      ⇒ The fix is to compute the digest DURING the single load, inside
-        `load_npz_cartridge`, and have the verifier use that rather than re-reading.
-        It is a small change and it touches the loader plus three call sites, so it
-        wants its own pass rather than being bolted onto this one.
-      ⇒ Until then: v3 attests the file on disk at verification time. That closes the
-        unsealed-array hole and does not close TOCTOU. Both halves are true and the
-        second half should not be quoted without the first.
+    ⛔ NOT THE FUNCTION VERIFICATION USES. Verification takes the digest the LOADER
+      computed (`LOADED_FP_KEY`), because this one re-reads the file and a second
+      read is not provably the read that produced what is in memory.
+      ⇒ Closed 2026-11-14. The case it closes: a process loads cart A, the file is
+        replaced by a validly sealed cart B, and a re-reading verifier reports
+        VERIFIED while the process serves A. Controls in
+        tests/test_toctou_load_time_digest.py run both behaviours side by side.
+
+    ⇒ USE THIS ONE for a file you are not loading: building a manifest for a cart on
+      disk, auditing a directory, or answering "does this file match this manifest"
+      about something no process has open. For anything being mounted, use the
+      loader's digest.
     """
     with np.load(cart_path, allow_pickle=True) as data:
         return fingerprint_members({k: data[k] for k in data.files})
@@ -293,8 +298,16 @@ UNREADABLE = "UNREADABLE"
 
 
 def verify_manifest_detail(cart_path: str, embeddings: np.ndarray, n_texts: int,
-                           texts) -> tuple[str, str]:
+                           texts, loaded_fingerprint) -> tuple[str, str]:
     """Return (verdict, message). ⭐ The caller cannot mistake a reason for a pass.
+
+    ⭐⭐ `loaded_fingerprint` is the v3 digest the LOADER computed, carried on the
+      dict it returned under `LOADED_FP_KEY`. Pass that, not a freshly computed one.
+      ⇒ It is what makes verification attest the bytes that were actually loaded
+        rather than a second read of the same path.
+      ⛔ It has NO DEFAULT, for the same reason `texts` has none: a default would let
+        a caller omit it and fall back to re-reading, which is the behaviour this
+        parameter exists to remove, and the omission would be invisible.
 
     ⛔⛔ `texts` HAS NO DEFAULT, AND THE DEFAULT IS WHAT BROKE THE BOOT PATH.
       It was `texts=None`, so a caller that omitted it compiled fine and failed
@@ -368,12 +381,15 @@ def verify_manifest_detail(cart_path: str, embeddings: np.ndarray, n_texts: int,
             f"manifest declares unknown fingerprint_algo {algo!r}; expected "
             f"{FINGERPRINT_ALGO}. Refusing rather than guessing.")
 
-    # ⭐ v3 is computed from the FILE, not from what this caller happened to pass, so
-    #   the arguments above cannot narrow what gets checked.
-    try:
-        actual_fp = fingerprint_cart_file(cart_path)
-    except Exception as e:                                  # noqa: BLE001
-        return UNREADABLE, f"could not fingerprint the cart file: {e}"
+    # ⭐ v3 covers every member, so the arguments above cannot narrow what is checked.
+    #   And it is the LOADER's digest, so it also cannot be a different read.
+    if not loaded_fingerprint:
+        return UNREADABLE, (
+            "the loader did not supply a v3 digest for this cart, so there is "
+            "nothing to verify against the manifest. A cart that cannot be "
+            "fingerprinted at load time is not a verified cart. (.pkl cartridges "
+            "have no v3 digest: rebuild them as .npz.)")
+    actual_fp = loaded_fingerprint
     if expected_fp != actual_fp:
         return MISMATCH, (
             f"FINGERPRINT MISMATCH: expected {expected_fp[:16]}..., "
@@ -383,8 +399,12 @@ def verify_manifest_detail(cart_path: str, embeddings: np.ndarray, n_texts: int,
 
 
 def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
-                    texts) -> tuple[bool, str]:
+                    texts, loaded_fingerprint) -> tuple[bool, str]:
     """(ok, message), where ⭐ ok is True ONLY for VERIFIED.
+
+    ⭐ `loaded_fingerprint` is the loader's v3 digest — `data[LOADED_FP_KEY]` from
+      whatever `load_cartridge_safe` returned. Required, no default, same reasoning
+      as `texts`: a default would reintroduce a silent weaker path.
 
     The RETURN SHAPE is unchanged from v1 on purpose, so no call site can read a
     truthy reason string as a pass.
@@ -406,7 +426,8 @@ def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
         They are different questions and only one of them was asked.
     """
     verdict, msg = verify_manifest_detail(cart_path, embeddings, n_texts,
-                                          texts=texts)
+                                          texts=texts,
+                                          loaded_fingerprint=loaded_fingerprint)
     return verdict == VERIFIED, f"[{verdict}] {msg}"
 
 
@@ -573,6 +594,24 @@ def load_npz_cartridge(path: str) -> dict:
     data = np.load(path, allow_pickle=True)
 
     result = {"format": "npz", "version": "unknown"}
+
+    # ⭐⭐ THE DIGEST IS TAKEN HERE, from the members this one open produced.
+    #   Verification then attests the bytes that were loaded, rather than re-reading
+    #   the file and attesting a second read that may differ. ⇒ Closes the TOCTOU gap
+    #   described on `fingerprint_cart_file`.
+    # ⓘ Costs no extra I/O. Both paths below read essentially every member anyway:
+    #   the standard path reads embeddings, passages, hippocampus, per_pattern_meta
+    #   and sign_bits; the split path reads snippets and sign_bits, which on
+    #   wiki_2400k_brain_index is 713 MB of its 714. The added work is the hash.
+    # ⛔ On failure the key is set to None and the reason recorded, rather than left
+    #   absent. An absent key would let a verifier quietly fall back to re-reading,
+    #   which is the exact behaviour this exists to remove.
+    try:
+        result[LOADED_FP_KEY] = fingerprint_members(
+            {k: data[k] for k in data.files})
+    except Exception as e:                                  # noqa: BLE001
+        result[LOADED_FP_KEY] = None
+        result[LOADED_FP_ERR_KEY] = f"{type(e).__name__}: {e}"
 
     # Check for split cart (index + SQLite sidecar)
     has_sqlite = bool(data["has_sqlite"]) if "has_sqlite" in data else False

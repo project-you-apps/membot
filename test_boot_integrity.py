@@ -75,7 +75,8 @@ try:
     print("\n§1 · a manifest that MATCHES must verify")
     d = load_cartridge_safe(CART)
     ok, msg = verify_manifest(CART, d["embeddings"], len(d["texts"]),
-                              texts=d["texts"])
+                              texts=d["texts"],
+                              loaded_fingerprint=d.get("_fingerprint_v3"))
     check("good cart verifies", ok, msg)
 
     print("\n§2 · a manifest that does NOT match must refuse the boot")
@@ -86,7 +87,8 @@ try:
     M.save_as_npz(CART, emb2, [f"different passage {i}" for i in range(30)])
     d2 = load_cartridge_safe(CART)
     ok2, msg2 = verify_manifest(CART, d2["embeddings"], len(d2["texts"]),
-                                texts=d2["texts"])
+                                texts=d2["texts"],
+                                loaded_fingerprint=d2.get("_fingerprint_v3"))
     check("fixture now genuinely fails verification", not ok2, msg2[:48])
 
     rc = boot(NAME)
