@@ -261,8 +261,21 @@ Further hardening is underway; this section will say more as it lands.
 
 | Component | Licence |
 | --- | --- |
-| Server, tools and utilities | MIT |
+| Server, tools and utilities | **Business Source License 1.1** — see [LICENSE](LICENSE) |
 | Optional GPU engine (`bin/*`) | Proprietary — see [bin/LICENSE](bin/LICENSE) |
 
-The GPU engine is free for personal, educational and non-commercial use. Commercial use requires
-a separate licence — [contact us](mailto:andy@project-you.app).
+**Non-production use is free and needs no agreement with us.** Read it, copy it, modify it,
+redistribute it, run it internally, evaluate it, test it, demo it. ⇒ That is what the licence
+calls non-production use, and it covers everything short of charging for it.
+
+⚠ **Production use requires a commercial licence.** If Membot is part of a product or service you
+charge for, or any revenue-generating application, [contact us](mailto:andy@project-you.app).
+⭐ We would rather hear from you than not — the point of the licence is to start a conversation,
+not to stop you evaluating.
+
+ⓘ **It does not stay closed.** On the Change Date in [LICENSE](LICENSE), each version becomes
+available under the MIT Licence. The licence applies per version, so each release carries its
+own date.
+
+⛔ **The GPU engine in `bin/` is not covered by the above** and is not part of the Licensed Work.
+It is proprietary, it is optional, and it is not in the retrieval path.
