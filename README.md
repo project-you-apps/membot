@@ -76,7 +76,7 @@ python membot_server.py --transport http --port 8000 --writable
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--transport` | `stdio` | `stdio`, `http`, or `sse` |
-| `--host` | `0.0.0.0` | Bind address (HTTP/SSE) |
+| `--host` | `127.0.0.1` | Bind address (HTTP/SSE) — **loopback only by default.** ⛔ `0.0.0.0` accepts connections from anything that can route to the box, and the API key does not cover every route |
 | `--port` | `8000` | Listen port (HTTP/SSE) |
 | `--writable` | off | Enables `memory_store` and `save_cartridge` |
 
