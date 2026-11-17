@@ -15,7 +15,7 @@ auth.users IDs. Without --map, the script tries to look up by email.
 
 Usage:
     python migrate_droplet_mempacks_to_supabase.py [--dry-run] [--map OLD=NEW]
-                                                   [--owner-email andy.grossberg@gmail.com]
+                                                   [--owner-email jane.doe@example.com]
                                                    [--base /opt/membot/cartridges/users]
 
 Idempotent: skips Mempacks whose (user_id, name) row already exists in

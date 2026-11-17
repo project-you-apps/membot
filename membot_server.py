@@ -4816,11 +4816,11 @@ function _applyTemplateVars(body){
   // 3579e6ee". Falls back to the UUID prefix when no email/name available.
   //
   // {owner_id_short}: human-greeting form
-  //     1st: full_name (from OAuth)        e.g. "Andy Grossberg"
-  //     2nd: email local-part              e.g. "andy.grossberg"
+  //     1st: full_name (from OAuth)        e.g. "Jane Doe"
+  //     2nd: email local-part              e.g. "jane.doe"
   //     3rd: UUID prefix                   e.g. "3579e6ee"
   // {owner_id}: identifier line
-  //     1st: email                         e.g. "andy.grossberg@gmail.com"
+  //     1st: email                         e.g. "jane.doe@example.com"
   //     2nd: full UUID                     e.g. "3579e6ee-6412-..."
   //     3rd: "unknown"
   //
@@ -8996,8 +8996,8 @@ def _build_starter_mempack_bytes(
     # any text the agent will read in Pattern I / briefing.
     uuid_short = owner_id[:8] if owner_id else "unknown"
     email_local = email.split("@", 1)[0] if email and "@" in email else None
-    label_short = full_name or email_local or uuid_short      # "Andy Grossberg" / "andy.grossberg" / "ececf504"
-    label_full  = email or full_name or owner_id or "unknown" # "andy@gmail.com" / "Andy Grossberg" / UUID
+    label_short = full_name or email_local or uuid_short      # "Jane Doe" / "jane.doe" / "ececf504"
+    label_full  = email or full_name or owner_id or "unknown" # "jane.doe@example.com" / "Jane Doe" / UUID
 
     briefing = briefing or _DEFAULT_BRIEFING_TEMPLATE.format(
         owner_id=label_full, owner_id_short=label_short, name=name,
