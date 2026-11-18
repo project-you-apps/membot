@@ -66,6 +66,8 @@ Stdlib only.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import re
 
 # Namespaces the server assigns itself. A caller may never name a seat in one of these,
@@ -90,6 +92,74 @@ SOURCE_DEFAULT = "default"     # nothing presented, nothing claimed
 def sanitize_seat(claimed: str) -> str:
     """Reduce a caller-supplied seat to the safe alphabet, or '' if nothing survives."""
     return _SAFE.sub("", (claimed or "").strip())[:MAX_SEAT_CHARS]
+
+
+# ---------------------------------------------------------------------------
+# The seat a REST route already established, carried down the call stack.
+# ---------------------------------------------------------------------------
+# ⛔⛔ THE BUG THIS CLOSES (measured 2026-11-15). A REST route derives the seat
+# itself -- JWT first, then the sanitized X-Membot-Session tab header -- and then
+# hands it to an @mcp.tool() as the `session_id` parameter. Branch 3 below refuses
+# any claim in a reserved namespace, because over HTTP the tools share ONE bearer
+# token and a claim is therefore worthless. But the server's own `anon_<tab>` is in
+# a reserved namespace too, and by the time branch 3 sees it, a seat the server
+# minted and a seat a caller typed are the same string in the same argument.
+#
+#   => The server mints a name and then refuses to believe its own name.
+#      PROVENANCE IS DROPPED AT THE CALL BOUNDARY, so the legitimate path is
+#      refused alongside the attack it was shaped to stop.
+#
+# Measured consequences, on a current revision with a client that sends the header:
+#   /api/mount  seats in `default`      /api/search  looks in `anon_<tab>`
+#   /api/store  WRITES into `default`   /api/status  reports `default`
+# ⇒ Reads were isolated and writes were shared: a tab could not see its own write,
+#   and every other anonymous caller could. Reads isolated, writes pooled, which is
+#   the worst way round -- the isolation protected nothing and leaked everything.
+#
+# ⭐⭐ AND THE JOURNAL WAS RECORDING IT WRONG. `_journal_event` calls resolve_seat
+#   on its own, deep in the call stack, so a tab's write was attributed to `default`
+#   -- a false authorship record in the one subsystem whose whole job is provenance.
+#   That is why this is fixed HERE and not by splitting each tool into a core plus a
+#   wrapper: a split fixes the tool it splits, and never reaches the journal.
+#
+# WHY A CONTEXTVAR AND NOT A PARAMETER. A parameter on an @mcp.tool() signature is
+# part of the tool's public schema, so adding one would hand every MCP client the
+# exact bypass the 2026-11-01 change closed. A contextvar is server-side state
+# scoped to the running request: a route can set it, a caller cannot reach it.
+#
+# ⛔⛔ IT DOES NOT UPGRADE TRUST, AND MUST NOT. The tab header is attacker-supplied
+#   -- one tab may claim to be another -- so an honored derived seat is still
+#   `source="claimed"`. This restores seat ROUTING; it asserts nothing about
+#   identity. Per-seat separation remains a convention, not a boundary.
+_derived_seat: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "membot_derived_seat", default="")
+
+
+@contextlib.contextmanager
+def derived_seat(seat: str):
+    """Run a block with `seat` as the server-established seat for this request.
+
+    For a surface that has ALREADY done the derivation -- a REST route that read the
+    JWT and the tab header -- so tools and the journal underneath it resolve to that
+    seat instead of having it refused as an impersonation attempt.
+
+    ⛔ Never pass a value that came straight from a caller. The point is that the
+      server computed this one. `_anon_session_from_request` is the function that
+      makes a header safe to use here; its output is what belongs in this call.
+
+    Always resets, including on an exception, so a seat cannot leak into the next
+    request handled by the same task or worker.
+    """
+    token = _derived_seat.set(sanitize_seat(seat) or "")
+    try:
+        yield
+    finally:
+        _derived_seat.reset(token)
+
+
+def current_derived_seat() -> str:
+    """The seat a surface established for this request, or '' if none did."""
+    return _derived_seat.get()
 
 
 def resolve_seat(claimed: str = "",
@@ -127,6 +197,33 @@ def resolve_seat(claimed: str = "",
         "refused": False,
         "verified_sub": "",
     }
+
+    # --- Branch 0: a surface above us already established the seat. -------------------
+    # Set only by server code, through `derived_seat()`, after it has read the JWT and
+    # sanitized the tab header. Checked FIRST because it is the most informed answer
+    # available: the caller of this function is a tool being handed a seat the request
+    # layer already worked out, and re-deriving it here from a bare string is exactly
+    # what lost it.
+    #
+    # ⛔⛔ DELIBERATELY NARROW: it honors an `anon_` seat ONLY, and everything else
+    #   falls through to the branches below.
+    #   - `anon_<tab>` is the case that is broken, and it cannot be re-derived here
+    #     because the header is on the request, not in the claim. Nothing verifies it
+    #     and nothing claims to: `source` stays "claimed".
+    #   - `user_<sub>` falls THROUGH on purpose. Branch 2 reads the JWT off the live
+    #     request and mints it again, so the seat arrives verified by this function's
+    #     own check rather than on a promise from its caller. Trusting the contextvar
+    #     there would let a bug upstream turn into an asserted identity, and would buy
+    #     nothing: branch 2 reaches the same seat.
+    derived = current_derived_seat()
+    if derived.startswith("anon_"):
+        out["seat"] = derived
+        out["source"] = SOURCE_CLAIMED
+        # A claim that disagrees with what the request layer established is worth
+        # recording, for the same reason branch 2 records it: someone asked for a seat
+        # they were not, and the journal should say so without the request failing.
+        out["overridden"] = bool(safe_claim) and safe_claim != derived
+        return out
 
     # --- Branch 1: no request. stdio, or a direct in-process call. --------------------
     # The local pipe IS the user. There is no identity to verify and no one else's seat

@@ -23,9 +23,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import membot_server as mb
+import service_identity
 
 # Auto-mount default cartridge on startup
 _default_session = "snarc-bridge"
+
+# What this process actually bound to, filled in at startup. Reported by /status so
+# exposure is read off the running process rather than inferred from a unit file --
+# the committed unit is not the running unit.
+_bound_host = None
+_bound_port = None
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -67,7 +74,27 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/status':
             result = mb.get_status(session_id=_default_session)
-            self._json({'ok': True, 'raw': result})
+            # ⭐ WHICH PROGRAM AND WHICH BUILD, and here it matters more than on the
+            # MCP server. This bridge is a SECOND server in the same directory with
+            # none of that one's protections: no authentication, unconditionally
+            # writable, one shared session id for every caller. On 2026-11-14 it was
+            # found on two fleet seats bound to all interfaces because the loopback
+            # default had been applied to membot_server.py and nobody looked here.
+            # ⇒ role="rest-bridge" is how a caller or a sweep tells the two apart
+            #   from the outside, which is exactly what nobody could do that day.
+            self._json({
+                'ok': True,
+                'service': service_identity.service_block(
+                    'rest-bridge',
+                    host=_bound_host, port=_bound_port,
+                    # Stated rather than left to be assumed. Every one of these is a
+                    # fact an operator has been surprised by.
+                    authentication=None,
+                    writable=True,
+                    shared_session=_default_session,
+                ),
+                'raw': result,
+            })
         else:
             self._json({'error': 'unknown endpoint'}, 404)
 
@@ -118,8 +145,12 @@ if __name__ == '__main__':
     #    nothing to require, so exposure has to be refused instead. Staged: warn now,
     #    refuse from 2026-11-18, so fleet units can add --host first.
     bind_loopback = mb._bind_is_loopback(args.host)
+    _bound_host, _bound_port = args.host, args.port
 
     print(f"Membot REST bridge on {args.host}:{args.port}")
+    # Identity on the boot line, same as the MCP server. ASCII only -- cp1252 console.
+    print("Service: " + service_identity.describe(
+        "rest-bridge", host=args.host, port=args.port))
     if bind_loopback:
         print("Bound to loopback - not reachable from other machines.")
     else:

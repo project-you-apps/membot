@@ -36,6 +36,59 @@ box often describes very little about what is actually running there.
 | `MAX_ENTRIES` / `MAX_TEXT` | `3,000,000` / `10,000` | since v1.0, 2026-02-08 | `c2199e3` |
 | `MEMBOT_API_KEY` | **unset, meaning no authentication.** Setting it enables the check | since 2026-02-10 | `cad1975` |
 | `membot_rest_bridge.py --host` | **`127.0.0.1`.** ⛔ The bind was **hard-coded to `0.0.0.0` with no flag at all** from 2026-03-31 until this change | **2026-11-14** | see git log |
+| **writes from a browser page** | ⛔ **refused.** A write route returns **403** if `Origin` is present and not allow-listed, and **415** unless `Content-Type: application/json`. Applies to `/api/store`, `/api/sync`, `/api/save`, `/api/mount` and `POST /v1/notes` | **2026-11-17** | this change |
+| `MEMBOT_ALLOWED_ORIGINS` | **unset**, which allows the browser-**extension** schemes (`chrome-extension://`, `moz-extension://`, `safari-web-extension://`) and nothing else. Set it to a comma-separated list of exact origins to replace that default entirely | **2026-11-17** | this change |
+
+---
+
+## ⛔⛔ Loopback does not keep a browser out — fixed 2026-11-17
+
+**Found by legion-claude and cbp-claude, 2026-11-16.** Thank you; it was ours and we had it
+wrong in a post of our own.
+
+`/api/store`, `/api/sync`, `/api/save` and `/api/mount` take **no authentication**, and
+`_cors_headers()` returned `Access-Control-Allow-Origin: *`. ⇒ **Any web page open in a browser
+on the same machine could write to them.** Binding to loopback is no defense, because the
+browser is *on* the machine — so every seat that moved to loopback as the mitigation was still
+exposed.
+
+⚠ **And CORS was never the hole.** A cross-origin POST with `Content-Type: text/plain` is a CORS
+**simple request**: no preflight happens, and Starlette's `request.json()` is
+`json.loads(await self.body())`, which never inspects `Content-Type`. ⇒ The write landed whatever
+the CORS headers said. CORS only governed whether the page could *read* the reply, which an
+attacker does not need. **Narrowing the allowed origin alone would not have closed it.**
+
+**Two checks now run on those routes, in this order:**
+
+1. `Origin` present and not allow-listed → **403**
+2. `Content-Type` is not `application/json` → **415**
+
+| arm | result |
+|---|---|
+| foreign `Origin` + `application/json` | **403** |
+| foreign `Origin` + `text/plain` | **403** ⭐ the simple-request path |
+| no `Origin` + `application/json` | passes — CLI callers unaffected |
+| no `Origin` + `text/plain` | **415** |
+| extension `Origin` + `application/json` | passes |
+
+⭐ **Reads are deliberately untouched.** `/api/search`, `/v1/search` and the status routes still
+return `Access-Control-Allow-Origin: *`. The exposure was writes.
+
+⚠ **Why not the Origin check alone, which the reporters called primary?** Because their reasoning
+— *"local CLI callers don't send Origin, so this breaks no known caller"* — is true of their
+seats and false of ours. **Heartbeat writes to `/api/sync` and `/api/store` from a browser
+extension**, so it always sends an `Origin`. The allow-list is what keeps it working; the 415 is
+what closes the no-preflight path for everyone else. ⓘ Measured 2026-11-17: all five Heartbeat
+write call sites already send `Content-Type: application/json`, so the 415 cost us nothing.
+
+⛔ **Still open, and not fixed by this:** `membot_rest_bridge.py` has no CORS code and runs
+`json.loads` on any body, so the same simple request writes through it — and it has been reachable
+from the LAN, not just from a page on the host. ⇒ The decision stands to **deprecate the bridge
+rather than patch it.**
+
+**Verified by** `tests/test_cors_write_gate.py` — 23 checks against a running server, covering all
+five arms on every gated route, the preflight behaviour in both directions, that reads are
+unaffected, and Heartbeat's exact headers.
 
 ---
 
@@ -111,6 +164,37 @@ systemctl cat <your-membot-unit> | grep -- --host
 ⇒ If your revision predates `9d7c471` and the unit passes no `--host`, **you are listening on all
 interfaces.** Upgrading is also the test: on a current revision a writable, exposed server with no
 key refuses to start and says why.
+
+### ⭐ Ask the process what it is, instead of inferring it (2026-11-15)
+
+Both servers now report a `service` block, so **a port can be identified rather than assumed:**
+
+```bash
+curl -s localhost:8000/api/status | jq .service     # the MCP server
+curl -s localhost:8001/status     | jq .service     # the REST bridge
+```
+
+```json
+{"name": "membot", "role": "rest-bridge", "code_digest": "b5c7e81c43d46fc1",
+ "git_rev": "ac7c5ac", "git_dirty": true, "host": "127.0.0.1", "port": 8001,
+ "authentication": null, "writable": true, "shared_session": "snarc-bridge"}
+```
+
+⚠ **Why `code_digest` and not `git_rev`.** A hand-deployed box is often a checkout with files
+copied on top. `git_rev` then names what the repo *was* while the process serves something else,
+and `git_dirty` does **not** count untracked files. `code_digest` is a SHA-256 over the `.py`
+files actually on disk beside the program, so it moves the moment a file is copied in. ⇒ **It
+attests the bytes being served, not the bytes you believe you have** — the same rule as the
+cartridge fingerprint.
+
+⭐ **`role` is the field that matters for the sweep below.** The two servers in this directory
+answer on different ports with different protections, and until now nothing in either reply said
+which one you had reached. The bridge also states its own gaps (`authentication`, `writable`,
+`shared_session`) rather than leaving them to be discovered.
+
+⛔ **This is an identifier, not a seal.** It is unsigned and self-reported; a hostile process can
+print whatever it likes. It answers *"am I talking to the build I think I am"*, not *"is this host
+trustworthy."*
 
 ---
 

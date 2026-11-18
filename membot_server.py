@@ -937,6 +937,13 @@ import journal
 import note_store
 import subscriptions
 
+# Which program this is and which build of it. Unguarded for the same reason as the
+# three above: it is stdlib-only, and a guarded import would mean a deployment missing
+# the file keeps answering with no identity at all -- which is the exact condition this
+# module exists to end. Shared with membot_rest_bridge.py so the two servers in this
+# directory cannot report identity in two different shapes.
+import service_identity
+
 # One store per cart DIRECTORY, so overlays travel beside the cart they describe.
 _OVERLAY_STORES: dict = {}
 
@@ -1442,6 +1449,32 @@ def _session_id_for_user(user_id: str | None, fallback: str = "") -> str:
     if user_id:
         return f"user_{user_id}"
     return fallback.strip() if fallback and fallback.strip() else "default"
+
+
+def _rest_seat(request, body_fallback: str = "") -> str:
+    """The seat for a REST request, derived the one way, in one place.
+
+    JWT first, then the sanitized `X-Membot-Session` tab header, then an unreserved
+    body value. Exactly what the routes were each doing inline.
+
+    ⇒ USE IT WITH `seat_identity.derived_seat(...)`, like this:
+
+           seat = _rest_seat(request, data.get("session_id", ""))
+           with seat_identity.derived_seat(seat):
+               ... call tools, write the journal ...
+
+    ⛔⛔ WHY THE `with` IS NOT OPTIONAL (measured 2026-11-15). Deriving the seat and
+      then passing it to an @mcp.tool() as `session_id` does NOT work: the tool runs
+      it back through seat_identity.resolve_seat, which refuses reserved namespaces
+      as impersonation -- and `anon_<tab>` is reserved, so the server's own seat was
+      refused and the call landed in `default`. Four routes did this. /api/store
+      wrote a tab's memory into the shared slot, where the tab could not see it and
+      every other anonymous caller could, and `_journal_event` recorded `default` as
+      the author. The `with` block is what carries the provenance past that gate.
+    """
+    user_id = _get_user_id_from_request(request)
+    return _session_id_for_user(
+        user_id, fallback=_anon_session_from_request(request, body_fallback))
 
 
 def _anon_session_from_request(request, body_fallback: str = "") -> str:
@@ -1998,31 +2031,256 @@ async def rest_store(request: Request) -> JSONResponse:
     mounted state (not whatever the global slot happens to hold).
     """
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_cors_headers(request, write=True))
+    refusal = _refuse_browser_write(request)
+    if refusal is not None:
+        return refusal
     try:
         data = await request.json()
         content = data.get("content", "")
         tags = data.get("tags", "")
         _log_rest(request, "STORE", f"tags={tags} len={len(content)}")
-        user_id = _get_user_id_from_request(request)
-        session_id = _session_id_for_user(
-            user_id,
-            fallback=_anon_session_from_request(request, data.get("session_id", "")))
+        session_id = _rest_seat(request, data.get("session_id", ""))
         _call = getattr(memory_store, 'fn', memory_store)  # FastMCP 2.x vs 3.x
-        result = _call(content=content, tags=tags, session_id=session_id)
+        # ⛔⛔ THE WORST OF THE FOUR, measured 2026-11-15. Without the `with`, the
+        # tool refused the derived `anon_<tab>` seat and this WROTE INTO `default`:
+        # the tab could not see its own write and every other anonymous caller
+        # could, and _journal_event recorded `default` as the author. A write going
+        # to the wrong seat is worse than a read, and a false authorship record is
+        # worse than both. See _rest_seat.
+        with seat_identity.derived_seat(session_id):
+            result = _call(content=content, tags=tags, session_id=session_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/store error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
 
 
+def _empty_search(envelope: str, error: str | None = None,
+                  filter_matched: int | None = None,
+                  elapsed_ms: float = 0.0) -> JSONResponse:
+    """An empty result set in whichever envelope the caller asked for.
+
+    ⛔ The early returns are the easiest place to leak the wrong shape, because they
+    are the paths nobody exercises while building the happy one. A `/v1` caller that
+    gets `{"results": []}` instead of `{"matches": []}` on "no cartridge mounted"
+    sees a parse error rather than an empty answer, and will debug the wrong thing.
+    """
+    body: dict = {"status": "ok"}
+    body["matches" if envelope == "v1" else "results"] = []
+    if error:
+        body["error"] = error
+    if filter_matched is not None:
+        body["filter_matched"] = filter_matched
+    if elapsed_ms:
+        body["elapsed_ms"] = round(elapsed_ms)
+    return JSONResponse(body, headers=_cors_headers())
+
+
+def _v1_filters_to_spec(filters) -> dict | None:
+    """The caller's `filters` block -> our filter spec. API contract §3.2.
+
+    Theirs:  {"control_id": "FR-02", "period": "2026-Q3", "tags": ["access-review"]}
+    Ours:    {"meta": {"control_id": "...", "period": "..."}, "tags_all": [...]}
+
+    ⚠ `control_id` and `period` become `meta` predicates, which are EXACT and
+      case-sensitive, and an ABSENT FIELD EXCLUDES the passage. That is what we told
+      them on 2026-11-14, and it is the behaviour that bites: filtering by
+      `control_id` over a cart whose passages carry no such field returns zero
+      matches, which is correct and looks broken. ⇒ The ingest endpoint has to write
+      these fields, or the filter is a guaranteed empty set.
+
+    ⚠ `period` is exact string equality today. Their control header shows a RANGE
+      ("July 1 to September 30, 2026"), so a date-range filter is still owed -- it is
+      the same missing per-passage `event_date` that recency needs.
+
+    ⓘ `tags` -> `tags_all` (AND). Their example passes one tag, where AND and OR
+      agree; stating the choice because it stops mattering only in that case.
+    """
+    if not filters or not isinstance(filters, dict):
+        return None
+    spec: dict = {}
+    meta = {k: filters[k] for k in ("control_id", "period", "customer_id")
+            if filters.get(k) not in (None, "")}
+    if meta:
+        spec["meta"] = meta
+    tags = filters.get("tags")
+    if tags:
+        spec["tags_all"] = list(tags) if isinstance(tags, (list, tuple)) else [tags]
+    return spec or None
+
+
+def _v1_match(entry: dict, state: dict, ingested_at: str | None) -> dict:
+    """One internal result -> one `matches[]` record. API contract §3.2.
+
+    ⛔ Absent facts are `null`, never invented. `document_id` and `source_target`
+      arrive with the ingest handoff, which is TO BUILD; emitting a plausible
+      stand-in would be indistinguishable from a real one to their attribute check.
+
+    ⭐ `signals.lexical` is OUR KEYWORD SIGNAL RENAMED, and it is not BM25. Their
+      spec's own table says so -- "keyword overlap", not comparable across queries,
+      because the scale depends on the query's term count. Ours is additionally a
+      HIT COUNT CAPPED AT 0.12, with no term-frequency or length normalization.
+      ⇒ Returned because they asked for the field and it is a real signal; named
+        honestly rather than promoted. `rank_by="lexical"` stays refused until BM25.
+    """
+    i = entry["index"]
+    sig = entry.get("signals") or {}
+    ppm = state.get("per_pattern_meta")
+    rec = ppm[i] if (ppm and i < len(ppm) and isinstance(ppm[i], dict)) else {}
+
+    page = rec.get("page")
+    hippo = state.get("hippocampus")
+    pattern_id = None
+    if hippo and i < len(hippo):
+        pattern_id = hippo[i].get("pattern_id")
+
+    return {
+        # Cart-local until POST /v1/documents mints global ids. Stable within a draft.
+        "passage_id": f"psg_{pattern_id if pattern_id else i}",
+        "document_id": None,
+        "text": entry.get("full_text") or entry.get("text"),
+        "locator": ({"page": page} if page is not None else None),
+        "source_file": rec.get("source") or rec.get("filename") or rec.get("source_file"),
+        "content_type": rec.get("content_type"),
+        "score": entry.get("score"),
+        "signals": {
+            "cosine": sig.get("cosine"),
+            "hamming": sig.get("hamming"),
+            "lexical": sig.get("keyword_boost"),
+            "recency": sig.get("recency"),
+            "base": sig.get("base"),
+        },
+        "source_target": None,
+        "ingested_at": ingested_at,
+        "tags": entry.get("tags") or "",
+    }
+
+
+def _cart_ingested_at(state: dict) -> str | None:
+    """The cart's build time, as an ISO instant, or None.
+
+    ⭐ The hippocampus timestamp is ONE VALUE PER CART, stamped when the cart was
+    built. That made it useless for the recency multiplier, which needs per-passage
+    dates -- and makes it exactly right here, because `ingested_at` is precisely
+    what it is. ⚠ It is NOT the document's own date; `event_date` is still owed.
+    """
+    hippo = state.get("hippocampus")
+    if not hippo:
+        return None
+    for rec in hippo:
+        ts = rec.get("timestamp") or 0
+        if ts > 0:
+            try:
+                return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+            except (OSError, OverflowError, ValueError):
+                return None
+    return None
+
+
+# `rank_by` values the engine can actually order by today.
+# ⛔ `lexical` is DELIBERATELY ABSENT, not forgotten. SPEC §3.2 lists it as a fourth
+# option and it needs BM25, which was agreed on 2026-11-14 to be held until after
+# the demo. Accepting the word and ranking by something else would be worse than
+# refusing it: the caller would believe compliance search was lexical when it was
+# semantic. ⇒ Add it to this set in the same commit that lands BM25.
+_RANK_BY_SUPPORTED = frozenset({"blend", "cosine", "hamming"})
+
+
+def _rank_by_error(value: str) -> str:
+    """Say why a rank_by was refused, distinguishing 'not yet' from 'never'."""
+    if value == "lexical":
+        return ("rank_by='lexical' needs BM25, which is not built yet. It is on the "
+                "build list and was deliberately held until after the demo -- this "
+                "endpoint refuses it rather than silently ranking by 'blend'.")
+    return (f"rank_by={value!r} is not a supported ranking. Use 'blend' (the "
+            f"cosine/hamming blend plus keyword boost), 'cosine', or 'hamming'.")
+
+
+def _signal_component(arr, i):
+    """One pre-blend score component for result `i`, or None if it did not apply.
+
+    None means "this component did not contribute to `score`" -- there are no
+    embeddings on this cart, or the index is past the end of the sign-bit corpus.
+    It is reported as JSON null rather than 0.0 on purpose: a caller using cosine
+    as a relevance floor must not read a missing component as a confident zero.
+    """
+    if arr is None or i >= len(arr):
+        return None
+    return round(float(arr[i]), 6)
+
+
+def _signals_for(i, base_score, keyword_boost, recency_mult, sig_cosine, sig_hamming):
+    """The `signals` block for one search result.
+
+    `score` is reconstructible from these, which is the point -- a signal you
+    cannot check against the number it produced is decorative:
+
+        score = (base + keyword_boost) * recency      (recency null means 1.0)
+
+    and `base` is the blend of the two similarity components:
+
+        both present   base = (1 - hamming_blend) * cosine + hamming_blend * hamming
+        hamming null   base = cosine      (no sign bits, or blend disabled)
+        cosine null    base = hamming     (cart carries sign bits only)
+
+    `hamming_blend` and the recency half-life are returned once per response under
+    `scoring`, so the arithmetic above can be verified without knowing our build.
+
+    NOTE: `base` is reported directly rather than left to be re-derived, because the
+    second and third cases above are NOT distinguishable from the blend formula
+    alone -- a caller applying it blindly to a null component would be wrong.
+    """
+    return {
+        "cosine": _signal_component(sig_cosine, i),
+        "hamming": _signal_component(sig_hamming, i),
+        "keyword_boost": round(keyword_boost, 6),
+        "recency": round(recency_mult, 6) if recency_mult is not None else None,
+        "base": round(base_score, 6),
+    }
+
+
 @mcp.custom_route("/api/search", methods=["POST", "OPTIONS"])
 async def rest_search(request: Request) -> JSONResponse:
-    """REST search returning structured JSON for browser apps.
+    """REST search for browser apps. Envelope A: `results[]`, `index`, `full_text`.
 
     Step 3: per-user session_id from JWT so each user searches THEIR mounted
     state. Cross-user Mempack contents are not readable from another user's
     session because their session points at a different state slot.
+    """
+    return await _search_impl(request, envelope="api")
+
+
+@mcp.custom_route("/v1/search", methods=["POST", "OPTIONS"])
+async def v1_search(request: Request) -> JSONResponse:
+    """API contract §3.2. Envelope B: `matches[]`, `passage_id`, `locator`.
+
+    Same request fields they specified -- `customer_id`, `query`, `filters`,
+    `top_k`, plus `rank_by` -- and the response shape from that section.
+
+    ⚠ FIELDS THAT ARE NULL UNTIL THE INGEST ENDPOINT EXISTS, and null rather than
+      invented, because a plausible value here is worse than an absent one:
+        `document_id`    assigned by POST /v1/documents, which is TO BUILD
+        `source_target`  comes from the ingest handoff, same reason
+      ⇒ `passage_id` IS returned, but it is cart-local (the hippocampus pattern id,
+        or the index) until ingest mints global ids. Stable within a cart draft.
+
+    ⓘ `locator.page` and the filename come from `per_pattern_meta`, so they are
+      populated for Cart-Builder-authored carts and null for others.
+    """
+    return await _search_impl(request, envelope="v1")
+
+
+async def _search_impl(request: Request, envelope: str = "api") -> JSONResponse:
+    """One search implementation, two response envelopes.
+
+    ⛔⛔ WHY THIS IS A PARAMETER AND NOT A SECOND FUNCTION. Scoring is already
+    implemented FOUR times in this organization -- here, in the MCP memory_search,
+    in multi_cart, and in the studio -- with four different formulas and four sets
+    of field names, so `score` is not comparable across them. Writing a second
+    ranking path for `/v1` would make it five, and the fifth would be the one a
+    paying customer's attribute check reads. ⇒ The envelope is a translation at the
+    edges; nothing between the query and the ranking knows which caller it serves.
     """
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
@@ -2030,11 +2288,42 @@ async def rest_search(request: Request) -> JSONResponse:
         data = await request.json()
         query = data.get("query", "")
         top_k = data.get("top_k", 5)
-        _log_rest(request, "SEARCH", f"q=\"{query[:60]}\" top_k={top_k}")
+        # The one request-shape difference: they specified `filters` with their own
+        # field names; /api/search takes our raw filter spec. Translated in one
+        # place so the filter engine sees a single shape.
+        if envelope == "v1":
+            filter_spec = _v1_filters_to_spec(data.get("filters"))
+        else:
+            filter_spec = data.get("filter")
+        # `rank_by` -- named in the API contract §3.2 as <TO BUILD, small>,
+        # with the reason it is small: "the engine already computes all four and
+        # currently discards three of them." `signals` stopped discarding them;
+        # this is the other half of that sentence, which orders by one.
+        #
+        # ⛔ AN UNSUPPORTED VALUE IS A REFUSAL, NOT A FALLBACK. Silently ranking by
+        # `blend` when a caller asked for `lexical` is a knob at its do-nothing
+        # default: the reply looks ordered as requested and is not, and no field
+        # says otherwise. The response echoes `ranked_by` for the same reason.
+        rank_by = (data.get("rank_by") or "blend").strip().lower()
+        if rank_by not in _RANK_BY_SUPPORTED:
+            return JSONResponse(
+                {"status": "error", "error": _rank_by_error(rank_by),
+                 "supported": sorted(_RANK_BY_SUPPORTED)},
+                status_code=400, headers=_cors_headers())
+        _log_rest(request, "SEARCH", f"q=\"{query[:60]}\" top_k={top_k} rank_by={rank_by}")
+        # ⓘ No `derived_seat()` block here: this route reads session state directly
+        # and calls no @mcp.tool(), so there is no gate between it and the seat. It
+        # is the one route that was already correct -- which is why a tab could read
+        # its own empty session while its writes went elsewhere.
+        session_id = _rest_seat(request, data.get("session_id", ""))
+        # ⛔ Read separately, and NOT foldable into _rest_seat. The ownership check
+        # below needs the caller's user id, not the seat -- and on 2026-11-15 this
+        # line was briefly deleted when the derivation moved into _rest_seat, which
+        # left `user_id` undefined INSIDE a security check. Every test passed,
+        # because `state.get("mempack_id")` is falsy for a knowledge cart and `and`
+        # short-circuits before reaching it. ⇒ The one path that would have raised
+        # is the cross-user Mempack read this check exists to refuse.
         user_id = _get_user_id_from_request(request)
-        session_id = _session_id_for_user(
-            user_id,
-            fallback=_anon_session_from_request(request, data.get("session_id", "")))
         state = _get_session(session_id)
         # Defense-in-depth: if the slot somehow holds another user's Mempack,
         # refuse the read. Belt + suspenders.
@@ -2049,12 +2338,12 @@ async def rest_search(request: Request) -> JSONResponse:
             )
 
         if state["cartridge_name"] is None:
-            return JSONResponse({"status": "ok", "results": [], "error": "No cartridge mounted"}, headers=_cors_headers())
+            return _empty_search(envelope, error="No cartridge mounted")
 
         has_emb = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
         has_ham = state["binary_corpus"] is not None
         if not has_emb and not has_ham:
-            return JSONResponse({"status": "ok", "results": []}, headers=_cors_headers())
+            return _empty_search(envelope, error="Cart carries neither embeddings nor sign bits")
 
         t0 = time.time()
 
@@ -2085,12 +2374,21 @@ async def rest_search(request: Request) -> JSONResponse:
                     dist[start:end] = xor.sum(axis=1)
             return 1.0 - dist.astype(np.float32) / n_bits
 
+        # Per-result score components, returned to the caller as `signals`.
+        # Held as whole arrays here and read per-result in the ranking loop below.
+        # A component that did not participate stays None and is reported as null
+        # rather than 0.0 -- see _signal_component for why that distinction is
+        # load-bearing for a caller thresholding on cosine.
+        sig_cosine = None    # pre-blend cosine similarity; None if no embeddings
+        sig_hamming = None   # pre-blend sign-bit agreement; None if not computed
+
         if has_emb:
             # Cosine similarity
             stored = state["embeddings"]
             stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
             query_norm = np.linalg.norm(query_emb) + 1e-9
             emb_scores = np.dot(stored / stored_norms, query_emb / query_norm)
+            sig_cosine = emb_scores
 
             # Hamming blend
             scores = emb_scores
@@ -2102,18 +2400,25 @@ async def rest_search(request: Request) -> JSONResponse:
                     blended = np.copy(emb_scores)
                     blended[:n_bin] = (1.0 - HAMMING_BLEND) * emb_scores[:n_bin] + HAMMING_BLEND * ham
                     scores = blended
+                    # Covers [0, n_bin) only; past that the signal stays null.
+                    # Assigned AFTER the blend succeeds, so a throw here leaves this
+                    # None rather than reporting a component that never reached `score`.
+                    sig_hamming = ham
                 except Exception:
                     pass
         else:
-            # Hamming-only
+            # Hamming-only. This IS the score, so it is also the hamming signal.
+            # `scores` is rebound (never mutated in place) by the filter below, so
+            # this reference keeps the unmasked values for reporting.
             scores = _ham_scores(query_emb, state["binary_corpus"])
+            sig_hamming = scores
 
         # Optional pre-filter: if a filter block is provided in the request,
         # restrict candidates to matching indices BEFORE ranking. This is the
         # shape Dennis's mechanics encoder + Query Hierarchy Phase 1 both want:
         # narrow by structural constraints first, rank by relevance second.
         # Filter spec shape documented in forum/filter-api-spec.md.
-        filter_spec = data.get("filter")
+        # (already resolved from `filters` or `filter` at the top, per envelope)
         filter_matched = None
         if filter_spec:
             allowed_indices = _apply_filter(state, filter_spec)
@@ -2121,15 +2426,7 @@ async def rest_search(request: Request) -> JSONResponse:
             if not allowed_indices:
                 elapsed_ms = (time.time() - t0) * 1000
                 _log_activity(session_id, "search+filter", f"'{query[:40]}' -> 0 (filter eliminated all)", elapsed_ms)
-                return JSONResponse(
-                    {
-                        "status": "ok",
-                        "results": [],
-                        "filter_matched": 0,
-                        "elapsed_ms": round(elapsed_ms),
-                    },
-                    headers=_cors_headers(),
-                )
+                return _empty_search(envelope, filter_matched=0, elapsed_ms=elapsed_ms)
             # Vectorized mask: excluded indices get -inf, included keep score
             allowed_mask = np.zeros(len(scores), dtype=bool)
             for idx in allowed_indices:
@@ -2172,15 +2469,33 @@ async def rest_search(request: Request) -> JSONResponse:
             boost = min(hits * 0.03, 0.12)
             final = base_score + boost
             # Apply recency weight
+            recency_mult = None
             if has_recency and i < len(hippo_meta):
                 entry_ts = hippo_meta[i].get("timestamp", 0)
                 if entry_ts > 0:
                     age = max(0.0, now_ts - entry_ts)
                     recency = 0.5 + 0.5 * math.exp(-_ln2 * age / RECENCY_HALF_LIFE)
                     final *= recency
-            boosted.append((i, final))
+                    recency_mult = recency
+            boosted.append((i, final, _signals_for(
+                i, base_score, boost, recency_mult, sig_cosine, sig_hamming)))
 
-        boosted.sort(key=lambda x: x[1], reverse=True)
+        # ⭐ `score` ALWAYS means the same thing -- the blended, boosted, recency-
+        # weighted number -- whatever `rank_by` is. Only the ORDER changes. Making
+        # `score` mean a different quantity per request would recreate, inside one
+        # endpoint, the exact problem that makes `score` incomparable across our four
+        # search implementations.
+        # ⛔ A result whose chosen component is null sorts LAST rather than crashing
+        # or being silently dropped: on a sign-bits-only cart every cosine is null,
+        # and rank_by='cosine' there is a question the cart cannot answer. The nulls
+        # are visible in `signals`, so a caller can see why the order looks flat.
+        if rank_by == "blend":
+            boosted.sort(key=lambda x: x[1], reverse=True)
+        else:
+            _key = "cosine" if rank_by == "cosine" else "hamming"
+            boosted.sort(
+                key=lambda x: (x[2].get(_key) is not None, x[2].get(_key) or 0.0, x[1]),
+                reverse=True)
 
         # Dedupe chunks that share a parent exchange. Long exchanges are chunked into
         # multiple patterns at cart-build time; each chunk is indexed independently
@@ -2191,7 +2506,7 @@ async def rest_search(request: Request) -> JSONResponse:
         seen_chunks = set()
         deduped = []
         dup_count = 0
-        for i, score in boosted:
+        for i, score, sig in boosted:
             text = state["texts"][i] if i < len(state["texts"]) else ""
             key = _chunk_dedup_key(text)
             if key is not None:
@@ -2199,7 +2514,7 @@ async def rest_search(request: Request) -> JSONResponse:
                     dup_count += 1
                     continue
                 seen_chunks.add(key)
-            deduped.append((i, score))
+            deduped.append((i, score, sig))
         if dup_count:
             log.info(f"[search] dedup removed {dup_count} sibling chunks")
         boosted = deduped
@@ -2220,7 +2535,7 @@ async def rest_search(request: Request) -> JSONResponse:
         )
 
         results = []
-        for i, final_score in boosted[:top_k]:
+        for i, final_score, sig in boosted[:top_k]:
             if final_score < 0.1:
                 continue
             ram_text = state["texts"][i]
@@ -2234,7 +2549,8 @@ async def rest_search(request: Request) -> JSONResponse:
                 body = body[tag_end + 1:].strip()
 
             text = _soft_truncate(body)
-            entry = {"text": text, "full_text": body, "score": round(final_score, 4), "tags": tags, "index": int(i)}
+            entry = {"text": text, "full_text": body, "score": round(final_score, 4),
+                     "tags": tags, "index": int(i), "signals": sig}
             # Provenance hint for split carts: client uses presence of source_db to
             # decide whether to render the "load source" CTA on the modal.
             if source_db_label:
@@ -2257,7 +2573,48 @@ async def rest_search(request: Request) -> JSONResponse:
         log_label = "search+filter" if filter_matched is not None else "search"
         _log_activity(session_id, log_label, f"'{query[:40]}' -> {len(results)} results", elapsed_ms)
 
-        resp = {"status": "ok", "results": results, "elapsed_ms": round(elapsed_ms)}
+        if envelope == "v1":
+            ingested_at = _cart_ingested_at(state)
+            v1 = {
+                "matches": [_v1_match(e, state, ingested_at) for e in results],
+                "elapsed_ms": round(elapsed_ms),
+                "ranked_by": rank_by,
+                "scoring": {
+                    "hamming_blend": HAMMING_BLEND,
+                    "recency_half_life_s": RECENCY_HALF_LIFE,
+                },
+            }
+            if filter_matched is not None:
+                # ⭐ The giveaway field: a filter that matched nothing and a search
+                # that found nothing come back identically without it, and for their
+                # "None found" screen those are different facts.
+                v1["filter_matched"] = filter_matched
+            # ⛔ Accepted and recorded, NOT enforced. The container is single-tenant
+            # by design (their D16, our §1), so there is no second customer in the
+            # store to isolate from. Echoed rather than ignored, because a field
+            # accepted silently cannot be told from one that was honored.
+            if data.get("customer_id"):
+                v1["customer_id"] = data.get("customer_id")
+                v1["customer_scoping"] = "single-tenant deployment; recorded, not enforced"
+            return JSONResponse(v1, headers=_cors_headers())
+
+        resp = {
+            "status": "ok",
+            "results": results,
+            "elapsed_ms": round(elapsed_ms),
+            # Echoed so a caller never has to assume the ordering it asked for is the
+            # ordering it got. A request field accepted without acknowledgement is
+            # indistinguishable from one that was ignored.
+            "ranked_by": rank_by,
+            # The constants a caller needs to reconstruct `score` from `signals`.
+            # Returned once per response rather than per result: without them the
+            # per-result components cannot be checked against the score they
+            # produced, and an unverifiable signal is decoration.
+            "scoring": {
+                "hamming_blend": HAMMING_BLEND,
+                "recency_half_life_s": RECENCY_HALF_LIFE,
+            },
+        }
         if filter_matched is not None:
             resp["filter_matched"] = filter_matched
         return JSONResponse(resp, headers=_cors_headers())
@@ -2546,17 +2903,32 @@ async def rest_status(request: Request) -> JSONResponse:
         # got the mount prompt suppressed and the search box enabled, then got "No
         # cartridge mounted" from /api/search. Two routes, same header, different
         # answers. Derived here exactly as rest_search derives it.
-        user_id = _get_user_id_from_request(request)
-        sid = _session_id_for_user(
-            user_id,
-            fallback=_anon_session_from_request(
-                request, request.query_params.get("session_id", "")))
-        sid = _resolve_session_id(sid)
+        # ⛔ AND THE REPAIR DESCRIBED ABOVE WAS CANCELLED FOUR LINES LATER, measured
+        # 2026-11-15. This derived the seat correctly and then ran it through
+        # `_resolve_session_id`, which refuses `anon_<tab>` as impersonation and
+        # returns `default`. ⇒ The symptom in the comment above -- a fresh visitor
+        # seeing cartridge=heartbeat and then "No cartridge mounted" from
+        # /api/search -- was never actually fixed, because status kept answering for
+        # the shared slot. The derivation is kept; the re-resolution is gone.
+        sid = _rest_seat(request, request.query_params.get("session_id", ""))
         state = _get_session(sid)
         n = len(state["texts"]) if state["texts"] else 0
         import socket
         return JSONResponse({
             "status": "ok",
+            # ⭐ WHICH PROGRAM AND WHICH BUILD. First field after status because a
+            # caller should assert it BEFORE reading anything below it. On 2026-11-15
+            # a test read Vector Plus Studio's reply to /api/status and /api/search as
+            # membot's, and the misdiagnosis survived three debugging steps: both serve
+            # routes of those names, and nothing in either reply said which program
+            # answered. Reports the ACTUAL transport, bind and port, not the requested
+            # ones, so exposure is read off the process rather than a unit file.
+            "service": service_identity.service_block(
+                "mcp-server",
+                transport=_server_config.get("transport"),
+                host=_server_config.get("host"),
+                port=_server_config.get("port"),
+            ),
             "cartridge": state["cartridge_name"],
             "briefing": state.get("briefing"),  # Pattern 0 v2 Phase 1
             # Pattern 0 v2 Phase 2 — ownership block. owner_id None = legacy cart.
@@ -2612,7 +2984,10 @@ async def rest_sync(request: Request) -> JSONResponse:
     Appends to cartridges/heartbeat_<machine>.jsonl (one JSON object per line).
     """
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_cors_headers(request, write=True))
+    refusal = _refuse_browser_write(request)
+    if refusal is not None:
+        return refusal
     try:
         data = await request.json()
         exchanges = data.get("exchanges", [])
@@ -2715,7 +3090,13 @@ async def rest_mount(request: Request) -> JSONResponse:
       unscoped find_mempacks). Knowledge carts unaffected.
     """
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_cors_headers(request, write=True))
+    # ⚠ Gated as a WRITE even though "mount" sounds like a read: with auto_create it
+    # initializes a new cartridge on disk, and auth here is OPTIONAL (owner_id falls back
+    # to the body), so an anonymous caller can create one.
+    refusal = _refuse_browser_write(request)
+    if refusal is not None:
+        return refusal
     try:
         data = await request.json()
         name = data.get("name", "")
@@ -2723,11 +3104,10 @@ async def rest_mount(request: Request) -> JSONResponse:
             return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_cors_headers())
 
         # Identify caller via JWT (cookie or Bearer). None for anonymous.
+        # Still needed separately below for Mempack scoping, which keys on the user
+        # rather than on the seat.
         user_id = _get_user_id_from_request(request)
-        # Per-user session slot when authenticated; per-body or default otherwise.
-        session_id = _session_id_for_user(
-            user_id,
-            fallback=_anon_session_from_request(request, data.get("session_id", "")))
+        session_id = _rest_seat(request, data.get("session_id", ""))
         # Mempack scoping: a signed-in caller can only see THEIR Mempacks.
         # Anonymous callers can still mount knowledge carts (no owner_id scope).
         owner_id = user_id or data.get("owner_id", "")
@@ -2755,7 +3135,11 @@ async def rest_mount(request: Request) -> JSONResponse:
             created = True
 
         _call = getattr(mount_cartridge, 'fn', mount_cartridge)
-        result = _call(name=name, session_id=session_id, owner_id=owner_id)
+        # ⛔ The seat must be carried, not just passed. Handed in as `session_id`
+        # alone it is refused inside the tool as a reserved-namespace claim and the
+        # mount lands in `default` -- measured 2026-11-15. See _rest_seat.
+        with seat_identity.derived_seat(session_id):
+            result = _call(name=name, session_id=session_id, owner_id=owner_id)
         return JSONResponse({"status": "ok", "result": result, "created": created}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mount error: {e}")
@@ -2772,11 +3156,11 @@ async def rest_passage(request: Request) -> JSONResponse:
         return JSONResponse({}, headers=_cors_headers())
     try:
         idx = int(request.query_params.get("idx", -1))
+        # user_id is still read separately for the cross-user Mempack check below.
+        # ⓘ No `derived_seat()` block: like /api/search this reads state directly and
+        # calls no tool, so nothing re-resolves the seat underneath it.
         user_id = _get_user_id_from_request(request)
-        session_id = _session_id_for_user(
-            user_id,
-            fallback=_anon_session_from_request(
-                request, request.query_params.get("session_id", "")))
+        session_id = _rest_seat(request, request.query_params.get("session_id", ""))
         state = _get_session(session_id)
 
         if state["cartridge_name"] is None:
@@ -2865,7 +3249,10 @@ async def rest_embed(request: Request) -> JSONResponse:
 async def rest_save(request: Request) -> JSONResponse:
     """REST wrapper for save_cartridge — persist to disk."""
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_cors_headers(request, write=True))
+    refusal = _refuse_browser_write(request)
+    if refusal is not None:
+        return refusal
     try:
         data = await request.json() if await request.body() else {}
         name = data.get("name", "")
@@ -2882,26 +3269,278 @@ async def rest_save(request: Request) -> JSONResponse:
         # that is not theirs. DERIVE it exactly as rest_mount does -- JWT first, then the
         # X-Membot-Session tab header -- so the body may name the CARTRIDGE and never the
         # SESSION.
-        user_id = _get_user_id_from_request(request)
-        session_id = _session_id_for_user(
-            user_id,
-            fallback=_anon_session_from_request(request, data.get("session_id", "")))
+        #
+        # ⛔ AND THE DERIVATION ABOVE WAS CORRECT AND THEN DISCARDED, measured
+        # 2026-11-15. save_cartridge runs the derived seat back through
+        # resolve_seat, which refuses `anon_<tab>` as impersonation, so this
+        # persisted the `default` session -- dp's exact bug, arrived at from the
+        # other direction. The reasoning in this comment was right; the seat never
+        # survived the call. The `with` is what makes the comment true.
+        session_id = _rest_seat(request, data.get("session_id", ""))
 
         _call = getattr(save_cartridge, 'fn', save_cartridge)
-        result = _call(name=name, session_id=session_id)
+        with seat_identity.derived_seat(session_id):
+            result = _call(name=name, session_id=session_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/save error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
 
 
-def _cors_headers():
-    """CORS headers for browser extension access."""
-    return {
-        "Access-Control-Allow-Origin": "*",
+# ===========================================================================
+# /v1 — the versioned surface a consuming application builds against
+# ===========================================================================
+# An external API contract governs these shapes, and it
+# marks every endpoint SHIPPED / TO BUILD / DESIGNED so they can plan against what
+# exists. These are the wrappers over what already works (their §6 item 1).
+#
+# ⛔ TWO ROWS OF THAT SPEC OVERSTATED, and both are answered here rather than in a
+#   correction they have to read:
+#     `POST /v1/notes` was marked SHIPPED with no HTTP route at all -- the
+#       capability is real as an MCP tool, the endpoint was not.
+#     `rank_by` was marked TO BUILD and had not been built.
+#
+# ⚠ `GET /v1/documents/{id}/provenance` is deliberately NOT here. It keys on a
+#   document id, and document ids are minted by POST /v1/documents, which is TO
+#   BUILD. A provenance endpoint that can only be addressed by cart-local index is
+#   not the endpoint they specified, and shipping it under that name would make the
+#   status table wrong in the other direction.
+
+
+@mcp.custom_route("/v1/version", methods=["GET", "OPTIONS"])
+async def v1_version(request: Request) -> JSONResponse:
+    """Which program and which build. SPEC §4 row, was `TO BUILD`.
+
+    ⭐ `code_digest` is the field to key on, not `git_rev`. A hand-deployed box is
+    often a checkout with files copied on top, where the revision names what the
+    repo WAS while the process serves something else. The digest is over the .py
+    files actually on disk, so it moves when a file is copied in.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    return JSONResponse(
+        service_identity.service_block(
+            "mcp-server",
+            transport=_server_config.get("transport"),
+            host=_server_config.get("host"),
+            port=_server_config.get("port"),
+            embedding_model="nomic-embed-text-v1.5",
+        ),
+        headers=_cors_headers())
+
+
+@mcp.custom_route("/v1/health", methods=["GET", "OPTIONS"])
+async def v1_health(request: Request) -> JSONResponse:
+    """Liveness plus the two facts that make a 200 meaningful. SPEC §4, `TO BUILD`.
+
+    ⛔ A health check that returns 200 whenever the process is up answers the one
+    question nobody needed to ask. It reports whether the embedding engine is
+    actually loaded and whether a cart is mounted, because a server that is running
+    and cannot embed will accept a search and fail it.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        state = _get_session(_rest_seat(request, request.query_params.get("session_id", "")))
+        engine_ready = bool(embed.active_backend())
+        body = {
+            "status": "ok" if engine_ready else "degraded",
+            "engine_ready": engine_ready,
+            "cartridge_mounted": state.get("cartridge_name"),
+            "passages": len(state["texts"]) if state.get("texts") else 0,
+            "read_only": _server_config.get("read_only", False),
+            "service": service_identity.service_block("mcp-server"),
+        }
+        return JSONResponse(body, status_code=200 if engine_ready else 503,
+                            headers=_cors_headers())
+    except Exception as e:                                  # noqa: BLE001
+        log.error(f"REST /v1/health error: {e}")
+        return JSONResponse({"status": "error", "engine_ready": False, "error": str(e)},
+                            status_code=503, headers=_cors_headers())
+
+
+@mcp.custom_route("/v1/notes", methods=["POST", "GET", "OPTIONS"])
+async def v1_notes(request: Request) -> JSONResponse:
+    """Annotations with author, kind and timestamp. SPEC §4 row, was `SHIPPED`.
+
+    ⛔⛔ IT WAS MARKED SHIPPED AND HAD NO ENDPOINT. The capability is real -- notes
+    carry an author, a kind, a timestamp, they are journalled, and a correction
+    supersedes rather than erases -- but only as MCP tools. The adjacent provenance
+    row carried the honest qualifier ("SHIPPED as an invariant; HTTP wrapper TO
+    BUILD") and this one did not. They are planning against that table.
+
+    ⭐ A NOTE IS PRIVATE UNTIL SHARED, and this endpoint does not change that. There
+    is no `share` parameter on purpose: sharing is a separate deliberate act, and a
+    default-public "why" is surveillance rather than memory.
+
+    ⚠ `author` is recorded as the caller states it, and `identity_source` says so.
+      Over HTTP that is `claimed`: one shared credential, caller-supplied seat. The
+      signer belongs in the calling application, where the record is signed; we hold it
+      and report what the attribution is worth rather than implying it was checked.
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers(request, write=True))
+    # ⚠ POST ONLY. The GET below reads notes and must stay reachable from a page, so the
+    # gate goes after the method check rather than at the top of the route.
+    if request.method == "POST":
+        refusal = _refuse_browser_write(request)
+        if refusal is not None:
+            return refusal
+    try:
+        if request.method == "GET":
+            idx = int(request.query_params.get("idx", -1))
+            seat = _rest_seat(request, request.query_params.get("session_id", ""))
+            _log_rest(request, "V1-NOTES-GET", f"idx={idx}")
+            with seat_identity.derived_seat(seat):
+                raw = getattr(notes, "fn", notes)(idx=idx, session_id=seat)
+            return JSONResponse({"status": "ok", "idx": idx, "notes_raw": raw,
+                                 "seat": seat}, headers=_cors_headers())
+
+        data = await request.json()
+        idx = data.get("idx")
+        kind = (data.get("kind") or "").strip()
+        body_text = data.get("body") or ""
+        if idx is None or not kind or not body_text:
+            return JSONResponse(
+                {"status": "error",
+                 "error": "idx, kind and body are all required",
+                 "kinds": ["why", "context", "caution", "decision", "prediction",
+                           "recommendation"]},
+                status_code=400, headers=_cors_headers())
+        seat = _rest_seat(request, data.get("session_id", ""))
+        _log_rest(request, "V1-NOTES-POST", f"idx={idx} kind={kind}")
+        # The seat must be CARRIED, not just passed: note_add is an @mcp.tool() and
+        # resolves the seat again, where a server-derived anon_* would be refused.
+        with seat_identity.derived_seat(seat):
+            result = getattr(note_add, "fn", note_add)(
+                idx=int(idx), kind=kind, body=body_text,
+                scope=data.get("scope", "private"), session_id=seat)
+        return JSONResponse(
+            {"status": "ok", "result": result, "seat": seat,
+             # Stated on every write rather than documented once. The whole point of
+             # recording how an identity was established is that a reader sees it.
+             "identity_source": seat_identity.resolve_seat(seat).get("source"),
+             "visibility": "private until explicitly shared"},
+            headers=_cors_headers())
+    except Exception as e:                                  # noqa: BLE001
+        log.error(f"REST /v1/notes error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)},
+                            status_code=500, headers=_cors_headers())
+
+
+def _cors_headers(request=None, write: bool = False):
+    """CORS headers for browser extension access.
+
+    ⚠ Called from 136 sites with no arguments, so the no-arg form MUST keep returning
+    `Access-Control-Allow-Origin: *`. Reads are not the threat and the extension reads.
+
+    ⭐ `write=True` narrows it: the origin is ECHOED when allow-listed and OMITTED when not.
+    An omitted `Access-Control-Allow-Origin` makes a preflight fail, which is what stops a
+    foreign page from sending the `application/json` body that `_refuse_browser_write`
+    would otherwise have to catch.
+    """
+    headers = {
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client",
     }
+    if not write or request is None:
+        headers["Access-Control-Allow-Origin"] = "*"
+        return headers
+
+    origin = request.headers.get("origin", "")
+    if not origin:
+        # No Origin at all: not a browser. CLI callers see the permissive header and
+        # ignore it, as they always have.
+        headers["Access-Control-Allow-Origin"] = "*"
+    elif _write_origin_allowed(origin):
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Vary"] = "Origin"
+    # else: deliberately NO Access-Control-Allow-Origin -> the preflight fails.
+    return headers
+
+
+# ⭐ Browser extensions, which is what Heartbeat is. A hostile page is `https://` or
+# `http://`, never one of these, so scheme alone separates the two threats.
+# ⚠ It does NOT defend against a hostile EXTENSION -- one already has far more reach than
+# this route, so that is not the boundary this is drawing.
+_WRITE_ORIGIN_SCHEMES = (
+    "chrome-extension://",
+    "moz-extension://",
+    "safari-web-extension://",
+)
+
+
+def _write_origin_allowed(origin: str) -> bool:
+    """May a browser at `origin` call a write route?
+
+    ⇒ `MEMBOT_ALLOWED_ORIGINS` (comma-separated, exact match) replaces the scheme default
+    entirely, for an operator who wants only one named extension id.
+    """
+    if not origin:
+        return True  # not a browser; see _refuse_browser_write for what still applies
+    explicit = [o.strip() for o in os.environ.get("MEMBOT_ALLOWED_ORIGINS", "").split(",")
+                if o.strip()]
+    if explicit:
+        return origin in explicit
+    return origin.startswith(_WRITE_ORIGIN_SCHEMES)
+
+
+def _refuse_browser_write(request):
+    """Gate an unauthenticated write route. Returns a JSONResponse to send, or None to proceed.
+
+    ⛔⛔ WHAT THIS CLOSES, reported by legion-claude and cbp-claude 2026-11-16:
+    `/api/store`, `/api/sync`, `/api/save` and `/api/mount` take no auth, and
+    `_cors_headers()` returned `Access-Control-Allow-Origin: *`. ⇒ Any web page open in a
+    browser ON THE SAME MACHINE could write to them. Binding to loopback does not help,
+    because the browser IS on the machine.
+
+    ⚠ And CORS alone was never the hole. A cross-origin POST with `Content-Type: text/plain`
+    is a CORS *simple request*: no preflight happens at all, and Starlette's `request.json()`
+    is `json.loads(await self.body())` -- it never looks at `Content-Type`. So the write
+    landed whatever the CORS headers said; CORS only governed whether the page could READ the
+    reply, which an attacker does not need.
+
+    ⇒ TWO CHECKS, in this order, because the order is what makes the fleet's negative control
+    come out right:
+
+      1. Origin present and not allow-listed        -> 403
+      2. Content-Type is not application/json       -> 415
+
+    | arm                                   | result |
+    |---------------------------------------|--------|
+    | foreign Origin + application/json     | 403    |
+    | foreign Origin + text/plain           | 403    |
+    | no Origin + application/json          | pass   |
+    | no Origin + text/plain                | 415    |
+    | extension Origin + application/json   | pass   |
+
+    ⭐ WHY 415 AND NOT ONLY THE ORIGIN CHECK. The fleet called the Origin refusal primary
+    because "local CLI callers don't send Origin, so this breaks no known caller." ⛔ That is
+    true of their seats and false of ours: Heartbeat writes to `/api/sync` and `/api/store`
+    from a browser extension, so it always sends an Origin. The allow-list is what keeps it
+    working, and the 415 is what closes the no-preflight path for everyone else. Measured
+    2026-11-17: all five Heartbeat write call sites already send
+    `'Content-Type': 'application/json'`, so the 415 costs us nothing.
+    """
+    origin = request.headers.get("origin", "")
+    if origin and not _write_origin_allowed(origin):
+        log.warning(f"REFUSED write from foreign origin {origin!r} to {request.url.path}")
+        return JSONResponse(
+            {"status": "error",
+             "error": "This endpoint does not accept requests from browser pages.",
+             "origin": origin},
+            status_code=403, headers=_cors_headers(request, write=True),
+        )
+
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        return JSONResponse(
+            {"status": "error",
+             "error": "Content-Type: application/json is required on this endpoint.",
+             "received": content_type or "(none)"},
+            status_code=415, headers=_cors_headers(request, write=True),
+        )
+    return None
 
 
 # ============================================================
@@ -8343,7 +8982,16 @@ def get_status(session_id: str = "") -> str:
             log.warning("generation check failed for %s: %s",
                         state.get("cartridge_path"), e)
 
+    # ⭐ AGENTS.md §5 tells an agent that a missing tool means "the server is older
+    # than this document" and to call get_status, which "reports the version". Until
+    # 2026-11-15 it did not report any version at all, so the one diagnostic the docs
+    # offer for version skew could not answer the question it was recommended for.
+    # ⛔ A document promising a field the code never returned, in the place an agent is
+    # sent when something is already wrong.
+    svc = service_identity.service_block("mcp-server")
     return (
+        f"Service: {svc['name']}/{svc['role']} "
+        f"contract={svc['contract_version']} code={svc['code_digest'] or 'unknown'} | "
         f"Cartridge: {cart}{modified}{freshness} | "
         f"Memories: {n}/{MAX_ENTRIES} | "
         f"Embedding dim: {dim} | "
@@ -10686,6 +11334,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     _server_config["read_only"] = not args.writable
+    # Recorded so /api/status can report what this process is ACTUALLY serving on.
+    # ⛔ Without these the service block would report None for all three and still
+    # look authoritative, which is the failure the block exists to prevent. On stdio
+    # host/port are meaningless and stay None -- "no network listener at all" has to
+    # be distinguishable from "bound somewhere I did not record".
+    _server_config["transport"] = args.transport
+    _server_config["host"] = args.host if args.transport != "stdio" else None
+    _server_config["port"] = args.port if args.transport != "stdio" else None
     _server_config["max_pool_bytes"] = (
         args.max_cart_ram_mb * 1024 * 1024 if args.max_cart_ram_mb
         else _default_pool_bytes()
@@ -10700,6 +11356,13 @@ if __name__ == "__main__":
 
     log.info("Starting Membot — Brain Cartridge Server...")
     log.info(f"Transport: {args.transport}")
+    # ⭐ Identity on the boot line, so "which build is this box running" is answerable
+    # from the log rather than by inferring it from a git checkout that may describe
+    # almost nothing about what was scp'd on top. ASCII only: this prints to a cp1252
+    # console on Windows.
+    log.info("Service: " + service_identity.describe(
+        "mcp-server", transport=args.transport,
+        host=_server_config["host"], port=_server_config["port"]))
 
     # Which embedding backend is active, and WHY — pub's 2026-07-22 audit, §3.
     #
