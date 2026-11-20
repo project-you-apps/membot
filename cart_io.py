@@ -585,7 +585,18 @@ def load_pkl_cartridge(path: str) -> dict:
 
 
 def load_npz_cartridge(path: str) -> dict:
-    """Load an .npz cartridge (safe — no code execution).
+    """Load an .npz cartridge. ⛔ THIS EXECUTES CODE ON AN UNTRUSTED FILE.
+
+    ⛔⛔ THIS LINE USED TO READ "(safe — no code execution)". It was false, and it
+    was false THREE LINES ABOVE the `allow_pickle=True` that makes it false.
+    ⚠ The 2026-11-09 finding corrected that claim in `load_cartridge_safe` and
+    stopped there -- but that function only DISPATCHES. This is the one that loads,
+    and it kept the false promise for another ten days.
+
+    ⇒ Found 2026-11-19 by censusing the CLAIM rather than the mechanism. The
+    11-09 census enumerated `np.load` call sites; this is a docstring, so it was
+    never on the list. ⭐ A claim travels independently of the mechanism it is
+    wrong about, so it must be searched for separately.
 
     Supports split carts: if the index contains has_sqlite=True,
     texts are loaded as snippets from the index and full passages
@@ -593,7 +604,23 @@ def load_npz_cartridge(path: str) -> dict:
     """
     data = np.load(path, allow_pickle=True)
 
+    # ⛔ "unknown" USED TO BE FINAL. This dict was initialised with it and the
+    #   version was never read back from the file, so every cart loaded here
+    #   reported "unknown" no matter what it actually said. Harmless while nothing
+    #   consumed it -- and actively harmful the moment a resave passes the loaded
+    #   version through, because the save would have written the literal string
+    #   "unknown" into the cart. Found 2026-11-19 while making the save lossless.
+    #
+    # ⚠ numpy stores a string scalar as a 0-d array, so it needs `.item()`; reading
+    #   it without that yields an ndarray that str()s into something that looks
+    #   almost right.
     result = {"format": "npz", "version": "unknown"}
+    if "version" in data:
+        try:
+            _v = data["version"]
+            result["version"] = _v.item() if getattr(_v, "ndim", None) == 0 else str(_v)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[CART] could not read version field: {e}")
 
     # ⭐⭐ THE DIGEST IS TAKEN HERE, from the members this one open produced.
     #   Verification then attests the bytes that were loaded, rather than re-reading
@@ -677,10 +704,35 @@ def load_npz_cartridge(path: str) -> dict:
     else:
         result["texts"] = []
 
+    # ⭐ RAW MEMBERS KEPT FOR LOSSLESS RESAVE. Added 2026-11-19.
+    #
+    # ⛔ The server's save path used to write embeddings, passages, compressed_texts
+    #   and a hardcoded version, and nothing else -- so a cart loaded here and saved
+    #   through `save_as_npz` came back WITHOUT hippocampus, pattern0,
+    #   per_pattern_meta or sign_bits. `save_cartridge` regenerates the manifest
+    #   afterwards, so the stripped cart then VERIFIED CLEAN. The seal attested the
+    #   damaged version and nothing reported a loss.
+    #
+    # ⚠ The hippocampus could not have been resaved even by a caller who wanted to,
+    #   because this loader returned only the UNPACKED list of dicts and discarded
+    #   the (N, 64) uint8 rows the format stores. `pattern0` was not returned at all.
+    #   ⇒ That is almost certainly why the old save set `state["hippocampus"] = None`
+    #   afterwards: it reconciled memory to a loss it could not prevent.
+    #
+    # ⇒ These two keys are PURELY ADDITIVE -- nothing read them before today, so
+    #   adding them cannot change existing behaviour. They exist so a resave can put
+    #   back exactly the bytes it was given, with no re-packing and no chance of
+    #   writing a subtly wrong row.
+    result["hippocampus_raw"] = None
+    result["pattern0"] = None
+    if "pattern0" in data:
+        result["pattern0"] = data["pattern0"]
+
     # Load hippocampus metadata if present (mcp-v4+)
     if "hippocampus" in data:
         raw_hippo = data["hippocampus"]
         log.info(f"[HIPPO] Found hippocampus in NPZ: shape={raw_hippo.shape}, dtype={raw_hippo.dtype}")
+        result["hippocampus_raw"] = raw_hippo
         result["hippocampus"] = _unpack_hippocampus(raw_hippo)
         log.info(f"[HIPPO] Unpacked {len(result['hippocampus'])} entries. First: {result['hippocampus'][0] if result['hippocampus'] else 'EMPTY'}")
         # Log a sample entry that should have links
@@ -787,3 +839,307 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
             "perms_byte":     vals[10],
         })
     return result
+
+
+# =============================================================================
+# THE CART'S SURFACE — what this cart can actually answer
+# =============================================================================
+# ⭐⭐ Andy's framing, 2026-11-19: a cart is more like a CELL than a file, and a query is a
+#   ligand that either fits a receptor or does not. ⇒ The useful consequence is that **the
+#   receptor is on the cell, not floating in the bloodstream**: the cart declares its
+#   surface, and the caller reads it instead of guessing or probing.
+#
+# ⛔⛔ DERIVED, NEVER STORED, and this is the fourth design today that rule has decided.
+#   A manifest claiming `has_provenance: true` is an ASSERTION. We spent 2026-11-19 finding
+#   three docstrings that asserted a safety property the code did not have, one of them ten
+#   days after we had already fixed the same sentence elsewhere. ⇒ A surface read off the
+#   actual arrays cannot drift from them.
+#
+# ⚠ WHERE THE METAPHOR MUST NOT BE FOLLOWED: receptor binding is specific and exclusive --
+#   a ligand fits or it does not. Our search is GRADED; every passage comes back with a
+#   score. ⇒ This function describes the INTERFACE. It must never become a hard gate that
+#   refuses a search, because soft ranking is the correct behaviour for the scoring itself.
+
+# Keys in a per_pattern_meta record that a reader can actually DO something with.
+# `v` and `created_at` are deliberately absent: they are true of every record and so
+# distinguish nothing.
+_USEFUL_META_KEYS = ("source", "source_path", "page", "chunk", "chunks",
+                     "content_type", "tags", "owner", "description")
+
+
+def _safe_len(value) -> int:
+    """Length of anything a cart might hold, or 0.
+
+    ⛔ Found 2026-11-19 by running `describe_surface` over all 18 local carts: cart `x`
+    carries `embeddings` as a **0-d numpy object**, so a bare `len()` raises
+    `TypeError: len() of unsized object`. A plain `is not None` check does not catch it.
+
+    ⚠ And this is the worst possible place for an exception. A function whose job is to
+    report that a cart is unusable must not become unusable itself on exactly those carts.
+    ⇒ An empty or malformed array reports 0, which is both true and actionable.
+    """
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
+def read_surface_unopened(path: str) -> dict:
+    """What a cart is, read WITHOUT opening it. No unpickling, no code execution.
+
+    ⛔⛔ THIS DOES NOT DECIDE ADMISSIBILITY, AND MUST NOT BE READ AS DOING SO.
+      The fleet's gate is **3A: Admissible, Authentic, Authorized** -- and in evidence law
+      admissibility DEPENDS on authentication rather than sitting beside it. You
+      authenticate the document, then it may be admitted. ⇒ So this function supplies one
+      INPUT to a 3A decision: whether the contents are structurally usable. It cannot say
+      they may be admitted, because the two rungs underneath are not built:
+        · AUTHENTIC  -- the manifest is a sibling file and `save_cartridge` REGENERATES it,
+                        so on 2026-11-19 a cart silently stripped of four arrays passed
+                        integrity verification. The seal attested the damaged version.
+        · AUTHORIZED -- agents share one key, so no agent can reach `verified` at all.
+                        Queue item A1a. Until then no cart can carry an attestation,
+                        which is why all 18 local carts carry none.
+      ⚠ Named `read_surface_unopened`, NOT `check_admissible`, deliberately. The first
+      draft of this docstring claimed admissibility, which is the same overclaim as the
+      three false safety comments found earlier the same day: a name promising more than
+      the mechanism delivers.
+
+    ⭐⭐⭐ WHAT IT IS: THE CELL WALL. `describe_surface` below takes an already-LOADED cart, and
+    loading a cart runs `np.load(..., allow_pickle=True)`, which executes code. So that
+    function cannot answer "is this cart legit?" -- by the time it speaks, you have already
+    run whatever was inside. ⇒ Andy, 2026-11-19: *"They can know about the cart before
+    opening the cart so they don't have to read anything inside before they know it's
+    legit."* That requires this function, not that one.
+
+    HOW IT IS SAFE
+    --------------
+    An `.npz` is a ZIP of `.npy` members. Every `.npy` begins with a magic string, a
+    version, and a **plain-text header dict** giving `shape`, `fortran_order` and `descr`
+    -- all of it BEFORE a single byte of payload. ⇒ We read headers and stop. An object
+    array announces itself as dtype `|O` in its header and we never touch its contents,
+    which is where the pickle lives.
+
+    ⚠ WHAT THIS CANNOT TELL YOU, and the caller must not pretend otherwise: whether any
+    `per_pattern_meta` record actually CARRIES a source. That needs the records, the
+    records are pickled, and reading them is the thing we are refusing to do. ⇒ Presence,
+    record count and alignment are safe. Populated-key counts require
+    `describe_surface` on a loaded cart, which is a trust decision, not a free one.
+
+    ⇒ `opened: False` is in the result so a reader can tell the two tiers apart. A surface
+    that did not say which tier it came from would be the same class of false assurance we
+    spent 2026-11-19 removing from three docstrings.
+    """
+    import zipfile
+
+    out = {
+        "path": path,
+        "opened": False,
+        "readable": True,
+        "members": {},
+        "object_arrays": [],
+        "passages": 0,
+        "semantic_search": False,
+        "binary_search": False,
+        "prototype": False,
+        "provenance": {"state": "absent", "records": 0, "populated": None},
+        "episodic": {"state": "absent", "entries": 0, "linked": None},
+    }
+
+    try:
+        from numpy.lib import format as _npf
+        with zipfile.ZipFile(path) as zf:
+            for name in zf.namelist():
+                key = name[:-4] if name.endswith(".npy") else name
+                try:
+                    with zf.open(name) as fh:
+                        version = _npf.read_magic(fh)
+                        if version == (1, 0):
+                            shape, _fortran, dtype = _npf.read_array_header_1_0(fh)
+                        elif version == (2, 0):
+                            shape, _fortran, dtype = _npf.read_array_header_2_0(fh)
+                        else:
+                            out["members"][key] = {"shape": None, "dtype": "unknown-version"}
+                            continue
+                    out["members"][key] = {"shape": list(shape), "dtype": str(dtype)}
+                    # ⚠ `|O` is the pickle. Noted, never read.
+                    if dtype.hasobject:
+                        out["object_arrays"].append(key)
+                except Exception as e:                     # noqa: BLE001
+                    out["members"][key] = {"shape": None, "dtype": f"header-unreadable: {e}"}
+    except (OSError, zipfile.BadZipFile) as e:
+        out["readable"] = False
+        out["error"] = str(e)
+        return out
+
+    # ------------------------------------------------------------------
+    # ⭐⭐ THE MANIFEST IS A CLAIM. THE HEADERS ARE THE FACT.
+    # ------------------------------------------------------------------
+    # The manifest is a sibling .json -- plain text, no pickle -- so it is safe to read
+    # here. ⇒ And because it STATES a count and which members exist, we can compare its
+    # claim against what the headers actually say, without opening anything.
+    #
+    # ⛔⛔ `written_at` IS NOT A BUILD DATE, and must never be labelled one.
+    #   `save_cartridge` REGENERATES the manifest. On 2026-11-19 that is exactly how a cart
+    #   stripped of four arrays passed integrity verification -- the seal attested the
+    #   damaged version. ⇒ So this timestamp says when the SEAL was last written. A cart
+    #   resaved today carries today's date over last month's content, and a field called
+    #   `built_at` would make that lie for us.
+    #
+    # ⚠ `consistent` is a WEAK authenticity signal, not a strong one. It catches a manifest
+    #   that disagrees with its own cart. It cannot catch a manifest regenerated over
+    #   altered content, because that one agrees perfectly. ⇒ Partial credit on the
+    #   Authentic rung of 3A; a signature is still missing and no cart has one.
+    man = {"present": False, "written_at": None, "claims": {}, "consistent": None}
+    man_path = path[:-4] + "_manifest.json" if path.endswith(".npz") else path + "_manifest.json"
+    try:
+        if os.path.exists(man_path):
+            with open(man_path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            man["present"] = True
+            man["written_at"] = raw.get("timestamp")
+            man["claims"] = {
+                "count": raw.get("count"),
+                "version": raw.get("version"),
+                "has_hippocampus": raw.get("has_hippocampus"),
+                "has_per_pattern_meta": raw.get("has_per_pattern_meta"),
+            }
+    except (OSError, ValueError) as e:
+        man["present"] = True
+        man["written_at"] = None
+        man["claims"] = {"unreadable": str(e)}
+    out["manifest"] = man
+
+    def rows(key):
+        m = out["members"].get(key)
+        return int(m["shape"][0]) if m and m.get("shape") else 0
+
+    n = rows("passages") or rows("texts")
+    out["passages"] = n
+    out["semantic_search"] = rows("embeddings") > 0 and rows("embeddings") == n
+    out["binary_search"] = "sign_bits" in out["members"]
+    out["prototype"] = "pattern0" in out["members"]
+
+    if "per_pattern_meta" in out["members"]:
+        recs = rows("per_pattern_meta")
+        out["provenance"] = {
+            "state": "aligned" if (n and recs == n) else "misaligned",
+            "records": recs,
+            # ⛔ None, NOT {}. An empty dict would read as "checked, found nothing."
+            #   None means "not knowable without opening this cart."
+            "populated": None,
+        }
+    if "hippocampus" in out["members"]:
+        ent = rows("hippocampus")
+        out["episodic"] = {
+            "state": "aligned" if (n and ent == n) else "misaligned",
+            "entries": ent,
+            "linked": None,
+        }
+
+    # ⇒ Now cross the claim against the fact. ⭐ Each disagreement is NAMED rather than
+    #   collapsed into a boolean, because "the manifest says 143 and the cart holds 116" and
+    #   "the manifest promises provenance the cart does not carry" call for different
+    #   responses.
+    if man["present"] and "unreadable" not in man["claims"]:
+        c = man["claims"]
+        problems = []
+        if c.get("count") is not None and n and int(c["count"]) != n:
+            problems.append(f"manifest claims {c['count']} passages, headers say {n}")
+        if c.get("has_per_pattern_meta") and "per_pattern_meta" not in out["members"]:
+            problems.append("manifest claims per_pattern_meta, the cart has none")
+        if c.get("has_hippocampus") and "hippocampus" not in out["members"]:
+            problems.append("manifest claims a hippocampus, the cart has none")
+        man["consistent"] = not problems
+        if problems:
+            man["disagreements"] = problems
+    return out
+
+
+def describe_surface(cart: dict) -> dict:
+    """What this cart can answer, read off its contents rather than off a claim.
+
+    ⭐ `provenance.populated` is the load-bearing field, and it is a COUNT PER KEY, never a
+    boolean. The boolean is what I tried to write first, and it cannot tell these apart:
+
+      · a cart with no `per_pattern_meta` at all                  -> absent
+      · a cart whose array is the wrong length                    -> misaligned (unusable:
+        readers index it BY PASSAGE POSITION, so a short one misattributes silently)
+      · ⚠ a cart with a correctly sized array of EMPTY dicts      -> aligned, populated {}
+
+    That third case is real: `heartbeat` carries 7,283 records of which 7,281 are `{}`.
+    A boolean would have said "yes, provenance" and every lookup would have returned None.
+    ⇒ A count says "aligned, nothing in it", which is the truth and is actionable.
+    """
+    n = _safe_len(cart.get("texts") if cart.get("texts") is not None
+                  else cart.get("passages"))
+    n_emb = _safe_len(cart.get("embeddings"))
+
+    # --- provenance ---------------------------------------------------------
+    ppm = cart.get("per_pattern_meta")
+    prov = {"state": "absent", "records": 0, "populated": {}}
+    if isinstance(ppm, list):
+        prov["records"] = len(ppm)
+        if n and len(ppm) == n:
+            prov["state"] = "aligned"
+            counts = {}
+            for rec in ppm:
+                if isinstance(rec, dict):
+                    for key in _USEFUL_META_KEYS:
+                        if rec.get(key) not in (None, "", [], {}):
+                            counts[key] = counts.get(key, 0) + 1
+            prov["populated"] = counts
+        else:
+            # ⛔ NOT "partial". Unusable. Position-indexed and the wrong length means every
+            #   lookup past the first divergence names a stranger.
+            prov["state"] = "misaligned"
+
+    # --- episodic -----------------------------------------------------------
+    hippo = cart.get("hippocampus")
+    epi = {"state": "absent", "entries": 0, "linked": 0}
+    if isinstance(hippo, list) and hippo:
+        epi["state"] = "aligned" if len(hippo) == n else "misaligned"
+        epi["entries"] = len(hippo)
+        # ⚠ Present is not the same as USEFUL. An unlinked hippocampus is a table of zero
+        #   rows wearing the right shape -- the same trap as the empty provenance dicts.
+        epi["linked"] = sum(1 for h in hippo
+                            if isinstance(h, dict)
+                            and (h.get("prev") is not None or h.get("next") is not None))
+
+    return {
+        "version": cart.get("version"),
+        "passages": n,
+        "split_cart": bool(cart.get("is_split_cart")),
+        # Receptors a query can bind to:
+        "semantic_search": n_emb > 0 and n_emb == n,
+        "binary_search": cart.get("sign_bits") is not None,
+        "prototype": cart.get("pattern0") is not None,
+        "provenance": prov,
+        "episodic": epi,
+    }
+
+
+def can_score_expect_ref(surface: dict) -> tuple:
+    """Can an expectation naming a filename be scored by rank against this cart?
+
+    Returns (bool, reason). ⭐ The reason is not decoration: a caller that cannot offer
+    `expect_ref` should be able to say WHY, because "this cart was never built with
+    provenance" and "this cart's provenance is the wrong length" call for different
+    responses -- a rebuild versus an investigation.
+
+    ⛔ Returns False rather than falling back silently. The `cart#addr` fallback keeps a
+    search scoreable, but nobody predicts an address, so offering `expect_ref` on a cart
+    with no sources invites a prediction that can only ever miss.
+    """
+    prov = surface.get("provenance") or {}
+    state = prov.get("state")
+    if state == "absent":
+        return False, "no per_pattern_meta: this cart was built before provenance, or from no files"
+    if state == "misaligned":
+        return False, (f"per_pattern_meta has {prov.get('records')} records for "
+                       f"{surface.get('passages')} passages -- unusable, not partial")
+    sources = (prov.get("populated") or {}).get("source", 0)
+    if not sources:
+        return False, "provenance is aligned but no record carries a source"
+    return True, f"{sources} of {surface.get('passages')} passages name a source file"

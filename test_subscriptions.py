@@ -267,7 +267,7 @@ def t_payload_is_rich():
         ns.add_note(cart, KEY_A, "decision", "Replaces the 2025 form; legal signed off.",
                     by=SEAT_B, surface="CLI", scope="shared", now=1100.0)
         ns.add_note(cart, KEY_OLD, "why",
-                    "The old form cited a rescinded FDICIA threshold, so it stopped being "
+                    "The old form cited a rescinded statutory threshold, so it stopped being "
                     "current the day the threshold moved.",
                     by=SEAT_B, surface="CLI", scope="shared", now=1101.0)
 
@@ -300,7 +300,7 @@ def t_payload_is_rich():
               repr(c1.get("why")))
         check("4.7 * and the note saying why the OLD one stopped being current rides "
               "along too -- the clause nobody else can send",
-              any("rescinded FDICIA threshold" in n.get("body", "")
+              any("rescinded statutory threshold" in n.get("body", "")
                   for n in c1.get("why_prior", [])), repr(c1.get("why_prior")))
         check("4.8 the entry hash travels with the change, so it is checkable",
               str(c1.get("entry_hash", "")).startswith("sha256:"),

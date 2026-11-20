@@ -9,7 +9,7 @@ because WHY cannot be reconstructed afterward. It has to be captured at the mome
 decision. A sticky note is that capture.
 
 A sticky note is NOT a compliance feature with a general-purpose fallback. It is a general
-cart annotation of which the SOX/FDICIA version is one configuration (Andy, 2026-10-25:
+cart annotation of which the compliance version is one configuration (Andy, 2026-10-25:
 "I want it for us to use also... on entries in the session cart or anywhere else we have a
 cart"). That reframe is what made it small.
 

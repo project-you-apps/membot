@@ -79,7 +79,7 @@ def test_the_whole_loop():
                   "superseding the 5-year schedule cited in the 2023 manual.",
           session_id=PREPARER)
     _call("note_add", idx=1, kind="decision",
-          body="Moved from 5 to 7 years because the examiner cited FDICIA in the 2025 "
+          body="Moved from 5 to 7 years because the examiner cited the regulation in the 2025 "
                "cycle. The 5-year schedule is not merely old, it is non-compliant.",
           session_id=PREPARER)
     note_id = [n for n in __import__("note_store").list_notes(cart, seat=PREPARER)][0]["id"]
@@ -90,7 +90,7 @@ def test_the_whole_loop():
 
     assert "CANNOT ANSWER" not in out and "NO JOURNAL" not in out, out
     assert "preparer" in out, f"the change does not name who made it:\n{out}"
-    assert "examiner cited FDICIA" in out, (
+    assert "examiner cited the regulation" in out, (
         f"⛔ THE WHY DID NOT TRAVEL. The alert is commodity without it:\n{out}"
     )
     return out

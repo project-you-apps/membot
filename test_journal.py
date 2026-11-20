@@ -870,10 +870,10 @@ def test_one_event_per_line_and_greppable(tmp_path):
 def test_non_ascii_survives_round_trip(tmp_path):
     p = tmp_path / "j.jsonl"
     journal.append(p, "andy", "CLI", "store", {"cart": "café.cart", "idx": 1},
-                   {"text": "松乃木 — Matsunoki"})
+                   {"text": "日本語 — nihongo"})
     v = journal.verify(p)
     assert v["ok"] is True
-    assert journal.replay(p)[0]["payload"]["text"] == "松乃木 — Matsunoki"
+    assert journal.replay(p)[0]["payload"]["text"] == "日本語 — nihongo"
 
 
 def test_hash_is_independent_of_on_disk_key_order(tmp_path):

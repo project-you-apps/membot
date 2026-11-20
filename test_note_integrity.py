@@ -59,7 +59,7 @@ def _splice_out(cart, note_id: str) -> None:
 
 
 def test_an_intact_cart_is_clean(cart):
-    _add(cart, "retention is 7 years because FDICIA")
+    _add(cart, "retention is 7 years because the retention rule")
     _add(cart, "confirmed with the examiner")
     r = note_integrity.reconcile(str(cart))
     assert r["ok"] is True, r
@@ -71,7 +71,7 @@ def test_an_intact_cart_is_clean(cart):
 def test_a_removed_note_is_DETECTED(cart):
     """⭐⭐ THE POINT. The notes file still parses and still looks right. The chain
     disagrees, and that disagreement is the detection."""
-    keep = _add(cart, "retention is 7 years because FDICIA")
+    keep = _add(cart, "retention is 7 years because the retention rule")
     doomed = _add(cart, "the inconvenient one")
     _splice_out(cart, doomed["id"])
 

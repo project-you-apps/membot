@@ -75,6 +75,18 @@ except ImportError:
 # DOCUMENT READING
 # ============================================================
 
+# ⭐ ONE LIST, so a caller's error message cannot disagree with what is actually
+# read. It said "(.txt, .md, .pdf, .docx)" in main() while the set here also held
+# .json and .jsonl -- a user handed a folder of .jsonl and told it was unsupported
+# would believe the message, which is the expensive kind of wrong.
+SUPPORTED_EXTS = {".txt", ".md", ".pdf", ".docx", ".json", ".jsonl", ".csv"}
+
+# Rows per CSV passage. 40 keeps a passage inside the embedding model's useful
+# window once the header line is added, and keeps a 4,000-row export to 100
+# passages rather than one unsearchable block.
+CSV_ROWS_PER_PASSAGE = 40
+
+
 def read_file(path: str) -> str:
     """Read a single file and return its text content."""
     ext = os.path.splitext(path)[1].lower()
@@ -130,6 +142,56 @@ def read_file(path: str) -> str:
                     passages.append(line)  # treat as plain text
         return "\n\n---PASSAGE_BREAK---\n\n".join(passages)
 
+    elif ext == ".csv":
+        # Rows are grouped into passages with the HEADER REPEATED on each, then
+        # joined with the PASSAGE_BREAK sentinel so chunk_text respects those
+        # boundaries -- the same path .json and .jsonl already take.
+        #
+        # ⛔ WHY NOT JUST READ IT AS TEXT AND LET chunk_text SPLIT IT. Word-based
+        # chunking cuts wherever the budget runs out: mid-row, with the header on
+        # the first chunk only. Every later passage is then a block of bare numbers
+        # with no column names, which to a reader is indistinguishable from corrupt
+        # data -- and to the embedder is nearly contentless, so it ranks badly for
+        # the queries it should answer. Repeating the header costs one line per
+        # passage and makes each one independently readable.
+        import csv as _csv
+        with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as fh:
+            sample = fh.read(8192)
+            fh.seek(0)
+            try:
+                dialect = _csv.Sniffer().sniff(sample, delimiters=",;\t|")
+            except _csv.Error:
+                # A single-column file, or one row, sniffs as nothing. Comma is the
+                # right guess and a wrong guess here costs formatting, not data.
+                dialect = _csv.excel
+            rows = [r for r in _csv.reader(fh, dialect) if any(c.strip() for c in r)]
+
+        if not rows:
+            return ""
+
+        def _row_line(cells: list) -> str:
+            return " | ".join(str(c).strip() for c in cells)
+
+        header_line = _row_line(rows[0])
+        body = rows[1:]
+        if not body:
+            # Header only. Still worth one passage: it documents the schema, which
+            # is a real question an auditor asks ("what columns does this export
+            # have?"). Returning "" would drop the file silently.
+            return header_line
+
+        base = os.path.basename(path)
+        passages = []
+        for start in range(0, len(body), CSV_ROWS_PER_PASSAGE):
+            block = body[start:start + CSV_ROWS_PER_PASSAGE]
+            lines = [
+                f"{base} rows {start + 1}-{start + len(block)} of {len(body)}",
+                header_line,
+            ]
+            lines.extend(_row_line(r) for r in block)
+            passages.append("\n".join(lines))
+        return "\n\n---PASSAGE_BREAK---\n\n".join(passages)
+
     else:
         print(f"  Skipping unsupported file: {path}")
         return ""
@@ -140,7 +202,7 @@ def read_folder(folder: str, recursive: bool = False) -> list[tuple[str, str]]:
 
     Returns list of (filename, text) tuples.
     """
-    supported = {".txt", ".md", ".pdf", ".docx", ".json", ".jsonl"}
+    supported = SUPPORTED_EXTS
     results = []
 
     if recursive:
@@ -294,6 +356,109 @@ FLAG_PERISH_ARCHIVAL    = 0x40  # permanent (reflections, discoveries, proven me
 def _source_hash(filename: str) -> int:
     """Deterministic 32-bit hash of a source filename."""
     return int(hashlib.md5(filename.encode()).hexdigest()[:8], 16)
+
+
+SOURCE_DETAIL_CHOICES = ("filename", "relative", "absolute")
+
+
+def build_per_pattern_meta(doc_map: list[tuple[str, int, int]],
+                           source_root: str = None,
+                           source_detail: str = "relative",
+                           created_at: float = None) -> list[dict]:
+    """One per-passage provenance record per entry, in the canonical cart shape.
+
+    WHY THIS EXISTS. `/v1/search` has returned `source_file` and `locator.page`
+    since the client API contract was written, and both read from
+    `per_pattern_meta`. This builder never wrote that array, so both fields came
+    back null on every cart it produced -- including the client demo cart,
+    whose API reference shows a filename as its example value. The field existed,
+    was documented to a customer, and read a structure nothing created. Verified
+    2026-11-18 by opening demo-controls-evidence.cart.npz: six arrays, no
+    per_pattern_meta.
+
+    THE SHAPE IS NOT NEW. It matches what `api/cartbuilder/builder.py` and the
+    browser writer in `cart-builder-v2/writer/npz.ts` already emit, field for
+    field, so a mounted cart looks identical whichever builder made it. Do not
+    "improve" the field names here; three writers and one reader agree on them.
+
+    ⭐ `source` IS ALWAYS THE BARE FILENAME, and that is deliberate.
+      `/v1/search` maps `source_file` straight from it, so keeping it a filename
+      means (a) the field starts working the moment this array exists, with no
+      API change, and (b) no deployment can leak a directory layout by accident
+      through a field whose name does not suggest it holds one. The richer value
+      goes in `source_path`, which a caller has to ask for.
+
+    ⚠ `source_detail` CONTROLS WHAT IS STORED, NOT WHAT IS SHOWN. The two are
+      different switches and both are needed:
+        - stored:  once a cart is built with `filename`, the path is gone. You
+                   cannot widen later without rebuilding, and a cart is a file we
+                   hand to customers, so an absolute path inside it travels.
+        - returned: the read layer can narrow what it discloses per deployment,
+                   per cartridge or per role, and can only narrow -- it cannot
+                   invent a path the cart does not carry.
+      Default is `relative`: it proves the structure *within the evidence set*
+      (FY26-Q3/ITGC-01/export.pdf) without disclosing where that set lived on
+      somebody's disk (/home/andy/clients/...).
+
+    ⓘ `page` is None for every entry. This builder flattens a PDF's pages into one
+      string before chunking, so page numbers are genuinely not known here -- and
+      None is the honest answer. `/v1/search` omits `locator` entirely when page is
+      None rather than reporting page 0, which would be a fact we made up.
+      Populating it means per-page extraction in read_file, which changes passage
+      boundaries for every existing PDF cart. Separate change, deliberately.
+
+    Args:
+        doc_map: (filename, chunk_index, total_chunks) per entry, as built in
+            main(). `filename` is already relative to `source_root` when the
+            folder was read recursively, and a bare name otherwise.
+        source_root: the folder or file the cart was built from, used to resolve
+            an absolute path. None means absolute detail degrades to relative.
+        source_detail: one of SOURCE_DETAIL_CHOICES.
+        created_at: unix seconds stamped on every record; defaults to now.
+
+    Returns:
+        A list of dicts, one per entry, parallel to `entries`.
+    """
+    if source_detail not in SOURCE_DETAIL_CHOICES:
+        raise ValueError(
+            f"source_detail must be one of {SOURCE_DETAIL_CHOICES}, got {source_detail!r}"
+        )
+    ts = time.time() if created_at is None else created_at
+
+    out = []
+    for filename, chunk_idx, total_chunks in doc_map:
+        base = os.path.basename(filename)
+
+        if source_detail == "filename":
+            source_path = base
+        elif source_detail == "relative":
+            # `filename` already IS the relative path under a recursive read.
+            source_path = filename.replace(os.sep, "/")
+        else:  # absolute
+            if source_root:
+                abs_path = os.path.abspath(os.path.join(source_root, filename))
+                source_path = abs_path.replace(os.sep, "/")
+            else:
+                source_path = filename.replace(os.sep, "/")
+
+        out.append({
+            "v": 1,
+            "content_type": "document",
+            "source": base,
+            "source_path": source_path,
+            "source_detail": source_detail,
+            "page": None,
+            "chunk": chunk_idx,
+            "chunks": total_chunks,
+            "tags": [],
+            "created_at": ts,
+            "tombstone": False,
+            # Written even when empty, because the other two builders write them
+            # and readers are entitled to rely on the keys existing.
+            "owner": "",
+            "description": "",
+        })
+    return out
 
 
 def build_metadata(entries: list[str], doc_map: list[tuple[str, int, int]],
@@ -478,8 +643,18 @@ def embed_texts(texts: list[str], batch_size: int = 32,
 # ============================================================
 
 def save_cartridge(output_dir: str, name: str, embeddings: np.ndarray, texts: list[str],
-                   metadata: list[bytes] = None, pattern0: bytes = None):
-    """Save cartridge as secure NPZ with integrity manifest and hippocampus metadata."""
+                   metadata: list[bytes] = None, pattern0: bytes = None,
+                   per_pattern_meta: list[dict] = None):
+    """Save cartridge as secure NPZ with integrity manifest and hippocampus metadata.
+
+    ⭐ `per_pattern_meta` is written as a 1-D object array of dicts. cart_io's
+      loader accepts four encodings (1-D object array of dicts, a 0-D array
+      wrapping a list, a 0-D array wrapping a JSON string, and per-element JSON
+      strings) and this is the first of them -- the one that needs no unwrap and no
+      json.loads on the way back in. The browser writer uses the JSON-string form
+      because a ZIP of .npy files cannot hold a pickled dict; this path can, so it
+      stores the structure directly rather than a string of it.
+    """
     os.makedirs(output_dir, exist_ok=True)
     cart_path = os.path.join(output_dir, f"{name}.cart.npz")
 
@@ -502,6 +677,18 @@ def save_cartridge(output_dir: str, name: str, embeddings: np.ndarray, texts: li
         save_kwargs["hippocampus"] = meta_array
     if pattern0 is not None:
         save_kwargs["pattern0"] = np.frombuffer(pattern0, dtype=np.uint8)
+    if per_pattern_meta is not None:
+        if len(per_pattern_meta) != len(texts):
+            # ⛔ A meta array shorter than the passage list is worse than none at
+            #   all: `_v1_match` indexes it by passage position, so a mismatch
+            #   silently attributes passage N's text to passage N's neighbour's
+            #   file. Provenance that is confidently wrong is the one failure this
+            #   whole change exists to prevent, so refuse to write it.
+            raise ValueError(
+                f"per_pattern_meta has {len(per_pattern_meta)} records for "
+                f"{len(texts)} passages; they are indexed positionally and must match"
+            )
+        save_kwargs["per_pattern_meta"] = np.array(per_pattern_meta, dtype=object)
 
     np.savez_compressed(cart_path, **save_kwargs)
 
@@ -520,6 +707,10 @@ def save_cartridge(output_dir: str, name: str, embeddings: np.ndarray, texts: li
         "version": "mcp-v4",
         "count": len(texts),
         "has_hippocampus": metadata is not None,
+        # ⭐ So "does this cart carry provenance?" is answerable by reading a small
+        #   JSON file, not by loading a 700 MB npz. That question cost us a
+        #   customer-facing documentation error; it should be cheap to ask.
+        "has_per_pattern_meta": per_pattern_meta is not None,
         "fingerprint_algo": FINGERPRINT_ALGO,
         "fingerprint": fingerprint,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -667,6 +858,13 @@ Examples:
     parser.add_argument("--no-chunk", action="store_true", help="Don't chunk — one entry per file")
     parser.add_argument("--no-prefix", action="store_true", help="Don't prepend filename to passages (cleaner embeddings for conversational data)")
     parser.add_argument("--recursive", action="store_true", help="Recurse into subdirectories")
+    parser.add_argument("--source-detail", choices=SOURCE_DETAIL_CHOICES, default="relative",
+                        help="How much of each file's location to STORE in the cart: "
+                             "filename (name only), relative (path within the ingested "
+                             "folder, the default), absolute (full path on this machine). "
+                             "A cart is a file you may hand to a customer, and an absolute "
+                             "path inside it travels with it. The read layer can narrow "
+                             "what it discloses but cannot recover what was never stored.")
     parser.add_argument("--train", action="store_true", help="Train lattice + capture signatures (requires GPU)")
     parser.add_argument("--train-frames", type=int, default=5, help="Training settle frames (default: 5)")
     parser.add_argument("--settle-frames", type=int, default=2, help="Signature capture settle frames (default: 2)")
@@ -694,7 +892,8 @@ Examples:
         print(f"Reading folder: {source}")
         docs = read_folder(source, recursive=args.recursive)
         if not docs:
-            print("Error: No supported files found (.txt, .md, .pdf, .docx)")
+            # Derived from the one set, so it cannot drift from what is actually read.
+            print(f"Error: No supported files found ({', '.join(sorted(SUPPORTED_EXTS))})")
             return
     else:
         print(f"Error: {source} not found")
@@ -741,11 +940,23 @@ Examples:
     n_linked = sum(1 for m in metadata if struct.unpack_from('<I', m, 6)[0] > 0 or struct.unpack_from('<I', m, 10)[0] > 0)
     print(f"  {len(metadata)} entries from {n_docs} documents, {n_linked} with PREV/NEXT links")
 
+    # 4b. Per-passage provenance. This is what /v1/search reads to populate
+    #     `source_file` and `locator.page`; without it both are null on every
+    #     result, which is how a documented field went a long time unnoticed.
+    #     `source` is a file when a single file was given, so resolve the root
+    #     accordingly -- joining a file path with a basename yields nonsense.
+    source_root = source if os.path.isdir(source) else os.path.dirname(source)
+    ppm = build_per_pattern_meta(doc_map, source_root=source_root,
+                                 source_detail=args.source_detail)
+    if ppm:
+        print(f"  provenance: {len(ppm)} records, source_detail={args.source_detail}")
+        print(f"    sample: source={ppm[0]['source']!r} source_path={ppm[0]['source_path']!r}")
+
     # 5. Save cartridge
     print(f"\nSaving cartridge...")
     cart_path, size_mb, fingerprint = save_cartridge(
         args.output_dir, args.name, embeddings, entries,
-        metadata=metadata, pattern0=pattern0,
+        metadata=metadata, pattern0=pattern0, per_pattern_meta=ppm,
     )
     print(f"  {cart_path} ({size_mb:.1f} MB, {fingerprint})")
 

@@ -146,6 +146,26 @@ def materialize(manifest: dict, parent: dict, salt: str = "",
     if compressed is not None and len(compressed) == len(passages):
         out["compressed_lens"] = [compressed[i] for i in indices]
 
+    # ⭐ Per-passage provenance, SLICED the same way. Added 2026-11-19: an exported
+    #   sub-cart used to arrive with no record of where any passage came from, which
+    #   is the opposite of what this function's own docstring asks for -- "an
+    #   artifact that cannot explain its own provenance is one nobody can audit
+    #   later."
+    #
+    # ⭐⭐ Slicing is safe here in a way that link-copying is NOT. `prev`, `next` and
+    #   friends are POSITIONS, which is why they are remapped above and why a
+    #   verbatim copy once pointed 453 references at strangers. A provenance record
+    #   is a FACT ABOUT ITS PASSAGE -- which file, which page -- so it travels with
+    #   the passage and needs no renumbering, only the same index selection.
+    #
+    # ⚠ The length guard is not decoration: readers index this array by passage
+    #   position, so a parent whose array is already short must not be sliced into a
+    #   child where the mismatch would be invisible. Drop it instead and let the
+    #   child honestly carry none.
+    ppm = parent.get("per_pattern_meta")
+    if ppm is not None and len(ppm) == len(passages):
+        out["per_pattern_meta"] = [ppm[i] for i in indices]
+
     out["stats"] = {
         "passages": len(out["passages"]),
         "requested": resolved["stats"]["requested"],

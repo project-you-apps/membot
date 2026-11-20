@@ -13,7 +13,12 @@ Architecture:
   - Compatible with Vector Plus Studio v8.3 cartridge format (.npz/.pkl)
 
 Security:
-  - New cartridges saved as NPZ (no code execution risk)
+  - ⛔ NPZ IS NOT A SAFETY BOUNDARY. This line used to read "New cartridges saved
+    as NPZ (no code execution risk)" and that was false: carts carry object-dtype
+    arrays, every reader passes allow_pickle=True, and unpickling executes code.
+    ⚠ Corrected 2026-11-19. The claim had already been found false in cart_io.py
+    on 11-09 and fixed only there -- a Security: block is exactly where a wrong
+    comment turns into an architecture, which is what happened to .pkl vs .npz.
   - Legacy .pkl loading restricted to trusted directories only
   - SHA256 manifest for cartridge integrity verification
   - Cartridge name sanitization (no path traversal)
@@ -103,6 +108,35 @@ MAX_ENTRIES = int(os.environ.get("MEMBOT_MAX_ENTRIES", 3_000_000))
 MAX_TEXT_LENGTH = int(os.environ.get("MEMBOT_MAX_TEXT_LENGTH", 10_000))
 MAX_QUERY_LENGTH = int(os.environ.get("MEMBOT_MAX_QUERY_LENGTH", 2_000))
 SAFE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\- \.]*$')
+
+# ============================================================
+# SOURCE DISCLOSURE -- how much of a passage's origin a search result reveals
+# ============================================================
+# `filename`  source_file only: "access-review-export.csv"        (default)
+# `path`      also source_path: "FY26-Q3/ITGC-01/access-review-export.csv"
+#
+# Full path is better provenance and a wider disclosure: it proves where a record
+# came from, and it shows the directory layout to anyone who can run a search.
+# Which of those matters more is a customer's call, not ours, so it is a setting.
+#
+# ⭐ IT CAN ONLY NARROW. `path` reveals what the cart stored; it cannot invent a
+#   path for a cart built with `--source-detail filename`, because the cart does
+#   not contain one. So tightening the builder is the durable control and this is
+#   the per-deployment one.
+#
+# ⛔ AN UNKNOWN VALUE REFUSES TO START, and that is deliberate -- the same rule
+#   `_search_impl` applies to `rank_by`, for a stronger reason. A typo'd
+#   MEMBOT_SOURCE_DISCLOSURE that quietly fell back to `filename` would look like
+#   a broken feature; one that fell back to `path` would be a silent disclosure.
+#   Both are worse than a server that says what is wrong and stops.
+SOURCE_DISCLOSURE_CHOICES = ("filename", "path")
+SOURCE_DISCLOSURE = os.environ.get("MEMBOT_SOURCE_DISCLOSURE", "filename").strip().lower()
+if SOURCE_DISCLOSURE not in SOURCE_DISCLOSURE_CHOICES:
+    raise SystemExit(
+        f"MEMBOT_SOURCE_DISCLOSURE={SOURCE_DISCLOSURE!r} is not one of "
+        f"{SOURCE_DISCLOSURE_CHOICES}. Refusing to start rather than guess how much "
+        f"of a file's location to disclose."
+    )
 
 
 # ============================================================
@@ -1977,19 +2011,140 @@ _HIPPO_SIZE = 64
 
 
 
-def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str]):
-    """Save cartridge in safe NPZ format (no pickle, no code execution)."""
+def _hippo_padded(raw, n_passages: int):
+    """Hippocampus rows padded (or refused) to match the passage count.
+
+    ⚠ The raw array is captured at MOUNT. Anything that appends a passage
+    afterwards -- `memory_store`, `/api/copy` -- leaves it one or more rows short,
+    and a short array means later passages have no episodic entry at all.
+
+    ⭐ A zero row is the honest filler: `pattern_id` 0, no prev, no next, flags 0.
+    That is exactly true of a freshly added passage -- it has no links yet and is
+    not tombstoned. ⛔ The alternative, dropping the whole array because it is the
+    wrong length, would discard every existing passage's links to avoid admitting
+    that one new passage has none.
+
+    ⛔ Returns None if the array is LONGER than the passages. That means passages
+    were removed and the rows no longer correspond positionally; truncating would
+    guess which ones to keep, and a wrong link is worse than a missing one.
+    """
+    if raw is None:
+        return None
+    try:
+        have = len(raw)
+    except TypeError:
+        return None
+    if have == n_passages:
+        return raw
+    if have > n_passages:
+        log.warning(f"[HIPPO] {have} rows for {n_passages} passages — passages were "
+                    f"removed; dropping the array rather than guessing which rows match")
+        return None
+    pad = np.zeros((n_passages - have, _HIPPO_SIZE), dtype=np.uint8)
+    log.info(f"[HIPPO] padding {have} rows to {n_passages} with {len(pad)} empty row(s)")
+    return np.vstack([np.asarray(raw, dtype=np.uint8), pad])
+
+
+_CART_VERSIONS = ("mcp-v3", "mcp-v4")
+
+
+def _cart_version_for_save(loaded_version) -> str:
+    """The version string to write, given whatever the mount reported.
+
+    ⚠ Preserve a real version; refuse to propagate a placeholder. `cart_io`
+    initialises its result with "unknown" and, before 2026-11-19, never replaced
+    it -- so a resave that trusted the loaded value would have stamped the literal
+    string "unknown" onto the cart. An unrecognised value falls back rather than
+    travelling, and says so in the log so the case is visible rather than guessed.
+    """
+    v = (loaded_version or "").strip()
+    if v in _CART_VERSIONS:
+        return v
+    if v and v != "unknown":
+        log.warning(f"[CART] unrecognised cart version {v!r}; writing mcp-v3")
+    return "mcp-v3"
+
+
+def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str],
+                hippocampus=None, pattern0=None, per_pattern_meta=None,
+                sign_bits=None, version: str = "mcp-v3"):
+    """Save a cartridge as NPZ. ⛔ NPZ IS NOT A SAFETY BOUNDARY -- see below.
+
+    ⛔⛔ THIS LINE USED TO READ "safe NPZ format (no pickle, no code execution)".
+      THAT WAS FALSE, and it was false in the same way, in the same repo, that
+      `cart_io.load_cartridge_safe` already documents at length. Two of the arrays
+      written here are object dtype -- `passages` and `compressed_texts`, plus
+      `per_pattern_meta` when present -- so EVERY reader of this file must pass
+      `allow_pickle=True`, and unpickling executes code.
+
+    ⚠ Found 2026-11-19 by running legion-claude's own census on ourselves, hours
+      after they caught the identical false claim in the provenance probe we had
+      posted to the fleet. ⇒ A comment asserting a safety property the code does
+      not have is the most dangerous kind, because it is load-bearing for someone
+      else's threat model and it outlives every reader who trusts it.
+
+    ⇒ What IS true: this function controls what goes IN. It does not make the
+      result safe to open from an untrusted source, and nothing downstream treats
+      the `.npz` extension as a gate.
+
+    ⛔⛔ THIS FUNCTION USED TO SILENTLY DESTROY FOUR ARRAYS, and the destruction
+      verified clean. Until 2026-11-19 it wrote embeddings, passages,
+      compressed_texts and a hardcoded version -- and nothing else. So a cart
+      loaded with `hippocampus`, `pattern0`, `per_pattern_meta` or `sign_bits`,
+      then saved through the server, came back without them. `save_cartridge`
+      REGENERATES the manifest afterwards, so the stripped cart then passed
+      integrity verification: the seal attested the damaged version and nothing
+      reported a loss.
+
+    ⇒ What that cost, concretely: `per_pattern_meta` is where `/v1/search` reads
+      `source_file` and `locator.page`; `hippocampus` carries prev/next episodic
+      navigation AND the TOMBSTONE flag that hides a passage from every search.
+      Losing them is not cosmetic.
+
+    ⭐ THE FIX IS NOT NEW CODE -- `multi_cart.py::_persist_cart` has done this
+      correctly all along: preserve hippocampus, pattern0 and version if present,
+      recompute sign_bits, and carry per_pattern_meta forward. The single-cart
+      path simply never got it. Fourth instance this week of two implementations
+      where the correct one is not the one in the hot path.
+
+    ⚠ CALLERS MUST PASS WHAT THEY HOLD. Defaults keep old call sites working, so
+      a caller that forgets an array still loses it quietly. That is why
+      `tests/test_save_roundtrip_is_lossless.py` asserts on a cart carrying all
+      four, with a control proving the test can fail.
+    """
     compressed_texts = []
     for t in texts:
         compressed_texts.append(np.void(zlib.compress(t.encode("utf-8"), level=9)))
 
-    np.savez_compressed(
-        path,
+    save_kwargs = dict(
         embeddings=embeddings,
         passages=np.array(texts, dtype=object),
         compressed_texts=np.array(compressed_texts, dtype=object),
-        version="mcp-v3",
+        version=version,
     )
+
+    # ⚠ Each guarded on `is not None`, never on truthiness: an empty array is a
+    #   legitimate value and `if arr:` on a numpy array raises anyway.
+    if hippocampus is not None:
+        save_kwargs["hippocampus"] = hippocampus
+    if pattern0 is not None:
+        save_kwargs["pattern0"] = pattern0
+    if sign_bits is not None:
+        save_kwargs["sign_bits"] = sign_bits
+    if per_pattern_meta is not None:
+        # ⛔ REFUSE A POSITIONAL MISMATCH rather than writing one. Every reader
+        #   indexes this array BY PASSAGE POSITION (`_v1_match`, `_apply_filter`,
+        #   `get_pattern_meta`), so a short array silently attributes passage N's
+        #   text to its neighbour's file. Provenance that is confidently wrong is
+        #   worse than provenance that is absent.
+        if len(per_pattern_meta) != len(texts):
+            raise ValueError(
+                f"per_pattern_meta has {len(per_pattern_meta)} records for "
+                f"{len(texts)} passages; they are indexed positionally and must match"
+            )
+        save_kwargs["per_pattern_meta"] = np.array(per_pattern_meta, dtype=object)
+
+    np.savez_compressed(path, **save_kwargs)
 
 
 # ============================================================
@@ -2110,6 +2265,23 @@ def _v1_filters_to_spec(filters) -> dict | None:
     return spec or None
 
 
+def _disclosed_source_path(rec: dict) -> str | None:
+    """The stored source path, if this deployment discloses it. See SOURCE_DISCLOSURE.
+
+    Returns None in two different situations, and that is acceptable here because
+    the caller cannot act differently on them: the deployment withholds the path,
+    or the cart never stored one. Both mean "no path for you to show." What is NOT
+    acceptable is returning the filename dressed as a path, which would make a cart
+    built with `--source-detail filename` look like it had been built with
+    `relative` -- so an absent `source_path` stays absent rather than being filled
+    from `source`.
+    """
+    if SOURCE_DISCLOSURE != "path":
+        return None
+    stored = rec.get("source_path")
+    return stored if stored else None
+
+
 def _v1_match(entry: dict, state: dict, ingested_at: str | None) -> dict:
     """One internal result -> one `matches[]` record. API contract §3.2.
 
@@ -2142,6 +2314,11 @@ def _v1_match(entry: dict, state: dict, ingested_at: str | None) -> dict:
         "text": entry.get("full_text") or entry.get("text"),
         "locator": ({"page": page} if page is not None else None),
         "source_file": rec.get("source") or rec.get("filename") or rec.get("source_file"),
+        # ⭐ Always present, null when withheld or unknown -- same principle as
+        #   `document_id` above. A field that disappears when disclosure is
+        #   tightened is indistinguishable from a field this build does not have,
+        #   and a client cannot tell "not allowed" from "not implemented".
+        "source_path": _disclosed_source_path(rec),
         "content_type": rec.get("content_type"),
         "score": entry.get("score"),
         "signals": {
@@ -2579,6 +2756,11 @@ async def _search_impl(request: Request, envelope: str = "api") -> JSONResponse:
                 "matches": [_v1_match(e, state, ingested_at) for e in results],
                 "elapsed_ms": round(elapsed_ms),
                 "ranked_by": rank_by,
+                # Echoed for the same reason as `ranked_by`: a client seeing
+                # source_path null cannot otherwise tell whether this deployment
+                # withholds paths or the mounted cart never stored any. One is a
+                # setting to change, the other is a cart to rebuild.
+                "source_disclosure": SOURCE_DISCLOSURE,
                 "scoring": {
                     "hamming_blend": HAMMING_BLEND,
                     "recency_half_life_s": RECENCY_HALF_LIFE,
@@ -6205,6 +6387,13 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "",
         state["signatures"] = None
         state["hippocampus"] = data.get("hippocampus")
         state["per_pattern_meta"] = data.get("per_pattern_meta")
+        # ⭐ Carried so a resave can put back exactly what it was handed. The
+        #   unpacked `hippocampus` above CANNOT be written to the format -- these
+        #   are the original (N, 64) rows. See cart_io's note: the save used to drop
+        #   both, and the stripped cart still verified clean afterwards.
+        state["hippocampus_raw"] = data.get("hippocampus_raw")
+        state["pattern0"] = data.get("pattern0")
+        state["cart_version"] = data.get("version")
         state["modified"] = False
         # Set from the mount call, not from the artifact. A cart may be writable in
         # general and still be read-only to THIS consumer.
@@ -7030,6 +7219,10 @@ def subcart_export(name: str, out_name: str = "", session_id: str = "") -> str:
             "embeddings": state.get("embeddings"),
             "links": state.get("links") or [],
             "metadata": {"parent_cart": state.get("cartridge_name")},
+            # ⭐ Hand materialize the provenance so it can slice it with the same
+            #   indices it uses for passages and embeddings. Without this an exported
+            #   sub-cart arrives anonymous.
+            "per_pattern_meta": state.get("per_pattern_meta"),
         }
         succession = _succession_for(state)
         result = _mat.materialize(manifest, parent, succession=succession)
@@ -7060,7 +7253,20 @@ def subcart_export(name: str, out_name: str = "", session_id: str = "") -> str:
                 f"Nothing was written.")
 
     try:
-        save_as_npz(out_path, result["embeddings"], result["passages"])
+        # ⭐ Provenance travels; the POSITIONAL members deliberately do not.
+        #
+        # ⛔ `hippocampus` is omitted ON PURPOSE, not forgotten. Its rows carry
+        #   `prev`/`next` as parent-cart POSITIONS, and a materialized cart
+        #   renumbers everything -- the same trap this function's docstring records
+        #   for links, where 453 references pointed outside a 300-passage slice.
+        #   Carrying it would point every one at a stranger. Remapping it properly
+        #   is a separate job; shipping it verbatim is worse than shipping none.
+        # ⛔ `pattern0` is omitted because it describes the PARENT cart.
+        # ⭐ `per_pattern_meta` DOES travel, sliced to the exported indices by
+        #   materialize(), because a provenance record is a fact about its passage
+        #   rather than a position.
+        save_as_npz(out_path, result["embeddings"], result["passages"],
+                    per_pattern_meta=result.get("per_pattern_meta"))
         size_mb = os.path.getsize(out_path) / (1024 * 1024)
     except Exception as e:                             # noqa: BLE001
         log.error("subcart_export save failed: %s", e)
@@ -8106,6 +8312,43 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
 
         # 4. Store text (stored_text was built above, for the dedup check)
         state["texts"].append(stored_text)
+        # ⛔⛔ AND ITS PROVENANCE RECORD, OR THE ARRAY DESYNCS. Every reader indexes
+        #   per_pattern_meta BY PASSAGE POSITION. Appending a passage without a
+        #   record leaves N records against N+1 passages, and from then on passage
+        #   N+1 is attributed to whatever file record N names -- provenance that is
+        #   confidently wrong, which is worse than none.
+        #
+        # ⚠ Harmless until 2026-11-18, because no cart built here had the array.
+        #   The builder now writes it, so this became live the moment a provenanced
+        #   cart could be mounted. Found by legion-claude running our own probe:
+        #   "Our being stores memories through memory_store, not cartridge_builder.
+        #   So the gap isn't only in the builder."
+        #
+        # ⭐ Pad-then-append, matching multi_cart.py::_persist_cart. Padding covers
+        #   passages added before this fix existed; without it a short array would
+        #   stay short and the mismatch guard in save would refuse the save outright.
+        _ppm = state.get("per_pattern_meta")
+        if _ppm is not None:
+            while len(_ppm) < len(state["texts"]) - 1:
+                _ppm.append({})
+            # A stored memory has no source FILE. Recording the writer and the
+            # moment is the honest answer, and it is what the universal write
+            # attribution invariant requires of every cart write anyway.
+            _ppm.append({
+                "v": 1,
+                "content_type": "document",
+                "source": "memory_store",
+                "source_path": "memory_store",
+                "page": None,
+                "chunk": 0,
+                "chunks": 1,
+                "tags": [t.strip() for t in tags.split(",") if t.strip()] if tags else [],
+                "created_at": time.time(),
+                "tombstone": False,
+                "owner": "",
+                "description": "",
+            })
+            state["per_pattern_meta"] = _ppm
         state["modified"] = True
         # Keep the dedup index incremental so it is never rebuilt per store.
         _dedup.add(stored_text)
@@ -8248,7 +8491,33 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
                     f"to pick up generation {e.status['current']}, then reapply them.")
 
     try:
-        save_as_npz(save_path, state["embeddings"], state["texts"])
+        # ⭐ Pass everything the mount carried. Before 2026-11-19 this call passed
+        #   only embeddings and texts, so hippocampus, pattern0, per_pattern_meta
+        #   and sign_bits were dropped on every save -- and because the manifest is
+        #   regenerated two lines below, the stripped cart then VERIFIED CLEAN.
+        # ⚠ Sign bits are recomputed rather than carried, matching
+        #   multi_cart.py::_persist_cart: they are a pure function of the
+        #   embeddings, and the embeddings may have changed since the mount.
+        # ⚠ `> 0`, NOT `>= 0`. Copied from multi_cart.py::_persist_cart deliberately:
+        #   the sign-bit convention decides every Hamming distance, and two modules
+        #   disagreeing about the zero case would make scores silently incomparable
+        #   between carts saved by different paths.
+        _sign_bits = None
+        if state.get("embeddings") is not None and len(state["embeddings"]) > 0:
+            _sign_bits = np.packbits((state["embeddings"] > 0).astype(np.uint8), axis=1)
+        save_as_npz(
+            save_path, state["embeddings"], state["texts"],
+            hippocampus=_hippo_padded(state.get("hippocampus_raw"), len(state["texts"])),
+            pattern0=state.get("pattern0"),
+            per_pattern_meta=state.get("per_pattern_meta"),
+            sign_bits=_sign_bits,
+            # ⛔ Never write the loader's placeholder into a cart. `cart_io` used to
+            #   report "unknown" for every cart because it initialised the field and
+            #   never read it back; that is fixed, but passing a sentinel through as
+            #   data is the kind of thing that survives a fix and outlives the memory
+            #   of why it was there.
+            version=_cart_version_for_save(state.get("cart_version")),
+        )
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
 
         # Save integrity manifest
@@ -8328,6 +8597,14 @@ def unmount(session_id: str = "") -> str:
     state["binary_corpus"] = None
     state["signatures"] = None
     state["hippocampus"] = None
+    # ⛔ Clear the raw members too. A stale `hippocampus_raw` surviving an unmount
+    #   would be written into the NEXT cart saved from this session -- one cart's
+    #   episodic links and tombstones stamped onto another's passages. Mount sets
+    #   these from `data.get(...)`, so a fresh mount already overwrites them; this
+    #   closes the window between unmount and the next mount.
+    state["hippocampus_raw"] = None
+    state["pattern0"] = None
+    state["cart_version"] = None
     state["modified"] = False
     state["sqlite_conn"] = None
     state["is_split_cart"] = False
@@ -8441,11 +8718,65 @@ def multi_mount_directory(dir_path: str, role: str = "", pattern: str = "*.cart"
         return f"multi_mount_directory failed: {e}"
 
 
+def _carriage_score(ask: dict, results: list, seat: str, surface: str) -> str:
+    """Score a recorded ask against what actually came back. Returns one line of output.
+
+    ⭐ A prose `expect` is deliberately NOT scored here. The caller is the party whose
+    retrieval is in question, so letting it rule on its own expectation would be
+    self-bookkeeping -- a signed self-report is still a self-report. It stays OPEN, which
+    is a real and countable state, not a failure.
+
+    ⚠ v1 matches a ref EXACTLY against the bare `source` filename. A caller who writes a
+    full path where the cart records a filename will get a miss they did not earn. That is
+    a known limit, written down rather than papered over with fuzzy matching -- because
+    fuzzy matching here is precisely the circular judgment the rank tier exists to avoid.
+    """
+    import carriage as _car
+    cdir = os.path.join(BASE_DIR, "carriages")
+
+    if not ask.get("expect_ref"):
+        return (f"⏱ expectation recorded as {ask['id']}, left OPEN — prose needs an "
+                f"independent judge, and the caller is not one.")
+
+    # ⇒ Rank order is the ranking the reader actually saw. `source` first because that is
+    #   what a person would predict; the cart#addr fallback keeps carts with no provenance
+    #   scoreable rather than silently unscoreable.
+    refs = [(r.get("source") or f"{r.get('cart_id')}#{r.get('local_addr')}")
+            for r in results]
+    try:
+        out = _car.rank_outcome(cdir, seat, surface, ask["id"], refs)
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("carriage: could not score %s: %s", ask.get("id"), e)
+        return f"⚠ expectation {ask['id']} recorded but NOT scored ({type(e).__name__}: {e})"
+
+    mark = "✅ HIT" if out["disposition"] == "hit" else "⛔ MISS"
+    return f"{mark} — {out['detail']}   (ask {ask['id']}, {out['judged_by']})"
+
+
 @mcp.tool()
 def multi_search(query: str, top_k: int = 10, scope: str = "all",
-                 role_filter: str = "", scope_mode: str = "global") -> str:
+                 role_filter: str = "", scope_mode: str = "global",
+                 expect: str = "", expect_ref: str = "",
+                 session_id: str = "", surface: str = "CLI") -> str:
     """Search across every mounted cart in the multi-cart pool. Results are
     ranked and attributed to their source cart.
+
+    ⭐⭐ YOU CAN SAY WHAT YOU EXPECT TO FIND, BEFORE YOU FIND IT. `expect` or `expect_ref`
+    records the question AND the expectation in your carriage, then scores it against what
+    actually came back. The point is not bookkeeping: a prediction nobody checks is a wish
+    with a timestamp, and the only reason the existing `prediction` note kind has never
+    once been scored is that scoring it required somebody to come back later. Riding on a
+    query you were already typing, the outcome arrives in the same breath.
+
+    ⚠ `expect_ref` is STRONGER than `expect`. A ref names something identifiable -- a
+    filename from a result's `source`, say -- so the outcome is simply WHERE it landed and
+    no judge is involved. ⭐ A measurement cannot be talked into agreeing with itself,
+    which is why rank outranks a frontier model here. `expect` is prose and stays OPEN
+    until something independent judges it.
+
+    ⛔ Your carriage is never an input to retrieval, is never shared, and is yours to
+    discard. It lives beside the carts, never inside one: a query is a fact about a
+    READER, and writing queries into the corpus would make the corpus grow by being read.
 
     Args:
         query: Natural language search query
@@ -8467,10 +8798,40 @@ def multi_search(query: str, top_k: int = 10, scope: str = "all",
                       you want fair representation AND global ranking.
                     - 'diagnostic': top-K from every cart, no merging at all,
                       fully labeled. Useful for debugging.
+        expect: What you expect to find, in prose. Recorded BEFORE the search runs,
+                and left OPEN for an independent judge.
+        expect_ref: An identifiable target you expect back -- a `source` filename as it
+                would appear on a result. Scored automatically by rank, no judge needed.
+        session_id: Your seat. The carriage is per-seat and never merged.
+        surface: CLI / VSC / WEB, for attribution.
     """
     if len(query) > MAX_QUERY_LENGTH:
         return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
     log.info(f"multi_search('{query[:60]}', top_k={top_k}, scope={scope!r}, role_filter={role_filter!r}, scope_mode={scope_mode!r})")
+
+    # ⭐⭐ RECORD THE EXPECTATION BEFORE THE SEARCH RUNS. Not after, and not alongside --
+    #   before. An expectation written once the results are visible is not a prediction,
+    #   it is a description, and the whole instrument depends on the order.
+    #
+    # ⚠ Which also means: if the search below fails, the ask stays OPEN. That is the
+    #   honest state, not a leak. An expectation nobody answered is exactly what
+    #   `open_asks()` exists to count.
+    _ask = None
+    _carriage_note = ""
+    if expect or expect_ref:
+        try:
+            import carriage as _car
+            _cdir = os.path.join(BASE_DIR, "carriages")
+            _seat = _resolve_session_id(session_id)
+            _ask = _car.record_ask(_cdir, _seat, surface, query,
+                                   expectation=expect, expect_ref=expect_ref,
+                                   cart=f"multi:{scope}")
+        except Exception as e:                             # noqa: BLE001
+            # ⛔ A carriage failure must NEVER cost the caller their search. The
+            #   expectation is an instrument bolted onto the query, not a precondition
+            #   for answering it.
+            log.warning("carriage: could not record the ask: %s", e)
+            _carriage_note = f"\n\n⚠ expectation NOT recorded ({type(e).__name__}: {e})"
 
     try:
         # S7: same ceiling as memory_search, and this path can be WORSE — it fans
@@ -8497,11 +8858,17 @@ def multi_search(query: str, top_k: int = 10, scope: str = "all",
 
     results = result["results"]
     if not results:
+        # ⭐ An empty result set still ANSWERS an expectation -- with a miss. Skipping the
+        #   scoring here would leave the ask open forever and quietly exclude the clearest
+        #   failures from `misses()`, which is the one view that has to stay honest.
+        tail = ""
+        if _ask is not None:
+            tail = "\n\n" + _carriage_score(_ask, [], _resolve_session_id(session_id), surface)
         return (
             f"No relevant matches for '{query}' "
             f"(searched {result['cart_count']} carts, "
             f"{result['total_patterns']} patterns, {result['elapsed_ms']}ms, "
-            f"scope_mode={scope_mode})"
+            f"scope_mode={scope_mode})" + tail + _carriage_note
         )
 
     header = (
@@ -8536,6 +8903,13 @@ def multi_search(query: str, top_k: int = 10, scope: str = "all",
                 cart_label += f"/{r['role']}"
             cart_label += f"#{r['local_addr']}]"
             lines.append(f"#{rank} {cart_label} [{r['score']:.3f}] {r['text']}")
+
+    # ⇒ Scored against the ranking the reader actually saw, in the same response. This is
+    #   the whole design: nobody has to come back later.
+    if _ask is not None:
+        lines.append(_carriage_score(_ask, results, _resolve_session_id(session_id), surface))
+    if _carriage_note:
+        lines.append(_carriage_note.strip())
     return "\n\n".join(lines)
 
 
@@ -10522,7 +10896,45 @@ async def rest_copy(request: Request) -> JSONResponse:
 
         dst_texts.append(new_text)
         new_embeddings = np.vstack([dst_embeddings, new_embedding[None, :]])
-        save_as_npz(dst_path, new_embeddings, dst_texts)
+
+        # ⛔ A COPY USED TO STRIP THE DESTINATION. This call passed three arguments,
+        #   so every /api/copy rewrote the destination cart without its hippocampus,
+        #   pattern0, provenance or sign bits -- and the manifest was regenerated
+        #   below, so the damaged cart verified clean afterwards.
+        #
+        # ⭐ The destination is being APPENDED to, so provenance needs the same
+        #   pad-then-append as memory_store: readers index the array by passage
+        #   position, and a short array attributes the copied passage to whatever
+        #   file the previous record names.
+        _dst_ppm = dst_data.get("per_pattern_meta")
+        if _dst_ppm is not None:
+            _dst_ppm = list(_dst_ppm)
+            while len(_dst_ppm) < len(dst_texts) - 1:
+                _dst_ppm.append({})
+            _dst_ppm.append({
+                "v": 1,
+                "content_type": "document",
+                "source": "api_copy",
+                "source_path": "api_copy",
+                "page": None,
+                "chunk": 0,
+                "chunks": 1,
+                "tags": [],
+                "created_at": time.time(),
+                "tombstone": False,
+                "owner": "",
+                "description": "",
+            })
+        _dst_sign = np.packbits((new_embeddings > 0).astype(np.uint8), axis=1) \
+            if len(new_embeddings) > 0 else None
+        save_as_npz(
+            dst_path, new_embeddings, dst_texts,
+            hippocampus=_hippo_padded(dst_data.get("hippocampus_raw"), len(dst_texts)),
+            pattern0=dst_data.get("pattern0"),
+            per_pattern_meta=_dst_ppm,
+            sign_bits=_dst_sign,
+            version=_cart_version_for_save(dst_data.get("version")),
+        )
 
         dst_manifest = load_manifest(dst_path) or {}
         save_manifest(
@@ -11512,6 +11924,12 @@ if __name__ == "__main__":
             state["signatures"] = None
             state["hippocampus"] = data.get("hippocampus")
             state["per_pattern_meta"] = data.get("per_pattern_meta")
+            # ⭐ Same reason as the other mount path: the raw rows are what a
+            #   lossless resave needs. Both sites must set these or a cart mounted
+            #   through this one silently loses them on save.
+            state["hippocampus_raw"] = data.get("hippocampus_raw")
+            state["pattern0"] = data.get("pattern0")
+            state["cart_version"] = data.get("version")
             state["modified"] = False
             if len(data["embeddings"]) > 0:
                 if data.get("_derived_sign_bits") is None:

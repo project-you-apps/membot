@@ -396,6 +396,18 @@ def _search_one_cart(state: dict, query_emb: np.ndarray, query_text: str) -> lis
     candidate_k = min(max(40, 20), len(scores))
     candidate_idx = np.argsort(scores)[-candidate_k:][::-1]
 
+    # ⭐ Provenance, added 2026-11-19. `per_pattern_meta` was already LOADED into state
+    #   but never reached a search result, so /v1/search could say which file a passage
+    #   came from and multi_search could not. ⇒ Same shape of gap as the save path found
+    #   this morning: the data was present and the read was missing.
+    #
+    # ⚠ The length guard is not decoration. This array is indexed BY PASSAGE POSITION and
+    #   `local_addr` IS that position, so a short array would silently hand passage i the
+    #   provenance of some other passage. A cart with none, or with a short one, must
+    #   honestly return nothing rather than something plausible.
+    ppm = state.get("per_pattern_meta")
+    have_meta = isinstance(ppm, list) and len(ppm) == len(state["texts"])
+
     results = []
     for i in candidate_idx:
         i = int(i)
@@ -406,6 +418,7 @@ def _search_one_cart(state: dict, query_emb: np.ndarray, query_text: str) -> lis
         text_lower = text.lower()
         hits = sum(1 for kw in keywords if kw in text_lower)
         boost = min(hits * 0.03, 0.12)
+        meta = ppm[i] if have_meta and isinstance(ppm[i], dict) else {}
         results.append({
             "cart_id": state["cart_id"],
             "role": state["role"],
@@ -415,6 +428,12 @@ def _search_one_cart(state: dict, query_emb: np.ndarray, query_text: str) -> lis
             "ham_score": float(ham_scores[i]) if ham_scores is not None and i < len(ham_scores) else None,
             "kw_boost": boost,
             "text": text,
+            # ⇒ `source` is the bare filename, `source_path` carries whatever detail the
+            #   builder was configured to disclose. Both None when the cart has no
+            #   provenance, which is a FACT about the cart, not an error.
+            "source": meta.get("source"),
+            "source_path": meta.get("source_path"),
+            "page": meta.get("page"),
         })
     return results
 

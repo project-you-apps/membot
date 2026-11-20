@@ -100,3 +100,59 @@ redaction-review.jsonl
 
 # Generated render artifacts from the app-extraction tooling. Not source.
 tools/test_output/
+
+# ============================================================
+# DATED BACKUPS -- our own convention, which defeated every rule above
+# ============================================================
+# Measured 2026-11-18. Every ignore rule in this file is anchored to an
+# extension, and appending our standard `.bak-YYYY-MM-DD` suffix moves the
+# filename past that anchor, so the backup of an ignored file is NOT ignored:
+#
+#   cartridges/x.cart.npz                 IGNORED   (cartridges/*.npz)
+#   cartridges/x.cart.npz.bak-2026-11-18  NOT IGNORED
+#   membot.log                            IGNORED   (*.log)
+#   membot.log.bak-2026-11-18             NOT IGNORED
+#
+# ⛔ So the safer a backup made us feel, the more it exposed: a 465 KB cart plus
+#   its notes sidecar would have landed untracked-and-unignored in a repo whose
+#   client remote has push enabled. The .env family escaped only because
+#   `.env.*` happens to be a prefix rule rather than a suffix one.
+#
+# ⓘ Verified before adding: zero `.bak` files tracked in this repo and none in
+#   history, so there is nothing to purge. Studio was never exposed because it
+#   ignores `cartridges/*` wholesale rather than by extension.
+*.bak
+*.bak-*
+
+# ============================================================
+# LOCAL-ONLY SAFETY AND HISTORY ARTIFACTS
+# ============================================================
+# ⚠ Glob the date, not the specific folder. The 2026-11-13 manifest upgrade left
+#   two of these behind; hardcoding those two names would ignore exactly the ones
+#   that already exist and none of the ones a future upgrade makes.
+#
+# A manifest backup is a local safety copy of a cart's integrity fingerprint. It
+# must never ship: a second manifest for the same cart is a second answer to
+# "what should this file hash to," and the whole point of the seal is that there
+# is one.
+manifest-backup*/
+
+# A snapshot of what was running on the droplet, kept for comparison. Contains
+# its own copy of membot_server.py, which is a deployment artifact and reads as
+# source to anyone who clones.
+droplet-snapshot-*/
+
+# ============================================================
+# BUILD ARTIFACTS THAT ARRIVE BY MERGE
+# ============================================================
+# ⭐ Added 2026-11-18 BEFORE reconciling with the fleet, not after. `fleet/main`
+#   carries `.next/trace` (818 bytes) and `.next/trace-build` (214 bytes) as
+#   tracked files, and we had no `.next` rule at all -- so a merge would have
+#   silently adopted another repo's build output as our source.
+#
+# ⚠ The general point, which is the reason this block exists rather than two
+#   lines: an ignore file protects you from what YOU create, and says nothing
+#   about what a merge brings in. Before taking anyone else's history, check what
+#   is tracked on their side that is merely untracked on ours.
+.next/
+*.tsbuildinfo
